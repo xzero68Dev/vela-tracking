@@ -163,11 +163,25 @@ async def run_cron():
 # ---- Scheduler ----
 scheduler = AsyncIOScheduler()
 
+RENDER_URL = os.getenv("RENDER_URL", "")
+
+async def keep_alive():
+    """Ping ตัวเองทุก 10 นาที ไม่ให้ Render sleep"""
+    if not RENDER_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get(f"{RENDER_URL}/health")
+        print("[keep-alive] ping OK")
+    except Exception as e:
+        print(f"[keep-alive] ping failed: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(run_cron, "interval", hours=3, id="tracking_cron")
+    scheduler.add_job(run_cron,   "interval", hours=3,    id="tracking_cron")
+    scheduler.add_job(keep_alive, "interval", minutes=10, id="keep_alive")
     scheduler.start()
-    print("[scheduler] cron started — ทุก 3 ชั่วโมง")
+    print("[scheduler] cron started — ทุก 3 ชั่วโมง, keep-alive ทุก 10 นาที")
     yield
     scheduler.shutdown()
 
@@ -247,5 +261,5 @@ async def list_shipments(is_done: Optional[bool] = None):
 @app.post("/shipments/check-now")
 async def check_now():
     """trigger cron ทันที ไม่ต้องรอ 3 ชั่วโมง"""
-    asyncio.create_task(run_cron())
+    await run_cron()
     return {"message": "กำลังเช็คสถานะ... ดูผลได้ที่ /shipments"}
