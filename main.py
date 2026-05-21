@@ -3,6 +3,7 @@ import time
 import httpx
 import asyncio
 from typing import Optional
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -150,7 +151,7 @@ async def run_cron():
                 "latest_location": latest.get("location"),
                 "latest_datetime": latest.get("datetime"),
                 "is_done":         is_done,
-                "last_checked_at": "now()",
+                "last_checked_at": datetime.utcnow().isoformat(),
             }).eq("barcode", barcode).execute()
             print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
         except Exception as e:
