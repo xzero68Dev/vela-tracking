@@ -114,7 +114,7 @@ async def fetch_tracking(barcode: str) -> dict:
             "location":     e.get("location"),
         })
 
-    latest = events[0] if events else None
+    latest = events[-1] if events else None  # events เรียงเก่า→ใหม่ ดึงอันสุดท้าย
     current_status, current_status_th = map_status(latest["status_code"] if latest else "")
     return {
         "barcode":           barcode,
