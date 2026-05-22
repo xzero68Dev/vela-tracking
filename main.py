@@ -264,3 +264,120 @@ async def check_now():
     """trigger cron ทันที ไม่ต้องรอ 3 ชั่วโมง"""
     await run_cron()
     return {"message": "กำลังเช็คสถานะ... ดูผลได้ที่ /shipments"}
+
+
+# ---- Import Excel ----
+from fastapi import UploadFile, File
+import io
+import pandas as pd
+
+def safe_date(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    try:
+        return pd.to_datetime(v, dayfirst=True).strftime("%Y-%m-%d")
+    except:
+        return None
+
+def safe_val(v):
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except:
+        pass
+    return v
+
+@app.post("/admin/import")
+async def import_excel(file: UploadFile = File(...)):
+    """รับไฟล์ Excel แล้ว import orders + shipping + shipments เข้า Supabase"""
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx หรือ .xls เท่านั้น")
+
+    content = await file.read()
+    buf = io.BytesIO(content)
+
+    try:
+        df_orders   = pd.read_excel(buf, sheet_name="Orders")
+        buf.seek(0)
+        df_shipping = pd.read_excel(buf, sheet_name="Shipping")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"อ่านไฟล์ไม่ได้: {e}")
+
+    sb = get_supabase()
+    stats = {"orders": 0, "shipping": 0, "tracking_added": 0, "tracking_list": []}
+
+    # ---- Import Orders ----
+    order_rows = []
+    for _, r in df_orders.iterrows():
+        order_id = safe_val(r.get("Order ID"))
+        if not order_id:
+            continue
+        order_rows.append({
+            "order_id":     str(order_id),
+            "order_date":   safe_date(r.get("Order Date")),
+            "ship_date":    safe_date(r.get("Ship Date")),
+            "customer":     safe_val(r.get("Customer")),
+            "phone":        str(safe_val(r.get("Phone")) or ""),
+            "province":     safe_val(r.get("Province")),
+            "zip":          str(safe_val(r.get("ZIP")) or ""),
+            "full_address": safe_val(r.get("Full Address")),
+            "note":         safe_val(r.get("Note")),
+            "sku":          safe_val(r.get("SKU")),
+            "qty":          int(r["Qty"]) if pd.notna(r.get("Qty")) else None,
+            "channel":      safe_val(r.get("Channel")),
+            "status":       safe_val(r.get("Status")),
+        })
+
+    for i in range(0, len(order_rows), 50):
+        sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id", ignore_duplicates=True).execute()
+    stats["orders"] = len(order_rows)
+
+    # ---- Import Shipping ----
+    shipping_rows = []
+    tracking_to_add = []
+
+    for _, r in df_shipping.iterrows():
+        carrier_raw = str(r.get("Carrier") or "").strip()
+        if "POST" in carrier_raw.upper() or "SABUY" in carrier_raw.upper():
+            carrier = "POST SABUY"
+        elif "KEX" in carrier_raw.upper():
+            carrier = "KEX"
+        else:
+            carrier = carrier_raw
+
+        weight = r.get("Weight (g)") or r.get("Weight(g)")
+        cost   = r.get("Shipping Cost (฿)") or r.get("Shipping Cost(฿)")
+        tracking = safe_val(r.get("Tracking"))
+
+        shipping_rows.append({
+            "order_id":      str(safe_val(r.get("Order ID")) or ""),
+            "ship_date":     safe_date(r.get("Ship Date")),
+            "carrier":       carrier,
+            "tracking":      str(tracking) if tracking else None,
+            "weight_g":      int(weight) if pd.notna(weight) else None,
+            "shipping_cost": float(cost) if pd.notna(cost) else None,
+        })
+
+        # เก็บ tracking POST SABUY ไว้เพิ่มใน shipments
+        if carrier == "POST SABUY" and tracking and str(tracking).strip():
+            tracking_to_add.append(str(tracking).strip().upper())
+
+    for i in range(0, len(shipping_rows), 50):
+        sb.table("shipping").insert(shipping_rows[i:i+50]).execute()
+    stats["shipping"] = len(shipping_rows)
+
+    # ---- เพิ่ม Tracking เข้า Shipments ----
+    if tracking_to_add:
+        shipment_rows = [{"barcode": t, "status": "pending", "is_done": False} for t in tracking_to_add]
+        sb.table("shipments").upsert(shipment_rows, on_conflict="barcode", ignore_duplicates=True).execute()
+        stats["tracking_added"] = len(tracking_to_add)
+        stats["tracking_list"]  = tracking_to_add
+
+    return {
+        "success": True,
+        "filename": file.filename,
+        "imported": stats,
+        "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking ใหม่"
+    }
