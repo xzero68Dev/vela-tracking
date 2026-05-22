@@ -367,8 +367,8 @@ async def import_excel(file: UploadFile = File(...)):
             "ship_date":     safe_date(r.get("Ship Date")),
             "carrier":       carrier,
             "tracking":      str(tracking) if tracking else None,
-            "weight_g":      int(weight) if pd.notna(weight) else None,
-            "shipping_cost": float(cost) if pd.notna(cost) else None,
+            "weight_g":      int(float(str(weight).replace(",",""))) if pd.notna(weight) and str(weight).strip() not in ["", "-", "N/A"] else None,
+            "shipping_cost": float(str(cost).replace(",","")) if pd.notna(cost) and str(cost).strip() not in ["", "-", "N/A"] else None,
         })
 
         # เก็บ tracking POST SABUY ไว้เพิ่มใน shipments
