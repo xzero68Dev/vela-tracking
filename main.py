@@ -298,15 +298,26 @@ async def import_excel(file: UploadFile = File(...)):
     content = await file.read()
     buf = io.BytesIO(content)
 
-    try:
-        df_orders   = pd.read_excel(buf, sheet_name="Orders")
-        buf.seek(0)
-        df_shipping = pd.read_excel(buf, sheet_name="Shipping")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"อ่านไฟล์ไม่ได้: {e}")
+    # โหลด sheets ที่มีอยู่
+    xl = pd.ExcelFile(buf)
+    available = xl.sheet_names
+
+    def read_sheet(name):
+        if name in available:
+            buf.seek(0)
+            return pd.read_excel(buf, sheet_name=name)
+        return None
+
+    df_orders      = read_sheet("Orders")
+    df_shipping    = read_sheet("Shipping")
+    df_accounting  = read_sheet("Accounting")
+    df_summary     = read_sheet("Daily Summary")
+
+    if df_orders is None and df_shipping is None:
+        raise HTTPException(status_code=400, detail=f"ไม่พบ sheet Orders หรือ Shipping ในไฟล์นี้")
 
     sb = get_supabase()
-    stats = {"orders": 0, "shipping": 0, "tracking_added": 0, "tracking_list": []}
+    stats = {"orders": 0, "shipping": 0, "tracking_added": 0, "accounting": 0, "daily_summary": 0, "tracking_list": []}
 
     # ---- Import Orders ----
     order_rows = []
@@ -375,9 +386,69 @@ async def import_excel(file: UploadFile = File(...)):
         stats["tracking_added"] = len(tracking_to_add)
         stats["tracking_list"]  = tracking_to_add
 
+    # ---- Import Accounting ----
+    if df_accounting is not None:
+        acc_rows = []
+        for _, r in df_accounting.iterrows():
+            order_id = safe_val(r.get("Order ID"))
+            if not order_id:
+                continue
+            def safe_num(v):
+                try:
+                    return float(v) if pd.notna(v) else None
+                except:
+                    return None
+            acc_rows.append({
+                "order_id":    str(order_id),
+                "order_date":  safe_date(r.get("Order Date")),
+                "customer":    safe_val(r.get("Customer")),
+                "revenue":     safe_num(r.get("Revenue (฿)")),
+                "shopee_net":  safe_num(r.get("Shopee Net (฿)")),
+                "shopee_fee":  safe_num(r.get("Shopee Fee (฿)")),
+                "shipping":    safe_num(r.get("Shipping (฿)")),
+                "coffee_cost": safe_num(r.get("Coffee Cost (฿)")),
+                "packaging":   safe_num(r.get("Packaging (฿)")),
+                "other":       safe_num(r.get("Other")) or 0,
+                "net_profit":  safe_num(r.get("Net Profit (฿)")),
+                "note":        safe_val(r.get("Note")),
+            })
+        if acc_rows:
+            sb.table("accounting").upsert(acc_rows, on_conflict="order_id").execute()
+            stats["accounting"] = len(acc_rows)
+
+    # ---- Import Daily Summary ----
+    if df_summary is not None:
+        sum_rows = []
+        for _, r in df_summary.iterrows():
+            ship_date = safe_date(r.get("Ship Date"))
+            if not ship_date or safe_val(r.get("Ship Date")) == "TOTAL":
+                continue
+            def safe_num(v):
+                try:
+                    return float(v) if pd.notna(v) else None
+                except:
+                    return None
+            sum_rows.append({
+                "ship_date":     ship_date,
+                "orders":        int(r["Orders"]) if pd.notna(r.get("Orders")) else None,
+                "units":         int(r["Units"]) if pd.notna(r.get("Units")) else None,
+                "revenue":       safe_num(r.get("Revenue (฿)")),
+                "shopee_net":    safe_num(r.get("Shopee Net (฿)")),
+                "fee":           safe_num(r.get("Fee (฿)")),
+                "shipping":      safe_num(r.get("Shipping (฿)")),
+                "coffee_cost":   safe_num(r.get("Coffee Cost (฿)")),
+                "packaging":     safe_num(r.get("Packaging (฿)")),
+                "net_profit":    safe_num(r.get("Net Profit (฿)")),
+                "margin_pct":    safe_num(r.get("Margin %")),
+                "avg_per_order": safe_num(r.get("Avg/Order (฿)")),
+            })
+        if sum_rows:
+            sb.table("daily_summary").upsert(sum_rows, on_conflict="ship_date").execute()
+            stats["daily_summary"] = len(sum_rows)
+
     return {
         "success": True,
         "filename": file.filename,
         "imported": stats,
-        "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking ใหม่"
+        "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking, {stats['accounting']} accounting, {stats['daily_summary']} daily summary"
     }
