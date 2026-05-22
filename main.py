@@ -400,18 +400,24 @@ async def import_excel(file: UploadFile = File(...)):
                     return float(v) if pd.notna(v) else None
                 except:
                     return None
+            def get_col(r, *names):
+                for n in names:
+                    v = r.get(n)
+                    if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                        return v
+                return None
             acc_rows.append({
                 "order_id":    str(order_id),
                 "order_date":  safe_date(r.get("Order Date")),
                 "customer":    safe_val(r.get("Customer")),
-                "revenue":     safe_num(r.get("Revenue (฿)")),
-                "shopee_net":  safe_num(r.get("Shopee Net (฿)")),
-                "shopee_fee":  safe_num(r.get("Shopee Fee (฿)")),
-                "shipping":    safe_num(r.get("Shipping (฿)")),
-                "coffee_cost": safe_num(r.get("Coffee Cost (฿)")),
-                "packaging":   safe_num(r.get("Packaging (฿)")),
+                "revenue":     safe_num(get_col(r, "Revenue (฿)", "Revenue")),
+                "shopee_net":  safe_num(get_col(r, "Shopee Net (฿)", "Shopee Net")),
+                "shopee_fee":  safe_num(get_col(r, "Shopee Fee (฿)", "Shopee Fee", "Fee")),
+                "shipping":    safe_num(get_col(r, "Shipping (฿)", "Shipping")),
+                "coffee_cost": safe_num(get_col(r, "Coffee Cost (฿)", "Coffee Cost")),
+                "packaging":   safe_num(get_col(r, "Packaging (฿)", "Packaging")),
                 "other":       safe_num(r.get("Other")) or 0,
-                "net_profit":  safe_num(r.get("Net Profit (฿)")),
+                "net_profit":  safe_num(get_col(r, "Net Profit (฿)", "Net Profit")),
                 "note":        safe_val(r.get("Note")),
             })
         if acc_rows:
@@ -430,19 +436,25 @@ async def import_excel(file: UploadFile = File(...)):
                     return float(v) if pd.notna(v) else None
                 except:
                     return None
+            def get_col(r, *names):
+                for n in names:
+                    v = r.get(n)
+                    if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                        return v
+                return None
             sum_rows.append({
                 "ship_date":     ship_date,
                 "orders":        int(r["Orders"]) if pd.notna(r.get("Orders")) else None,
                 "units":         int(r["Units"]) if pd.notna(r.get("Units")) else None,
-                "revenue":       safe_num(r.get("Revenue (฿)")),
-                "shopee_net":    safe_num(r.get("Shopee Net (฿)")),
-                "fee":           safe_num(r.get("Fee (฿)")),
-                "shipping":      safe_num(r.get("Shipping (฿)")),
-                "coffee_cost":   safe_num(r.get("Coffee Cost (฿)")),
-                "packaging":     safe_num(r.get("Packaging (฿)")),
-                "net_profit":    safe_num(r.get("Net Profit (฿)")),
-                "margin_pct":    safe_num(r.get("Margin %")),
-                "avg_per_order": safe_num(r.get("Avg/Order (฿)")),
+                "revenue":       safe_num(get_col(r, "Revenue (฿)", "Revenue")),
+                "shopee_net":    safe_num(get_col(r, "Shopee Net (฿)", "Shopee Net")),
+                "fee":           safe_num(get_col(r, "Fee (฿)", "Fee")),
+                "shipping":      safe_num(get_col(r, "Shipping (฿)", "Shipping")),
+                "coffee_cost":   safe_num(get_col(r, "Coffee Cost (฿)", "Coffee Cost")),
+                "packaging":     safe_num(get_col(r, "Packaging (฿)", "Packaging")),
+                "net_profit":    safe_num(get_col(r, "Net Profit (฿)", "Net Profit")),
+                "margin_pct":    safe_num(get_col(r, "Margin %", "Margin%")),
+                "avg_per_order": safe_num(get_col(r, "Avg/Order (฿)", "Avg/Order")),
             })
         if sum_rows:
             # deduplicate โดยเอา ship_date ล่าสุดในกรณีซ้ำ
