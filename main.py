@@ -445,6 +445,11 @@ async def import_excel(file: UploadFile = File(...)):
                 "avg_per_order": safe_num(r.get("Avg/Order (฿)")),
             })
         if sum_rows:
+            # deduplicate โดยเอา ship_date ล่าสุดในกรณีซ้ำ
+            seen = {}
+            for row in sum_rows:
+                seen[row["ship_date"]] = row
+            sum_rows = list(seen.values())
             sb.table("daily_summary").upsert(sum_rows, on_conflict="ship_date").execute()
             stats["daily_summary"] = len(sum_rows)
 
