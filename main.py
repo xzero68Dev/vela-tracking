@@ -375,6 +375,8 @@ async def import_excel(file: UploadFile = File(...)):
         if carrier == "POST SABUY" and tracking and str(tracking).strip():
             tracking_to_add.append(str(tracking).strip().upper())
 
+    # กรองเฉพาะ row ที่มี order_id จริงๆ
+    shipping_rows = [r for r in shipping_rows if r.get("order_id") and r["order_id"].strip()]
     for i in range(0, len(shipping_rows), 50):
         sb.table("shipping").insert(shipping_rows[i:i+50]).execute()
     stats["shipping"] = len(shipping_rows)
