@@ -330,7 +330,7 @@ async def import_excel(file: UploadFile = File(...)):
             "order_date":   safe_date(r.get("Order Date")),
             "ship_date":    safe_date(r.get("Ship Date")),
             "customer":     safe_val(r.get("Customer")),
-            "phone":        str(safe_val(r.get("Phone")) or ""),
+            "phone":        str(safe_val(r.get("Phone")) or "").zfill(10) if str(safe_val(r.get("Phone")) or "").isdigit() and len(str(safe_val(r.get("Phone")) or "")) < 10 else str(safe_val(r.get("Phone")) or ""),
             "province":     safe_val(r.get("Province")),
             "zip":          str(safe_val(r.get("ZIP")) or ""),
             "full_address": safe_val(r.get("Full Address")),
