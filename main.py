@@ -350,7 +350,7 @@ async def import_excel(file: UploadFile = File(...)):
         })
 
     for i in range(0, len(order_rows), 50):
-        sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id", ignore_duplicates=True).execute()
+        sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id").execute()
     stats["orders"] = len(order_rows)
 
     # ---- Import Shipping ----
