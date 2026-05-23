@@ -386,7 +386,7 @@ async def import_excel(file: UploadFile = File(...)):
     # กรองเฉพาะ row ที่มี order_id จริงๆ
     shipping_rows = [r for r in shipping_rows if r.get("order_id") and r["order_id"].strip()]
     for i in range(0, len(shipping_rows), 50):
-        sb.table("shipping").insert(shipping_rows[i:i+50]).execute()
+        sb.table("shipping").upsert(shipping_rows[i:i+50], on_conflict="tracking", ignore_duplicates=True).execute()
     stats["shipping"] = len(shipping_rows)
 
     # ---- เพิ่ม Tracking เข้า Shipments ----
