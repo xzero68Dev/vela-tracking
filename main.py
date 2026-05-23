@@ -358,6 +358,10 @@ async def import_excel(file: UploadFile = File(...)):
     tracking_to_add = []
 
     for _, r in df_shipping.iterrows():
+        # ข้ามแถว TOTAL หรือแถวที่ไม่มี Order ID
+        order_id_raw = str(r.get("Order ID") or "").strip()
+        if not order_id_raw or order_id_raw.upper() == "TOTAL" or order_id_raw == "nan":
+            continue
         carrier_raw = str(r.get("Carrier") or "").strip()
         if "POST" in carrier_raw.upper() or "SABUY" in carrier_raw.upper():
             carrier = "POST SABUY"
