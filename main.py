@@ -330,7 +330,7 @@ async def import_excel(file: UploadFile = File(...)):
             "order_date":   safe_date(r.get("Order Date")),
             "ship_date":    safe_date(r.get("Ship Date")),
             "customer":     safe_val(r.get("Customer")),
-            "phone":        str(safe_val(r.get("Phone")) or "").zfill(10) if str(safe_val(r.get("Phone")) or "").isdigit() and len(str(safe_val(r.get("Phone")) or "")) < 10 else str(safe_val(r.get("Phone")) or ""),
+            "phone":        (lambda p: p.zfill(10) if p.isdigit() and len(p) < 10 else p)(str(int(float(safe_val(r.get("Phone")))) if safe_val(r.get("Phone")) and str(safe_val(r.get("Phone"))).replace('.','').isdigit() else safe_val(r.get("Phone")) or "")),
             "province":     safe_val(r.get("Province")),
             "zip":          str(safe_val(r.get("ZIP")) or ""),
             "full_address": safe_val(r.get("Full Address")),
@@ -429,7 +429,8 @@ async def import_excel(file: UploadFile = File(...)):
         sum_rows = []
         for _, r in df_summary.iterrows():
             ship_date = safe_date(r.get("Ship Date"))
-            if not ship_date or safe_val(r.get("Ship Date")) == "TOTAL":
+            raw_date = str(r.get("Ship Date") or "").strip()
+            if not ship_date or raw_date.upper() == "TOTAL" or not raw_date:
                 continue
             def safe_num(v):
                 try:
