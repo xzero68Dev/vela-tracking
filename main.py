@@ -272,10 +272,18 @@ import io
 import pandas as pd
 
 def safe_date(v):
-    if v is None or (isinstance(v, float) and pd.isna(v)):
+    if v is None:
         return None
     try:
-        return pd.to_datetime(v, dayfirst=True).strftime("%Y-%m-%d")
+        if pd.isna(v):
+            return None
+    except:
+        pass
+    try:
+        ts = pd.to_datetime(v, dayfirst=True)
+        if pd.isna(ts):
+            return None
+        return ts.strftime("%Y-%m-%d")
     except:
         return None
 
