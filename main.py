@@ -37,6 +37,7 @@ SMS_TEMPLATES = {
 
 async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = ""):
     """ส่ง SMS ผ่าน Thaibulksms พร้อม log"""
+    print(f"[SMS] key={SMS_API_KEY[:6]}... secret={SMS_API_SECRET[:6]}...")
     if not SMS_API_KEY or not SMS_API_SECRET:
         print(f"[SMS] ยังไม่ได้ตั้ง SMS key")
         return False
