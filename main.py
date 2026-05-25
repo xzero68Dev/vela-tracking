@@ -143,7 +143,10 @@ STATUS_MAP = {
 }
 
 def map_status(code: str):
-    return STATUS_MAP.get(str(code), ("unknown", f"สถานะ {code}"))
+    code = str(code).strip()
+    if not code:
+        return ("pending", "รอข้อมูล")
+    return STATUS_MAP.get(code, ("unknown", f"ไม่ทราบสถานะ ({code})"))
 
 
 # ---- Thailand Post helpers ----
@@ -226,7 +229,12 @@ async def run_cron():
 
     for barcode in barcodes:
         try:
-            result = await fetch_tracking(barcode)
+            # retry ถ้า error ครั้งแรก
+            try:
+                result = await fetch_tracking(barcode)
+            except Exception:
+                await asyncio.sleep(2)
+                result = await fetch_tracking(barcode)
             status    = result["status"]
             is_done   = status in DONE_STATUSES
             latest    = result["latest_event"] or {}
