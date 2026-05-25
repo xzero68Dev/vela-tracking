@@ -20,6 +20,80 @@ TRACK_URL        = "https://trackapi.thailandpost.co.th/post/api/v1/track"
 
 DONE_STATUSES = {"delivered", "returned"}
 
+# ---- SMS Config ----
+SMS_API_KEY    = os.getenv("SMS_API_KEY", "")
+SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
+SMS_SENDER     = "VeLA"
+
+SMS_TEMPLATES = {
+    "accepted": None,  # ไม่ส่ง
+    "in_transit": None,  # ไม่ส่ง
+    "out_for_delivery": "VeLA Cold Brew: พัสดุของคุณกำลังนำจ่ายแล้ววันนี้ 🚚 ติดตาม: vela-web-sigma.vercel.app",
+    "delivered": "VeLA Cold Brew: จัดส่งสำเร็จแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 ติดตาม: vela-web-sigma.vercel.app",
+    "returned": "VeLA Cold Brew: พัสดุตีกลับแล้ว ⚠ กรุณาติดต่อเราเพื่อจัดส่งใหม่นะคะ",
+    "problem": "VeLA Cold Brew: พัสดุมีปัญหาในการจัดส่ง ⚠ กรุณาติดต่อเราด่วนนะคะ",
+}
+
+
+async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = ""):
+    """ส่ง SMS ผ่าน Thaibulksms พร้อม log"""
+    if not SMS_API_KEY or not SMS_API_SECRET:
+        print(f"[SMS] ยังไม่ได้ตั้ง SMS key")
+        return False
+    if not phone or len(phone) < 9:
+        print(f"[SMS] เบอร์โทรไม่ถูกต้อง: {phone}")
+        return False
+
+    # เช็คว่าเคยส่ง status นี้ไปแล้วหรือยัง (เฉพาะกรณีมี barcode)
+    if barcode and status:
+        try:
+            sb = get_supabase()
+            existing = sb.table("sms_logs").select("id").eq("barcode", barcode).eq("status", status).execute()
+            if existing.data:
+                print(f"[SMS] ข้าม {barcode} → {status} (เคยส่งแล้ว)")
+                return False
+        except:
+            pass
+
+    success = False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://api-v2.thaibulksms.com/sms",
+                json={
+                    "key":     SMS_API_KEY,
+                    "secret":  SMS_API_SECRET,
+                    "msisdn":  phone,
+                    "message": message,
+                    "sender":  SMS_SENDER,
+                },
+            )
+            data = resp.json()
+            success = data.get("status") == "success" or resp.status_code == 200
+            if success:
+                print(f"[SMS] ✓ ส่งไปที่ ...{phone[-4:]} สำเร็จ")
+            else:
+                print(f"[SMS] ✗ ส่งไม่สำเร็จ: {data}")
+    except Exception as e:
+        print(f"[SMS] ERROR: {e}")
+
+    # Log ทุกการส่ง
+    if barcode and status:
+        try:
+            sb = get_supabase()
+            sb.table("sms_logs").insert({
+                "barcode":  barcode,
+                "phone":    phone,
+                "customer": customer,
+                "status":   status,
+                "message":  message,
+                "success":  success,
+            }).execute()
+        except Exception as e:
+            print(f"[SMS] log error: {e}")
+
+    return success
+
 # ---- Token cache ----
 _token_cache: dict = {"token": None, "expires_at": 0}
 
@@ -150,6 +224,10 @@ async def run_cron():
             status    = result["status"]
             is_done   = status in DONE_STATUSES
             latest    = result["latest_event"] or {}
+            # ดึง status เก่าก่อนอัพเดท
+            old_row = sb.table("shipments").select("status").eq("barcode", barcode).execute()
+            old_status = old_row.data[0]["status"] if old_row.data else "pending"
+
             sb.table("shipments").update({
                 "status":          status,
                 "status_th":       result["status_th"],
@@ -159,6 +237,21 @@ async def run_cron():
                 "last_checked_at": datetime.utcnow().isoformat(),
             }).eq("barcode", barcode).execute()
             print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
+
+            # ส่ง SMS ถ้าสถานะเปลี่ยน
+            if status != old_status and SMS_TEMPLATES.get(status):
+                msg = SMS_TEMPLATES[status]
+                # ดึงเบอร์จาก orders ผ่าน shipping
+                ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                if ship_row.data:
+                    order_id = ship_row.data[0]["order_id"]
+                    order_row = sb.table("orders").select("phone,customer").eq("order_id", order_id).execute()
+                    if order_row.data:
+                        phone = order_row.data[0].get("phone", "")
+                        customer = order_row.data[0].get("customer", "")
+                        if phone:
+                            await send_sms(phone, msg)
+                            print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
         except Exception as e:
             print(f"[cron] ERROR {barcode}: {e}")
         await asyncio.sleep(0.5)  # หน่วงนิดนึงไม่ให้ยิง API ถี่เกิน
@@ -301,6 +394,21 @@ def safe_val(v):
     except:
         pass
     return v
+
+class TestSMSRequest(BaseModel):
+    phone: str
+    message: str = "VeLA Cold Brew: ทดสอบระบบ SMS ✓"
+
+@app.post("/admin/test-sms")
+async def test_sms(body: TestSMSRequest):
+    """ทดสอบส่ง SMS ไปที่เบอร์ที่ระบุ"""
+    success = await send_sms(body.phone, body.message)
+    return {
+        "success": success,
+        "phone": body.phone,
+        "message": body.message,
+    }
+
 
 @app.post("/admin/import")
 async def import_excel(file: UploadFile = File(...)):
