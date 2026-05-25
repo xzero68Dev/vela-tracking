@@ -70,9 +70,14 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
                 auth=(SMS_API_KEY, SMS_API_SECRET),
             )
             data = resp.json()
-            success = data.get("status") == "success" or resp.status_code == 200
+            # Thaibulksms success = มี phone_number_list และไม่มี error
+            success = (
+                "error" not in data and
+                len(data.get("phone_number_list", [])) > 0
+            )
             if success:
-                print(f"[SMS] ✓ ส่งไปที่ ...{phone[-4:]} สำเร็จ")
+                credit_left = data.get("remaining_credit", "?")
+                print(f"[SMS] ✓ ส่งไปที่ ...{phone[-4:]} สำเร็จ (เครดิตคงเหลือ: {credit_left})")
             else:
                 print(f"[SMS] ✗ ส่งไม่สำเร็จ: {data}")
     except Exception as e:
