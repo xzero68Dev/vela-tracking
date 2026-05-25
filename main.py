@@ -23,7 +23,7 @@ DONE_STATUSES = {"delivered", "returned"}
 # ---- SMS Config ----
 SMS_API_KEY    = os.getenv("SMS_API_KEY", "")
 SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
-SMS_SENDER     = "VeLA"
+SMS_SENDER     = "Demo"  # free trial ใช้ได้แค่ Demo, SMS, MySMS
 
 SMS_TEMPLATES = {
     "accepted": None,  # ไม่ส่ง
