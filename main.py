@@ -62,13 +62,12 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
             resp = await client.post(
                 "https://api-v2.thaibulksms.com/sms",
                 data={
-                    "key":     SMS_API_KEY,
-                    "secret":  SMS_API_SECRET,
                     "msisdn":  phone,
                     "message": message,
                     "sender":  SMS_SENDER,
                 },
                 headers={"content-type": "application/x-www-form-urlencoded"},
+                auth=(SMS_API_KEY, SMS_API_SECRET),
             )
             data = resp.json()
             success = data.get("status") == "success" or resp.status_code == 200
