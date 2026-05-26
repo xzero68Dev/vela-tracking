@@ -218,7 +218,7 @@ async def run_cron():
     """เช็คเฉพาะพัสดุที่ is_done = false ทุก 3 ชั่วโมง เฉพาะช่วง 10:00-18:00"""
     # เช็คเวลา (timezone Bangkok UTC+7)
     hour = (datetime.utcnow().hour + 7) % 24
-    if not (10 <= hour < 18):
+    if not (8 <= hour < 20):
         print(f"[cron] ข้ามเพราะนอกเวลาทำงาน (ตอนนี้ {hour}:xx น.)")
         return
     print("[cron] เริ่มเช็คสถานะพัสดุที่ยังไม่เสร็จ...")
