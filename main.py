@@ -476,6 +476,12 @@ async def import_excel(file: UploadFile = File(...)):
             "status":       safe_val(r.get("Status")),
         })
 
+    # deduplicate order_id ในกรณีซ้ำในไฟล์เดียวกัน
+    seen_orders = {}
+    for row in order_rows:
+        if row["order_id"]:
+            seen_orders[row["order_id"]] = row
+    order_rows = list(seen_orders.values())
     for i in range(0, len(order_rows), 50):
         sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id").execute()
     stats["orders"] = len(order_rows)
