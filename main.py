@@ -172,7 +172,7 @@ async def get_access_token() -> str:
 
 async def fetch_tracking(barcode: str) -> dict:
     token = await get_access_token()
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             TRACK_URL,
             json={"status": "all", "language": "TH", "barcode": [barcode]},
@@ -268,7 +268,7 @@ async def run_cron():
                             print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
         except Exception as e:
             print(f"[cron] ERROR {barcode}: {e}")
-        await asyncio.sleep(0.5)  # หน่วงนิดนึงไม่ให้ยิง API ถี่เกิน
+        await asyncio.sleep(1.5)  # หน่วงให้มากขึ้นป้องกัน Thailand Post API timeout
 
     print("[cron] เสร็จแล้ว")
 
