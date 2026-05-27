@@ -64,7 +64,6 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
                 data={
                     "msisdn":  phone,
                     "message": message,
-                    "sender":  SMS_SENDER,
                 },
                 headers={"content-type": "application/x-www-form-urlencoded"},
                 auth=(SMS_API_KEY, SMS_API_SECRET),
@@ -599,7 +598,7 @@ async def import_excel(file: UploadFile = File(...)):
                 "coffee_cost":   safe_num(get_col(r, "Coffee Cost (฿)", "Coffee Cost(฿)", "Coffee Cost")),
                 "packaging":     safe_num(get_col(r, "Packaging (฿)", "Packaging(฿)", "Packaging")),
                 "net_profit":    safe_num(get_col(r, "Net Profit (฿)", "Net Profit(฿)", "Net Profit")),
-                "margin_pct":    safe_num(get_col(r, "Margin %", "Margin%")),
+                "margin_pct":    (lambda v: round(v * 100, 2) if v is not None and v < 1 else v)(safe_num(get_col(r, "Margin %", "Margin%"))),
                 "avg_per_order": safe_num(get_col(r, "Avg/Order (฿)", "Avg/Order(฿)", "Avg/Order")),
             })
         if sum_rows:
