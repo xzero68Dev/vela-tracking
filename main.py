@@ -269,8 +269,12 @@ async def run_cron():
             print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
 
             # ส่ง SMS ถ้าสถานะเปลี่ยน
-            if status != old_status and SMS_TEMPLATES.get(status):
-                msg = SMS_TEMPLATES[status]
+            # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
+            sms_status = status
+            if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
+                sms_status = "accepted"
+            if status != old_status and SMS_TEMPLATES.get(sms_status):
+                msg = SMS_TEMPLATES[sms_status]
                 ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
                 if ship_row.data:
                     order_id  = ship_row.data[0]["order_id"]
