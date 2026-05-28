@@ -26,10 +26,10 @@ SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
 SMS_SENDER     = "Demo"
 
 SMS_TEMPLATES = {
-    "accepted": None,  # ไม่ส่ง
+    "accepted": "VeLA Cold Brew: ร้านได้จัดส่งพัสดุของคุณแล้ว 📦 ติดตามสถานะได้ที่: vela-web-sigma.vercel.app",
     "in_transit": None,  # ไม่ส่ง
-    "out_for_delivery": "VeLA Cold Brew: พัสดุของคุณกำลังนำจ่ายแล้ววันนี้ 🚚 ติดตาม: vela-web-sigma.vercel.app",
-    "delivered": "VeLA Cold Brew: จัดส่งสำเร็จแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 ติดตาม: vela-web-sigma.vercel.app",
+    "out_for_delivery": None,  # ไม่ส่ง
+    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰",
     "returned": "VeLA Cold Brew: พัสดุตีกลับแล้ว ⚠ กรุณาติดต่อเราเพื่อจัดส่งใหม่นะคะ",
     "problem": "VeLA Cold Brew: พัสดุมีปัญหาในการจัดส่ง ⚠ กรุณาติดต่อเราด่วนนะคะ",
 }
@@ -169,12 +169,13 @@ async def get_access_token() -> str:
         return token
 
 
-async def fetch_tracking(barcode: str) -> dict:
+async def fetch_tracking_batch(barcodes: list) -> list:
+    """เรียก Thailand Post API แบบ batch สูงสุด 20 เลขต่อครั้ง"""
     token = await get_access_token()
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             TRACK_URL,
-            json={"status": "all", "language": "TH", "barcode": [barcode]},
+            json={"status": "all", "language": "TH", "barcode": barcodes},
             headers={"Authorization": f"Token {token}", "Content-Type": "application/json"},
         )
     if resp.status_code != 200:
@@ -182,37 +183,42 @@ async def fetch_tracking(barcode: str) -> dict:
     data = resp.json()
     if not data.get("status"):
         raise HTTPException(status_code=502, detail=data.get("message", "API error"))
-    response   = data.get("response", {})
-    items      = response.get("items", {})
+    response    = data.get("response", {})
+    items       = response.get("items", {})
     track_count = response.get("track_count", {})
-    events_raw = items.get(barcode, [])
 
-    events = []
-    for e in events_raw:
-        code = str(e.get("status", ""))
-        status, desc_th = map_status(code)
-        events.append({
-            "status_code":  code,
-            "status":       status,
-            "description":  e.get("status_description") or desc_th,
-            "datetime":     e.get("status_date"),
-            "location":     e.get("location"),
+    results = []
+    for barcode in barcodes:
+        events_raw = items.get(barcode, [])
+        events = []
+        for e in events_raw:
+            code = str(e.get("status", "")).strip()
+            status, desc_th = map_status(code) if code else ("pending", "รอข้อมูล")
+            events.append({
+                "status_code":  code,
+                "status":       status,
+                "description":  e.get("status_description") or desc_th,
+                "datetime":     e.get("status_date"),
+                "location":     e.get("location"),
+            })
+        latest = events[-1] if events else None
+        current_status, current_status_th = map_status(latest["status_code"] if latest else "")
+        results.append({
+            "barcode":           barcode,
+            "status":            current_status,
+            "status_th":         current_status_th,
+            "latest_event":      latest,
+            "events":            events,
+            "track_count_today": track_count.get("count_number"),
+            "track_count_limit": track_count.get("track_count_limit"),
         })
-
-    latest = events[-1] if events else None  # events เรียงเก่า→ใหม่ ดึงอันสุดท้าย
-    current_status, current_status_th = map_status(latest["status_code"] if latest else "")
-    return {
-        "barcode":           barcode,
-        "status":            current_status,
-        "status_th":         current_status_th,
-        "latest_event":      latest,
-        "events":            events,
-        "track_count_today": track_count.get("count_number"),
-        "track_count_limit": track_count.get("track_count_limit"),
-    }
+    return results
 
 
-# ---- Cron job ----
+async def fetch_tracking(barcode: str) -> dict:
+    return (await fetch_tracking_batch([barcode]))[0]
+
+
 async def run_cron():
     """เช็คเฉพาะพัสดุที่ is_done = false ทุก 3 ชั่วโมง เฉพาะช่วง 10:00-18:00"""
     # เช็คเวลา (timezone Bangkok UTC+7)
@@ -226,20 +232,31 @@ async def run_cron():
     barcodes = [r["barcode"] for r in (rows.data or [])]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
 
-    for barcode in barcodes:
+    # ดึง status เก่าทั้งหมดก่อน
+    old_rows = sb.table("shipments").select("barcode,status").in_("barcode", barcodes).execute()
+    old_status_map = {r["barcode"]: r["status"] for r in (old_rows.data or [])}
+
+    # เช็คเป็น batch ทีละ 20 เลข — 1 request ต่อ batch แทนที่จะเรียกทีละเลข
+    batch_size = 20
+    for i in range(0, len(barcodes), batch_size):
+        batch = barcodes[i:i+batch_size]
         try:
-            # retry ถ้า error ครั้งแรก
+            results = await fetch_tracking_batch(batch)
+        except Exception as e:
+            print(f"[cron] batch ERROR: {e} — retry...")
             try:
-                result = await fetch_tracking(barcode)
-            except Exception:
-                await asyncio.sleep(2)
-                result = await fetch_tracking(barcode)
-            status    = result["status"]
-            is_done   = status in DONE_STATUSES
-            latest    = result["latest_event"] or {}
-            # ดึง status เก่าก่อนอัพเดท
-            old_row = sb.table("shipments").select("status").eq("barcode", barcode).execute()
-            old_status = old_row.data[0]["status"] if old_row.data else "pending"
+                await asyncio.sleep(3)
+                results = await fetch_tracking_batch(batch)
+            except Exception as e2:
+                print(f"[cron] batch retry ERROR: {e2}")
+                continue
+
+        for result in results:
+            barcode    = result["barcode"]
+            status     = result["status"]
+            is_done    = status in DONE_STATUSES
+            latest     = result["latest_event"] or {}
+            old_status = old_status_map.get(barcode, "pending")
 
             sb.table("shipments").update({
                 "status":          status,
@@ -254,20 +271,19 @@ async def run_cron():
             # ส่ง SMS ถ้าสถานะเปลี่ยน
             if status != old_status and SMS_TEMPLATES.get(status):
                 msg = SMS_TEMPLATES[status]
-                # ดึงเบอร์จาก orders ผ่าน shipping
                 ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
                 if ship_row.data:
-                    order_id = ship_row.data[0]["order_id"]
+                    order_id  = ship_row.data[0]["order_id"]
                     order_row = sb.table("orders").select("phone,customer").eq("order_id", order_id).execute()
                     if order_row.data:
-                        phone = order_row.data[0].get("phone", "")
+                        phone    = order_row.data[0].get("phone", "")
                         customer = order_row.data[0].get("customer", "")
                         if phone:
-                            await send_sms(phone, msg)
+                            await send_sms(phone, msg, barcode=barcode, status=status, customer=customer)
                             print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
-        except Exception as e:
-            print(f"[cron] ERROR {barcode}: {e}")
-        await asyncio.sleep(1.5)  # หน่วงให้มากขึ้นป้องกัน Thailand Post API timeout
+
+        if i + batch_size < len(barcodes):
+            await asyncio.sleep(1)
 
     print("[cron] เสร็จแล้ว")
 
