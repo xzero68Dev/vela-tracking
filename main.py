@@ -258,6 +258,11 @@ async def run_cron():
             latest     = result["latest_event"] or {}
             old_status = old_status_map.get(barcode, "pending")
 
+            # ถ้า API ส่ง events ว่างมา (Thailand Post มีปัญหา) → ข้ามไปไม่ทับสถานะเดิม
+            if not result.get("events") and status == "pending":
+                print(f"[cron] {barcode} → ข้าม (API ไม่มีข้อมูล)")
+                continue
+
             sb.table("shipments").update({
                 "status":          status,
                 "status_th":       result["status_th"],
