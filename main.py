@@ -239,13 +239,20 @@ async def run_cron():
         try:
             results = await fetch_tracking_batch(batch)
         except Exception as e:
-            print(f"[cron] batch ERROR: {e} — retry...")
+            print(f"[cron] batch ERROR: {e} — รอ 3 นาทีแล้วลองใหม่...")
+            await asyncio.sleep(180)
             try:
-                await asyncio.sleep(3)
                 results = await fetch_tracking_batch(batch)
+                print(f"[cron] retry สำเร็จ")
             except Exception as e2:
-                print(f"[cron] batch retry ERROR: {e2}")
-                continue
+                print(f"[cron] batch retry ERROR: {e2} — รอ 3 นาทีอีกครั้ง...")
+                await asyncio.sleep(180)
+                try:
+                    results = await fetch_tracking_batch(batch)
+                    print(f"[cron] retry ครั้งที่ 2 สำเร็จ")
+                except Exception as e3:
+                    print(f"[cron] หยุดเช็ค batch นี้: {e3}")
+                    continue
 
         for result in results:
             barcode    = result["barcode"]
