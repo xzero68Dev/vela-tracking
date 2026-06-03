@@ -644,3 +644,49 @@ async def import_excel(file: UploadFile = File(...)):
         "imported": stats,
         "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking, {stats['accounting']} accounting, {stats['daily_summary']} daily summary"
     }
+
+
+# ---- Create Web Order ----
+class OrderItem(BaseModel):
+    sku: str
+    qty: int
+    price: float
+    name: str
+
+class CreateOrderRequest(BaseModel):
+    order_id:     str
+    customer:     str
+    phone:        str
+    full_address: str
+    province:     str
+    zip:          str
+    note:         Optional[str] = ""
+    items:        list[OrderItem]
+    total:        float
+    channel:      str = "web"
+    status:       str = "รอชำระเงิน"
+
+@app.post("/orders/create")
+async def create_order(body: CreateOrderRequest):
+    """สร้าง order จากหน้าเว็บ"""
+    sb = get_supabase()
+
+    # เก็บ SKU ทุกชิ้นเป็น string
+    sku_str = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
+
+    sb.table("orders").insert({
+        "order_id":     body.order_id,
+        "order_date":   datetime.utcnow().strftime("%Y-%m-%d"),
+        "customer":     body.customer,
+        "phone":        body.phone.zfill(10) if body.phone.isdigit() and len(body.phone) < 10 else body.phone,
+        "full_address": body.full_address,
+        "province":     body.province,
+        "zip":          body.zip,
+        "note":         body.note,
+        "sku":          sku_str,
+        "qty":          sum(i.qty for i in body.items),
+        "channel":      body.channel,
+        "status":       body.status,
+    }).execute()
+
+    return {"success": True, "order_id": body.order_id}
