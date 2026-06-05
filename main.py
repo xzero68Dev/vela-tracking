@@ -26,10 +26,10 @@ SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
 SMS_SENDER     = "VeLA"
 
 SMS_TEMPLATES = {
-    "accepted": "VeLA Cold Brew: ร้านได้จัดส่งพัสดุของคุณแล้ว 📦 ติดตามสถานะได้ที่: vela-web-sigma.vercel.app",
+    "accepted": "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามสถานะพัสดุได้ที่: vela-web-sigma.vercel.app เลขแทรก {barcode}",
     "in_transit": None,  # ไม่ส่ง
     "out_for_delivery": None,  # ไม่ส่ง
-    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰",
+    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 ลูกค้าสามารถแอดไลน์และสั่งสินค้าได้ที่ vela-web-sigma.vercel.app เพื่อรับสิทธิพิเศษเฉพาะสมาชิก VeLA เท่านั้น",
     "returned": "VeLA Cold Brew: พัสดุตีกลับแล้ว ⚠ กรุณาติดต่อเราเพื่อจัดส่งใหม่นะคะ",
     "problem": "VeLA Cold Brew: พัสดุมีปัญหาในการจัดส่ง ⚠ กรุณาติดต่อเราด่วนนะคะ",
 }
@@ -291,7 +291,8 @@ async def run_cron():
                         phone    = order_row.data[0].get("phone", "")
                         customer = order_row.data[0].get("customer", "")
                         if phone:
-                            await send_sms(phone, msg, barcode=barcode, status=status, customer=customer)
+                            final_msg = msg.replace("{barcode}", barcode)
+                            await send_sms(phone, final_msg, barcode=barcode, status=status, customer=customer)
                             print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
 
         if i + batch_size < len(barcodes):
