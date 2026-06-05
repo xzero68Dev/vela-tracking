@@ -23,7 +23,7 @@ DONE_STATUSES = {"delivered", "returned"}
 # ---- SMS Config ----
 SMS_API_KEY    = os.getenv("SMS_API_KEY", "")
 SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
-SMS_SENDER     = "Demo"
+SMS_SENDER     = "VeLA"
 
 SMS_TEMPLATES = {
     "accepted": "VeLA Cold Brew: ร้านได้จัดส่งพัสดุของคุณแล้ว 📦 ติดตามสถานะได้ที่: vela-web-sigma.vercel.app",
