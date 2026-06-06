@@ -75,6 +75,7 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
                 "error" not in data and
                 len(data.get("phone_number_list", [])) > 0
             )
+            message_id = data.get("phone_number_list", [{}])[0].get("message_id", "") if success else ""
             if success:
                 credit_left = data.get("remaining_credit", "?")
                 print(f"[SMS] ✓ ส่งไปที่ ...{phone[-4:]} สำเร็จ (เครดิตคงเหลือ: {credit_left})")
@@ -88,12 +89,14 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
         try:
             sb = get_supabase()
             sb.table("sms_logs").insert({
-                "barcode":  barcode,
-                "phone":    phone,
-                "customer": customer,
-                "status":   status,
-                "message":  message,
-                "success":  success,
+                "barcode":    barcode,
+                "phone":      phone,
+                "customer":   customer,
+                "status":     status,
+                "message":    message,
+                "success":    success,
+                "message_id": message_id,
+                "delivery_status": "sent" if success else "failed",
             }).execute()
         except Exception as e:
             print(f"[SMS] log error: {e}")
