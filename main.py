@@ -64,6 +64,7 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
                 data={
                     "msisdn":  phone,
                     "message": message,
+                    "sender":  SMS_SENDER,
                 },
                 headers={"content-type": "application/x-www-form-urlencoded"},
                 auth=(SMS_API_KEY, SMS_API_SECRET),
