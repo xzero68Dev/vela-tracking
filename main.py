@@ -35,6 +35,59 @@ SMS_TEMPLATES = {
 }
 
 
+async def send_line_notify(line_user_id: str, message: str):
+    """ส่งข้อความผ่าน LINE OA โดยใช้ LINE Messaging API"""
+    LINE_CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_TOKEN", "")
+    if not LINE_CHANNEL_TOKEN:
+        print(f"[LINE] ยังไม่ได้ตั้ง LINE_CHANNEL_TOKEN")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={
+                    "Authorization": f"Bearer {LINE_CHANNEL_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "to": line_user_id,
+                    "messages": [{"type": "text", "text": message}]
+                }
+            )
+            if resp.status_code == 200:
+                print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ")
+                return True
+            else:
+                print(f"[LINE] ✗ ส่งไม่สำเร็จ: {resp.text}")
+                return False
+    except Exception as e:
+        print(f"[LINE] ERROR: {e}")
+        return False
+
+
+async def send_line_notify(line_user_id: str, message: str):
+    """ส่งข้อความผ่าน LINE OA"""
+    token = os.getenv("LINE_CHANNEL_TOKEN", "")
+    if not token:
+        print("[LINE] ยังไม่ได้ตั้ง LINE_CHANNEL_TOKEN")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"to": line_user_id, "messages": [{"type": "text", "text": message}]}
+            )
+            if resp.status_code == 200:
+                print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ")
+                return True
+            print(f"[LINE] ✗ {resp.text}")
+            return False
+    except Exception as e:
+        print(f"[LINE] ERROR: {e}")
+        return False
+
+
 async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = ""):
     """ส่ง SMS ผ่าน Thaibulksms พร้อม log"""
     print(f"[SMS] key={SMS_API_KEY[:6]}... secret={SMS_API_SECRET[:6]}...")
@@ -280,7 +333,7 @@ async def run_cron():
             }).eq("barcode", barcode).execute()
             print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
 
-            # ส่ง SMS ถ้าสถานะเปลี่ยน
+            # แจ้งเตือนถ้าสถานะเปลี่ยน
             # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
             sms_status = status
             if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
@@ -295,9 +348,27 @@ async def run_cron():
                         phone    = order_row.data[0].get("phone", "")
                         customer = order_row.data[0].get("customer", "")
                         if phone:
+                            # เช็ค notify_channel จาก customers table
+                            notify       = "sms"
+                            line_uid     = ""
+                            try:
+                                cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
+                                if cust.data:
+                                    notify   = cust.data[0].get("notify_channel") or "sms"
+                                    line_uid = cust.data[0].get("line_user_id") or ""
+                            except:
+                                pass
+
                             final_msg = msg.replace("{barcode}", barcode)
-                            await send_sms(phone, final_msg, barcode=barcode, status=status, customer=customer)
-                            print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+
+                            if notify == "none":
+                                print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
+                            elif notify == "line" and line_uid:
+                                await send_line_notify(line_uid, final_msg)
+                                print(f"[LINE] แจ้ง {customer} → {status}")
+                            else:
+                                await send_sms(phone, final_msg, barcode=barcode, status=sms_status, customer=customer)
+                                print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
 
         if i + batch_size < len(barcodes):
             await asyncio.sleep(1)
