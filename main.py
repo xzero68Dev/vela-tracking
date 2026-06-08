@@ -516,6 +516,17 @@ class TestSMSRequest(BaseModel):
     phone: str
     message: str = "VeLA Cold Brew: ทดสอบระบบ SMS ✓"
 
+class TestLineRequest(BaseModel):
+    line_user_id: str
+    message: str = "VeLA Cold Brew: ทดสอบ LINE notification 🐰"
+
+@app.post("/admin/test-line")
+async def test_line(body: TestLineRequest):
+    """ทดสอบส่ง LINE message"""
+    success = await send_line_notify(body.line_user_id, body.message)
+    return {"success": success, "line_user_id": body.line_user_id}
+
+
 @app.post("/admin/test-sms")
 async def test_sms(body: TestSMSRequest):
     """ทดสอบส่ง SMS ไปที่เบอร์ที่ระบุ"""
