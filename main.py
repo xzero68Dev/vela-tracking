@@ -26,14 +26,17 @@ SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
 SMS_SENDER     = "VeLA"
 
 SMS_TEMPLATES = {
-    "accepted": "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามสถานะพัสดุได้ที่: vela-web-sigma.vercel.app เลขแทรก {barcode}",
+    "accepted": None,  # ไม่ส่ง SMS แล้ว
     "in_transit": None,  # ไม่ส่ง
     "out_for_delivery": None,  # ไม่ส่ง
     "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 ลูกค้าสามารถแอดไลน์และสั่งสินค้าได้ที่ vela-web-sigma.vercel.app เพื่อรับสิทธิพิเศษเฉพาะสมาชิก VeLA เท่านั้น",
-    "returned": "VeLA Cold Brew: พัสดุตีกลับแล้ว ⚠ กรุณาติดต่อเราเพื่อจัดส่งใหม่นะคะ",
-    "problem": "VeLA Cold Brew: พัสดุมีปัญหาในการจัดส่ง ⚠ กรุณาติดต่อเราด่วนนะคะ",
+    "returned": None,  # แจ้ง admin ผ่าน LINE
+    "problem": None,   # แจ้ง admin ผ่าน LINE
 }
 
+
+ADMIN_LINE_USER_ID = os.getenv("ADMIN_LINE_USER_ID", "U28d1b5573f79da2f3ff3f52ccc1fcf1c")
+ALERT_STATUSES = {"returned", "problem"}
 
 async def send_line_notify(line_user_id: str, message: str):
     """ส่งข้อความผ่าน LINE OA โดยใช้ LINE Messaging API"""
@@ -369,6 +372,12 @@ async def run_cron():
                             else:
                                 await send_sms(phone, final_msg, barcode=barcode, status=sms_status, customer=customer)
                                 print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+
+                            # แจ้ง admin ถ้ามีปัญหา
+                            if status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
+                                admin_msg = f"⚠ VeLA Alert: พัสดุ {barcode} ของ {customer} ({phone}) สถานะ: {status_th or status}"
+                                await send_line_notify(ADMIN_LINE_USER_ID, admin_msg)
+                                print(f"[ADMIN] แจ้ง admin → {barcode} {status}")
 
         if i + batch_size < len(barcodes):
             await asyncio.sleep(1)
