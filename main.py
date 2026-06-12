@@ -26,10 +26,10 @@ SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
 SMS_SENDER     = "VeLA"
 
 SMS_TEMPLATES = {
-    "accepted": None,  # ไม่ส่ง SMS แล้ว
+    "accepted": "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามพัสดุได้เลย: velacoldbrew.com/track/{barcode}",
     "in_transit": None,  # ไม่ส่ง
     "out_for_delivery": None,  # ไม่ส่ง
-    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 ลูกค้าสามารถแอดไลน์และสั่งสินค้าได้ที่ velacoldbrew.com เพื่อรับสิทธิพิเศษเฉพาะสมาชิก VeLA เท่านั้น",
+    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com",
     "returned": None,  # แจ้ง admin ผ่าน LINE
     "problem": None,   # แจ้ง admin ผ่าน LINE
 }
