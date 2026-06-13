@@ -5,7 +5,7 @@ import asyncio
 from typing import Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -413,7 +413,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="VeLA Tracking API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://velacoldbrew.com",
+        "https://www.velacoldbrew.com",
+        "https://vela-web-sigma.vercel.app",
+        "http://localhost:3000",
+    ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -525,13 +530,23 @@ class TestSMSRequest(BaseModel):
     phone: str
     message: str = "VeLA Cold Brew: ทดสอบระบบ SMS ✓"
 
+# ---- Admin Auth ----
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+def check_admin_key(request_key: str):
+    """ตรวจสอบ admin API key"""
+    if ADMIN_API_KEY and request_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 class TestLineRequest(BaseModel):
     line_user_id: str
     message: str = "VeLA Cold Brew: ทดสอบ LINE notification 🐰"
 
 @app.post("/admin/test-line")
-async def test_line(body: TestLineRequest):
+async def test_line(body: TestLineRequest, x_api_key: str = Header(default="")):
     """ทดสอบส่ง LINE message"""
+    check_admin_key(x_api_key)
     success = await send_line_notify(body.line_user_id, body.message)
     return {"success": success, "line_user_id": body.line_user_id}
 
@@ -548,7 +563,7 @@ async def test_sms(body: TestSMSRequest):
 
 
 @app.post("/admin/import")
-async def import_excel(file: UploadFile = File(...)):
+async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = File(...)):
     """รับไฟล์ Excel แล้ว import orders + shipping + shipments เข้า Supabase"""
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx หรือ .xls เท่านั้น")
