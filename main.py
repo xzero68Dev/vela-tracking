@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 THAIPOST_API_KEY = os.getenv("THAIPOST_API_KEY", "")
 SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY     = os.getenv("SUPABASE_KEY", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 TOKEN_URL        = "https://trackapi.thailandpost.co.th/post/api/v1/authenticate/token"
 TRACK_URL        = "https://trackapi.thailandpost.co.th/post/api/v1/track"
 
@@ -164,7 +165,9 @@ _token_cache: dict = {"token": None, "expires_at": 0}
 
 # ---- Supabase client ----
 def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    """ใช้ service role key เพื่อ bypass RLS (backend only)"""
+    key = SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
+    return create_client(SUPABASE_URL, key)
 
 # ---- Status mapping ----
 STATUS_MAP = {
