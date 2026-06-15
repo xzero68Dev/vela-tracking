@@ -69,7 +69,7 @@ async def send_line_notify(line_user_id: str, message: str):
         return False
 
 
-async def send_line_notify(line_user_id: str, message: str):
+async def send_line_notify(line_user_id: str, message: str, barcode: str = "", status: str = "", customer: str = "", phone: str = ""):
     """ส่งข้อความผ่าน LINE OA"""
     token = os.getenv("LINE_CHANNEL_TOKEN", "")
     if not token:
@@ -82,11 +82,29 @@ async def send_line_notify(line_user_id: str, message: str):
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 json={"to": line_user_id, "messages": [{"type": "text", "text": message}]}
             )
-            if resp.status_code == 200:
+            success = resp.status_code == 200
+            if success:
                 print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ")
-                return True
-            print(f"[LINE] ✗ {resp.text}")
-            return False
+            else:
+                print(f"[LINE] ✗ {resp.text}")
+
+            # log ลง sms_logs
+            if barcode and status:
+                try:
+                    sb = get_supabase()
+                    sb.table("sms_logs").insert({
+                        "barcode":      barcode,
+                        "phone":        phone,
+                        "customer":     customer,
+                        "status":       status,
+                        "message":      message,
+                        "success":      success,
+                        "notify_via":   "line",
+                        "delivery_status": "sent" if success else "failed",
+                    }).execute()
+                except Exception as log_err:
+                    print(f"[LINE] log error: {log_err}")
+            return success
     except Exception as e:
         print(f"[LINE] ERROR: {e}")
         return False
@@ -146,13 +164,14 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
         try:
             sb = get_supabase()
             sb.table("sms_logs").insert({
-                "barcode":    barcode,
-                "phone":      phone,
-                "customer":   customer,
-                "status":     status,
-                "message":    message,
-                "success":    success,
-                "message_id": message_id,
+                "barcode":         barcode,
+                "phone":           phone,
+                "customer":        customer,
+                "status":          status,
+                "message":         message,
+                "success":         success,
+                "message_id":      message_id,
+                "notify_via":      "sms",
                 "delivery_status": "sent" if success else "failed",
             }).execute()
         except Exception as e:
@@ -344,8 +363,12 @@ async def run_cron():
             sms_status = status
             if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
                 sms_status = "accepted"
-            if status != old_status and SMS_TEMPLATES.get(sms_status):
-                msg = SMS_TEMPLATES[sms_status]
+            # เลือก template ตาม channel
+            line_msg = LINE_TEMPLATES.get(sms_status)
+            sms_msg  = SMS_TEMPLATES.get(sms_status)
+            has_notify = (line_msg or sms_msg)
+            if status != old_status and has_notify:
+                msg = line_msg or sms_msg
                 ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
                 if ship_row.data:
                     order_id  = ship_row.data[0]["order_id"]
@@ -370,11 +393,21 @@ async def run_cron():
                             if notify == "none":
                                 print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
                             elif notify == "line" and line_uid:
-                                await send_line_notify(line_uid, final_msg)
-                                print(f"[LINE] แจ้ง {customer} → {status}")
+                                # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
+                                if line_msg:
+                                    final_line_msg = line_msg.replace("{barcode}", barcode)
+                                    await send_line_notify(line_uid, final_line_msg, barcode=barcode, status=sms_status, customer=customer, phone=phone)
+                                    print(f"[LINE] แจ้ง {customer} → {status}")
+                                else:
+                                    print(f"[LINE] ข้าม {customer} → ไม่มี LINE template สำหรับ {sms_status}")
                             else:
-                                await send_sms(phone, final_msg, barcode=barcode, status=sms_status, customer=customer)
-                                print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+                                # SMS ใช้ SMS_TEMPLATES (เฉพาะ delivered)
+                                if sms_msg:
+                                    final_sms_msg = sms_msg.replace("{barcode}", barcode)
+                                    await send_sms(phone, final_sms_msg, barcode=barcode, status=sms_status, customer=customer)
+                                    print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+                                else:
+                                    print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
 
                             # แจ้ง admin ถ้ามีปัญหา
                             if status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
