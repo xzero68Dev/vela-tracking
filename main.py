@@ -26,48 +26,29 @@ SMS_API_KEY    = os.getenv("SMS_API_KEY", "")
 SMS_API_SECRET = os.getenv("SMS_API_SECRET", "")
 SMS_SENDER     = "VeLA"
 
+# SMS — ส่งเฉพาะตอนถึงเท่านั้น (ประหยัดเครดิต)
 SMS_TEMPLATES = {
-    "accepted": "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามพัสดุได้เลย: velacoldbrew.com/track/{barcode}",
-    "in_transit": None,  # ไม่ส่ง
-    "out_for_delivery": None,  # ไม่ส่ง
+    "accepted":         None,  # ไม่ส่ง SMS
+    "in_transit":       None,  # ไม่ส่ง SMS
+    "out_for_delivery": None,  # ไม่ส่ง SMS
     "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com",
     "returned": None,  # แจ้ง admin ผ่าน LINE
-    "problem": None,   # แจ้ง admin ผ่าน LINE
+    "problem":  None,  # แจ้ง admin ผ่าน LINE
+}
+
+# LINE — ส่งทั้งตอนจัดส่งและตอนถึง (ฟรี)
+LINE_TEMPLATES = {
+    "accepted": "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามพัสดุได้เลย: velacoldbrew.com/track/{barcode}",
+    "in_transit":       None,
+    "out_for_delivery": None,
+    "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com",
+    "returned": None,
+    "problem":  None,
 }
 
 
 ADMIN_LINE_USER_ID = os.getenv("ADMIN_LINE_USER_ID", "U28d1b5573f79da2f3ff3f52ccc1fcf1c")
 ALERT_STATUSES = {"returned", "problem"}
-
-async def send_line_notify(line_user_id: str, message: str):
-    """ส่งข้อความผ่าน LINE OA โดยใช้ LINE Messaging API"""
-    LINE_CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_TOKEN", "")
-    if not LINE_CHANNEL_TOKEN:
-        print(f"[LINE] ยังไม่ได้ตั้ง LINE_CHANNEL_TOKEN")
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers={
-                    "Authorization": f"Bearer {LINE_CHANNEL_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "to": line_user_id,
-                    "messages": [{"type": "text", "text": message}]
-                }
-            )
-            if resp.status_code == 200:
-                print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ")
-                return True
-            else:
-                print(f"[LINE] ✗ ส่งไม่สำเร็จ: {resp.text}")
-                return False
-    except Exception as e:
-        print(f"[LINE] ERROR: {e}")
-        return False
-
 
 async def send_line_notify(line_user_id: str, message: str, barcode: str = "", status: str = "", customer: str = "", phone: str = ""):
     """ส่งข้อความผ่าน LINE OA"""
