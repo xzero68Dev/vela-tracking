@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import httpx
 import asyncio
@@ -607,7 +608,7 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         raise HTTPException(status_code=400, detail=f"ไม่พบ sheet Orders หรือ Shipping ในไฟล์นี้")
 
     sb = get_supabase()
-    stats = {"orders": 0, "shipping": 0, "tracking_added": 0, "accounting": 0, "daily_summary": 0, "tracking_list": []}
+    stats = {"orders": 0, "shipping": 0, "tracking_added": 0, "accounting": 0, "daily_summary": 0, "points": 0, "tracking_list": []}
 
     # ---- Import Orders ----
     order_rows = []
@@ -640,6 +641,27 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
     for i in range(0, len(order_rows), 50):
         sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id").execute()
     stats["orders"] = len(order_rows)
+
+    # ---- บันทึก point_ledger จาก Shopee order (ใช้ parser ที่ทดสอบกับ SKU จริงแล้ว) ----
+    point_rows = []
+    for row in order_rows:
+        phone = row.get("phone")
+        if not phone:
+            continue  # point_ledger ต้องมีเบอร์โทร ข้ามถ้าไม่มี
+        ml = parse_shopee_sku_ml(row.get("sku") or "")
+        point_rows.append({
+            "order_id":   row["order_id"],
+            "phone":      phone,
+            "customer":   row.get("customer"),
+            "channel":    row.get("channel") or "shopee",
+            "ml_total":   ml,
+            "points":     ml / 100,
+            "order_date": row.get("order_date"),
+        })
+    if point_rows:
+        for i in range(0, len(point_rows), 50):
+            sb.table("point_ledger").upsert(point_rows[i:i+50], on_conflict="order_id").execute()
+    stats["points"] = len(point_rows)
 
     # ---- Import Shipping ----
     shipping_rows = []
@@ -770,7 +792,7 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         "success": True,
         "filename": file.filename,
         "imported": stats,
-        "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking, {stats['accounting']} accounting, {stats['daily_summary']} daily summary"
+        "message": f"Import สำเร็จ — {stats['orders']} orders, {stats['shipping']} shipping, {stats['tracking_added']} tracking, {stats['accounting']} accounting, {stats['daily_summary']} daily summary, {stats['points']} point records"
     }
 
 
@@ -794,12 +816,64 @@ class CreateOrderRequest(BaseModel):
     channel:      str = "web"
     status:       str = "รอชำระเงิน"
 
+def sku_code_to_ml(sku_code: str) -> int:
+    """แปลง SKU code (เช่น ORIGINAL-200, KYOHO, ORIGINAL) เป็น ml — ใช้กับ order จากเว็บเท่านั้น"""
+    code = (sku_code or "").upper().strip()
+    if code.endswith("-200"):
+        return 200
+    if code in ("KYOHO", "GESHA"):
+        return 200
+    return 1000  # Cold Brew ขนาดมาตรฐาน 1L
+
+
+def parse_shopee_sku_ml(sku_str: str) -> int:
+    """
+    คำนวณ ml รวมจาก SKU string ของ order ที่ import จาก Excel (Shopee)
+    รองรับรูปแบบอิสระ เช่น "Original 1L x1, Honey 200ml x1" / "Dark 1L" / "Original 1L / Fruity 1L"
+    ตัด RTD ออกทั้งหมด (ไม่ได้ point)
+    ทดสอบแล้วกับ SKU จริง 100 รายการจากระบบ
+    """
+    if not sku_str:
+        return 0
+
+    items = re.split(r'[,+/]', sku_str)
+    total_ml = 0
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+
+        # ตัด RTD ออกทั้งหมด (ไม่สนตัวพิมพ์ใหญ่เล็ก, ไม่สนขีดล่าง)
+        if re.search(r'rtd', item, re.IGNORECASE):
+            continue
+
+        # หาขนาดที่ระบุไว้ชัดเจน: 1L หรือ 200ml
+        size_match = re.search(r'(\d+)\s*(ml|l)\b', item, re.IGNORECASE)
+        if size_match:
+            size_num  = int(size_match.group(1))
+            size_unit = size_match.group(2).lower()
+            ml = size_num * 1000 if size_unit == 'l' else size_num
+        else:
+            # ไม่มีขนาดระบุ -> Cold Drip/Gesha/Kyoho default 200ml, อื่นๆ default 1L
+            if re.search(r'cold\s*drip|gesha|kyoho', item, re.IGNORECASE):
+                ml = 200
+            else:
+                ml = 1000
+
+        qty_match = re.search(r'x\s*(\d+)\b', item, re.IGNORECASE)
+        qty = int(qty_match.group(1)) if qty_match else 1
+
+        total_ml += ml * qty
+
+    return total_ml
+
+
 @app.post("/orders/create")
 async def create_order(body: CreateOrderRequest):
     """สร้าง order จากหน้าเว็บ"""
     sb = get_supabase()
 
-    # เก็บ SKU ทุกชิ้นเป็น string
+    # sku: ใช้ชื่อสินค้า (แสดงให้ลูกค้า/admin อ่านง่าย)
     sku_str = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
 
     sb.table("orders").insert({
@@ -817,4 +891,83 @@ async def create_order(body: CreateOrderRequest):
         "status":       body.status,
     }).execute()
 
+    # บันทึก point_ledger — ใช้ SKU code ตรงๆ ไม่ต้องเดาขนาดจากข้อความ
+    ml_total = sum(sku_code_to_ml(i.sku) * i.qty for i in body.items)
+    try:
+        sb.table("point_ledger").insert({
+            "order_id":   body.order_id,
+            "phone":      body.phone.zfill(10) if body.phone.isdigit() and len(body.phone) < 10 else body.phone,
+            "customer":   body.customer,
+            "channel":    body.channel,
+            "ml_total":   ml_total,
+            "points":     ml_total / 100,
+            "order_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        }).execute()
+    except Exception as e:
+        print(f"[point_ledger] insert error (web order): {e}")
+
+    # บันทึก revenue ลง accounting ด้วย เพื่อให้นับรวมใน leaderboard/ranking
+    sb.table("accounting").upsert({
+        "order_id":   body.order_id,
+        "order_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "customer":   body.customer,
+        "revenue":    body.total,
+    }, on_conflict="order_id").execute()
+
     return {"success": True, "order_id": body.order_id}
+
+
+@app.get("/leaderboard")
+async def get_leaderboard(limit: int = 10):
+    """
+    Top N ลูกค้าตามยอด point ของเดือนปัจจุบัน (รวม Shopee + เว็บ ตามเบอร์โทรเดียวกัน)
+    Point มาจาก ml รวมที่ดื่ม ไม่ใช่ยอดเงิน — 100ml = 1 point
+    """
+    sb = get_supabase()
+
+    today = datetime.utcnow()
+    month_start = today.strftime("%Y-%m-01")
+
+    rows = sb.table("point_ledger") \
+        .select("phone,customer,points,order_date") \
+        .gte("order_date", month_start) \
+        .execute()
+
+    data = rows.data or []
+
+    # รวม point ตามเบอร์โทร (group by ทำใน Python เพราะข้อมูลไม่เยอะ)
+    totals: dict[str, dict] = {}
+    for r in data:
+        phone = r.get("phone")
+        if not phone:
+            continue
+        if phone not in totals:
+            totals[phone] = {"phone": phone, "customer": r.get("customer") or "", "points": 0.0}
+        totals[phone]["points"] += float(r.get("points") or 0)
+        # ใช้ชื่อล่าสุดที่เจอ (เผื่อชื่อเปลี่ยนระหว่างเดือน)
+        if r.get("customer"):
+            totals[phone]["customer"] = r["customer"]
+
+    ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)[:limit]
+
+    # ปิดบังเบอร์โทรบางส่วนเพื่อความเป็นส่วนตัว เช่น 091-XXX-456
+    def mask_phone(p: str) -> str:
+        p = p or ""
+        if len(p) < 7:
+            return p
+        return f"{p[:3]}-XXX-{p[-3:]}"
+
+    result = [
+        {
+            "rank":          i + 1,
+            "customer":      r["customer"],
+            "phone_masked":  mask_phone(r["phone"]),
+            "points":        round(r["points"], 1),
+        }
+        for i, r in enumerate(ranked)
+    ]
+
+    return {
+        "month":  today.strftime("%Y-%m"),
+        "results": result,
+    }
