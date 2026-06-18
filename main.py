@@ -642,10 +642,14 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id").execute()
     stats["orders"] = len(order_rows)
 
-    # ---- บันทึก point_ledger จาก Shopee order (ใช้ parser ที่ทดสอบกับ SKU จริงแล้ว) ----
+    # ---- บันทึก point_ledger จาก Shopee order ที่ชำระแล้วเท่านั้น (ใช้ parser ที่ทดสอบกับ SKU จริงแล้ว) ----
     point_rows = []
     skipped_no_date = 0
+    skipped_unpaid  = 0
     for row in order_rows:
+        if row.get("status") != "ชำระแล้ว":
+            skipped_unpaid += 1
+            continue  # ให้ point เฉพาะ order ที่ชำระเงินแล้วเท่านั้น
         phone = row.get("phone")
         if not phone:
             continue  # point_ledger ต้องมีเบอร์โทร ข้ามถ้าไม่มี
@@ -671,6 +675,8 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
     stats["points"] = len(point_rows)
     if skipped_no_date:
         print(f"[point_ledger] ข้าม {skipped_no_date} order ที่ไม่มี order_date ที่ถูกต้อง")
+    if skipped_unpaid:
+        print(f"[point_ledger] ข้าม {skipped_unpaid} order ที่ยังไม่ชำระเงิน (จะได้ point ตอน import รอบหน้าถ้าสถานะอัปเดตเป็นชำระแล้ว)")
 
     # ---- Import Shipping ----
     shipping_rows = []
@@ -863,8 +869,8 @@ def parse_shopee_sku_ml(sku_str: str) -> int:
             size_unit = size_match.group(2).lower()
             ml = size_num * 1000 if size_unit == 'l' else size_num
         else:
-            # ไม่มีขนาดระบุ -> Cold Drip/Gesha/Kyoho default 200ml, อื่นๆ default 1L
-            if re.search(r'cold\s*drip|gesha|kyoho', item, re.IGNORECASE):
+            # ไม่มีขนาดระบุ -> Cold Drip/Gesha/Kyoho/ขนาดทดลอง default 200ml, อื่นๆ default 1L
+            if re.search(r'cold\s*drip|gesha|kyoho|ขนาดทดลอง', item, re.IGNORECASE):
                 ml = 200
             else:
                 ml = 1000
@@ -879,7 +885,7 @@ def parse_shopee_sku_ml(sku_str: str) -> int:
 
 @app.post("/orders/create")
 async def create_order(body: CreateOrderRequest):
-    """สร้าง order จากหน้าเว็บ"""
+    """สร้าง order จากหน้าเว็บ — ยังไม่ให้ point ตรงนี้ ต้องรอยืนยันการชำระเงินก่อน (ดู /admin/confirm-payment)"""
     sb = get_supabase()
 
     # sku: ใช้ชื่อสินค้า (แสดงให้ลูกค้า/admin อ่านง่าย)
@@ -900,21 +906,6 @@ async def create_order(body: CreateOrderRequest):
         "status":       body.status,
     }).execute()
 
-    # บันทึก point_ledger — ใช้ SKU code ตรงๆ ไม่ต้องเดาขนาดจากข้อความ
-    ml_total = sum(sku_code_to_ml(i.sku) * i.qty for i in body.items)
-    try:
-        sb.table("point_ledger").insert({
-            "order_id":   body.order_id,
-            "phone":      body.phone.zfill(10) if body.phone.isdigit() and len(body.phone) < 10 else body.phone,
-            "customer":   body.customer,
-            "channel":    body.channel,
-            "ml_total":   ml_total,
-            "points":     ml_total / 100,
-            "order_date": datetime.utcnow().strftime("%Y-%m-%d"),
-        }).execute()
-    except Exception as e:
-        print(f"[point_ledger] insert error (web order): {e}")
-
     # บันทึก revenue ลง accounting ด้วย เพื่อให้นับรวมใน leaderboard/ranking
     sb.table("accounting").upsert({
         "order_id":   body.order_id,
@@ -924,6 +915,62 @@ async def create_order(body: CreateOrderRequest):
     }, on_conflict="order_id").execute()
 
     return {"success": True, "order_id": body.order_id}
+
+
+@app.post("/admin/confirm-payment")
+async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
+    """
+    ยืนยันการชำระเงินของ order — แทนที่การ PATCH ตรงไปยัง Supabase จากหน้า admin เดิม
+    ทำ 2 อย่างพร้อมกัน: (1) อัปเดต status เป็น 'ชำระแล้ว' พร้อม paid_at
+                        (2) คำนวณ point จาก sku ของ order แล้วบันทึกลง point_ledger
+    Point จะเข้าระบบ "ตอนยืนยันชำระเงินแล้วเท่านั้น" ไม่ใช่ตอนสั่งซื้อ
+    """
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+
+    # ดึง order มาก่อน เพื่อเอา sku/phone/customer/channel/order_date ไปคำนวณ point
+    res = sb.table("orders").select("*").eq("order_id", order_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ order_id: {order_id}")
+    order = res.data[0]
+
+    paid_at = datetime.utcnow().isoformat()
+
+    # 1) อัปเดตสถานะเป็นชำระแล้ว
+    sb.table("orders").update({
+        "status":  "ชำระแล้ว",
+        "paid_at": paid_at,
+    }).eq("order_id", order_id).execute()
+
+    # 2) คำนวณ point จาก sku string ที่เก็บไว้ (ใช้ parser เดียวกันทุกช่องทาง)
+    phone = order.get("phone")
+    point_result = None
+    if phone:
+        ml = parse_shopee_sku_ml(order.get("sku") or "")
+        order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            sb.table("point_ledger").upsert({
+                "order_id":   order_id,
+                "phone":      phone,
+                "customer":   order.get("customer"),
+                "channel":    order.get("channel") or "web",
+                "ml_total":   ml,
+                "points":     ml / 100,
+                "order_date": order_date,
+            }, on_conflict="order_id").execute()
+            point_result = {"ml_total": ml, "points": ml / 100}
+        except Exception as e:
+            print(f"[point_ledger] insert error (confirm-payment {order_id}): {e}")
+    else:
+        print(f"[point_ledger] ข้าม {order_id} — ไม่มีเบอร์โทร")
+
+    return {
+        "success":  True,
+        "order_id": order_id,
+        "status":   "ชำระแล้ว",
+        "paid_at":  paid_at,
+        "points":   point_result,
+    }
 
 
 @app.get("/leaderboard")
