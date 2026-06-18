@@ -644,10 +644,17 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
 
     # ---- บันทึก point_ledger จาก Shopee order (ใช้ parser ที่ทดสอบกับ SKU จริงแล้ว) ----
     point_rows = []
+    skipped_no_date = 0
     for row in order_rows:
         phone = row.get("phone")
         if not phone:
             continue  # point_ledger ต้องมีเบอร์โทร ข้ามถ้าไม่มี
+        order_date = row.get("order_date")
+        if not order_date:
+            # safe_date() อาจ return None ถ้าวันที่ใน Excel ผิดรูปแบบ/ว่าง
+            # point_ledger.order_date เป็น NOT NULL — ข้ามแถวนี้ ไม่ให้พังทั้ง batch
+            skipped_no_date += 1
+            continue
         ml = parse_shopee_sku_ml(row.get("sku") or "")
         point_rows.append({
             "order_id":   row["order_id"],
@@ -656,12 +663,14 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
             "channel":    row.get("channel") or "shopee",
             "ml_total":   ml,
             "points":     ml / 100,
-            "order_date": row.get("order_date"),
+            "order_date": order_date,
         })
     if point_rows:
         for i in range(0, len(point_rows), 50):
             sb.table("point_ledger").upsert(point_rows[i:i+50], on_conflict="order_id").execute()
     stats["points"] = len(point_rows)
+    if skipped_no_date:
+        print(f"[point_ledger] ข้าม {skipped_no_date} order ที่ไม่มี order_date ที่ถูกต้อง")
 
     # ---- Import Shipping ----
     shipping_rows = []
@@ -918,10 +927,13 @@ async def create_order(body: CreateOrderRequest):
 
 
 @app.get("/leaderboard")
-async def get_leaderboard(limit: int = 10):
+async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
     """
-    Top N ลูกค้าตามยอด point ของเดือนปัจจุบัน (รวม Shopee + เว็บ ตามเบอร์โทรเดียวกัน)
+    จัดอันดับลูกค้าตามยอด point ของเดือนปัจจุบัน (รวม Shopee + เว็บ ตามเบอร์โทรเดียวกัน)
     Point มาจาก ml รวมที่ดื่ม ไม่ใช่ยอดเงิน — 100ml = 1 point
+
+    - limit: จำนวน top ranking ที่จะแสดง (ค่าเริ่มต้น 10)
+    - phone: ถ้าระบุ จะคืนอันดับ/point ของเบอร์นี้มาด้วย แม้จะอยู่นอก top N ก็ตาม
     """
     sb = get_supabase()
 
@@ -938,17 +950,18 @@ async def get_leaderboard(limit: int = 10):
     # รวม point ตามเบอร์โทร (group by ทำใน Python เพราะข้อมูลไม่เยอะ)
     totals: dict[str, dict] = {}
     for r in data:
-        phone = r.get("phone")
-        if not phone:
+        p = r.get("phone")
+        if not p:
             continue
-        if phone not in totals:
-            totals[phone] = {"phone": phone, "customer": r.get("customer") or "", "points": 0.0}
-        totals[phone]["points"] += float(r.get("points") or 0)
+        if p not in totals:
+            totals[p] = {"phone": p, "customer": r.get("customer") or "", "points": 0.0}
+        totals[p]["points"] += float(r.get("points") or 0)
         # ใช้ชื่อล่าสุดที่เจอ (เผื่อชื่อเปลี่ยนระหว่างเดือน)
         if r.get("customer"):
-            totals[phone]["customer"] = r["customer"]
+            totals[p]["customer"] = r["customer"]
 
-    ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)[:limit]
+    # จัดอันดับทั้งหมดก่อน (ไม่ตัด limit) เพื่อให้หา rank ของเบอร์เฉพาะได้แม้อยู่นอก top N
+    full_ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)
 
     # ปิดบังเบอร์โทรบางส่วนเพื่อความเป็นส่วนตัว เช่น 091-XXX-456
     def mask_phone(p: str) -> str:
@@ -957,17 +970,32 @@ async def get_leaderboard(limit: int = 10):
             return p
         return f"{p[:3]}-XXX-{p[-3:]}"
 
-    result = [
+    top_n = [
         {
             "rank":          i + 1,
             "customer":      r["customer"],
             "phone_masked":  mask_phone(r["phone"]),
             "points":        round(r["points"], 1),
         }
-        for i, r in enumerate(ranked)
+        for i, r in enumerate(full_ranked[:limit])
     ]
 
-    return {
-        "month":  today.strftime("%Y-%m"),
-        "results": result,
+    response = {
+        "month":   today.strftime("%Y-%m"),
+        "results": top_n,
+        "total_participants": len(full_ranked),
     }
+
+    # ถ้าระบุเบอร์ — หา rank จริงของเบอร์นั้นในทั้งหมด (ไม่จำกัดแค่ top N)
+    if phone:
+        my_rank = None
+        for i, r in enumerate(full_ranked):
+            if r["phone"] == phone:
+                my_rank = {
+                    "rank":   i + 1,
+                    "points": round(r["points"], 1),
+                }
+                break
+        response["me"] = my_rank  # None ถ้าเบอร์นี้ยังไม่มี point เดือนนี้
+
+    return response
