@@ -904,6 +904,7 @@ async def create_order(body: CreateOrderRequest):
         "qty":          sum(i.qty for i in body.items),
         "channel":      body.channel,
         "status":       body.status,
+        "total":        body.total,
     }).execute()
 
     # บันทึก revenue ลง accounting ด้วย เพื่อให้นับรวมใน leaderboard/ranking
