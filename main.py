@@ -918,6 +918,52 @@ async def create_order(body: CreateOrderRequest):
     return {"success": True, "order_id": body.order_id}
 
 
+@app.post("/admin/confirm-payment")
+async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
+    """ยืนยันการชำระเงิน — อัปเดตสถานะเป็น 'ชำระแล้ว' และให้ point ทันที"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+
+    res = sb.table("orders").select("*").eq("order_id", order_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ order_id: {order_id}")
+    order = res.data[0]
+
+    paid_at = datetime.utcnow().isoformat()
+
+    sb.table("orders").update({
+        "status":  "ชำระแล้ว",
+        "paid_at": paid_at,
+    }).eq("order_id", order_id).execute()
+
+    phone = order.get("phone")
+    point_result = None
+    if phone:
+        ml = parse_shopee_sku_ml(order.get("sku") or "")
+        order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            sb.table("point_ledger").upsert({
+                "order_id":   order_id,
+                "phone":      phone,
+                "customer":   order.get("customer"),
+                "channel":    order.get("channel") or "web",
+                "ml_total":   ml,
+                "points":     ml / 100,
+                "order_date": order_date,
+            }, on_conflict="order_id").execute()
+            point_result = {"ml_total": ml, "points": ml / 100}
+        except Exception as e:
+            print(f"[point_ledger] insert error (confirm-payment {order_id}): {e}")
+
+    return {
+        "success":  True,
+        "order_id": order_id,
+        "status":   "ชำระแล้ว",
+        "paid_at":  paid_at,
+        "points":   point_result,
+    }
+
+
 class AddShippingRequest(BaseModel):
     order_id:      str
     tracking:      str
