@@ -917,7 +917,50 @@ async def create_order(body: CreateOrderRequest):
     return {"success": True, "order_id": body.order_id}
 
 
-@app.post("/admin/confirm-payment")
+class AddShippingRequest(BaseModel):
+    order_id:      str
+    tracking:      str
+    carrier:       str = "POST SABUY"
+    ship_date:     Optional[str] = None
+    weight_g:      Optional[int] = None
+    shipping_cost: Optional[float] = None
+
+
+@app.post("/admin/add-shipping")
+async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default="")):
+    """เพิ่มข้อมูลการจัดส่งจากหน้า admin — บันทึกลง shipping และ shipments"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+
+    ship_date = body.ship_date or datetime.utcnow().strftime("%Y-%m-%d")
+
+    # บันทึกลง shipping table
+    sb.table("shipping").upsert({
+        "order_id":      body.order_id,
+        "ship_date":     ship_date,
+        "carrier":       body.carrier,
+        "tracking":      body.tracking.strip().upper(),
+        "weight_g":      body.weight_g,
+        "shipping_cost": body.shipping_cost,
+    }, on_conflict="tracking").execute()
+
+    # อัปเดตสถานะ order เป็นจัดส่งแล้ว
+    sb.table("orders").update({
+        "status":    "จัดส่งแล้ว",
+        "ship_date": ship_date,
+    }).eq("order_id", body.order_id).execute()
+
+    # เพิ่มลง shipments (tracking system) ถ้ายังไม่มี
+    existing = sb.table("shipments").select("barcode").eq("barcode", body.tracking.strip().upper()).execute()
+    if not existing.data:
+        sb.table("shipments").insert({
+            "barcode":  body.tracking.strip().upper(),
+            "status":   "pending",
+        }).execute()
+
+    return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
+
+
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     """
     ยืนยันการชำระเงินของ order — แทนที่การ PATCH ตรงไปยัง Supabase จากหน้า admin เดิม
