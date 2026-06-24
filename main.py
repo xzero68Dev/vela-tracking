@@ -1063,6 +1063,77 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     }
 
 
+
+
+# ---- OTP Login ----
+import random
+OTP_STORE: dict[str, dict] = {}  # phone -> {otp, expires}
+
+class OTPRequestBody(BaseModel):
+    phone: str
+
+class OTPVerifyBody(BaseModel):
+    phone: str
+    otp:   str
+    name:  Optional[str] = None
+
+@app.post("/auth/request-otp")
+async def request_otp(body: OTPRequestBody):
+    """ส่ง OTP ไปยังเบอร์โทร"""
+    phone = body.phone.replace("-","").replace(" ","").strip()
+    if len(phone) < 9:
+        raise HTTPException(status_code=400, detail="เบอร์โทรไม่ถูกต้อง")
+
+    # สร้าง OTP 6 หลัก
+    otp = str(random.randint(100000, 999999))
+    import time
+    OTP_STORE[phone] = {"otp": otp, "expires": time.time() + 300}  # หมดอายุ 5 นาที
+
+    # ส่ง SMS
+    msg = f"VeLA Cold Brew: รหัส OTP ของคุณคือ {otp} (หมดอายุใน 5 นาที)"
+    success = await send_sms(phone, msg)
+
+    if not success:
+        raise HTTPException(status_code=500, detail="ส่ง OTP ไม่สำเร็จ")
+
+    return {"success": True, "message": "ส่ง OTP แล้ว"}
+
+
+@app.post("/auth/verify-otp")
+async def verify_otp(body: OTPVerifyBody):
+    """ตรวจสอบ OTP และ login/สร้าง account"""
+    import time
+    phone = body.phone.replace("-","").replace(" ","").strip()
+
+    stored = OTP_STORE.get(phone)
+    if not stored:
+        raise HTTPException(status_code=400, detail="ไม่พบ OTP กรุณาขอใหม่")
+    if time.time() > stored["expires"]:
+        del OTP_STORE[phone]
+        raise HTTPException(status_code=400, detail="OTP หมดอายุแล้ว กรุณาขอใหม่")
+    if stored["otp"] != body.otp.strip():
+        raise HTTPException(status_code=400, detail="OTP ไม่ถูกต้อง")
+
+    # OTP ถูกต้อง — ลบทิ้ง
+    del OTP_STORE[phone]
+
+    sb = get_supabase()
+
+    # เช็คว่ามี customer เบอร์นี้ไหม
+    res = sb.table("customers").select("*").eq("phone", phone).execute()
+    customer = res.data[0] if res.data else None
+
+    if not customer:
+        # สร้างใหม่
+        name = body.name or f"ลูกค้า VeLA"
+        ins = sb.table("customers").insert({
+            "phone":        phone,
+            "display_name": name,
+        }).execute()
+        customer = ins.data[0] if ins.data else {"phone": phone, "display_name": name}
+
+    return {"success": True, "customer": customer}
+
 @app.get("/leaderboard")
 async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
     """
