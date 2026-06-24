@@ -1136,3 +1136,54 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
         response["me"] = my_rank  # None ถ้าเบอร์นี้ยังไม่มี point เดือนนี้
 
     return response
+
+
+class LineOAuthRequest(BaseModel):
+    code:         str
+    redirect_uri: str
+
+@app.post("/auth/line-oauth")
+async def line_oauth(body: LineOAuthRequest):
+    """แลก LINE OAuth code เป็น profile — ทำฝั่ง server เพราะต้องใช้ Channel Secret"""
+    LINE_CHANNEL_ID     = os.getenv("LINE_CHANNEL_ID", "2010290578")
+    LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+
+    # แลก code เป็น access token
+    async with httpx.AsyncClient(timeout=10) as client:
+        token_res = await client.post(
+            "https://api.line.me/oauth2/v2.1/token",
+            data={
+                "grant_type":    "authorization_code",
+                "code":          body.code,
+                "redirect_uri":  body.redirect_uri,
+                "client_id":     LINE_CHANNEL_ID,
+                "client_secret": LINE_CHANNEL_SECRET,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if token_res.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"LINE token error: {token_res.text}")
+        token_data = token_res.json()
+        access_token = token_data.get("access_token")
+
+        # ดึง profile
+        profile_res = await client.get(
+            "https://api.line.me/v2/profile",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if profile_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="LINE profile error")
+        profile = profile_res.json()
+
+    # upsert ลง customers
+    sb = get_supabase()
+    sb.table("customers").upsert({
+        "line_user_id": profile["userId"],
+        "display_name": profile.get("displayName"),
+        "picture_url":  profile.get("pictureUrl"),
+    }, on_conflict="line_user_id").execute()
+
+    res = sb.table("customers").select("*").eq("line_user_id", profile["userId"]).execute()
+    customer = res.data[0] if res.data else None
+
+    return {"success": True, "customer": customer}
