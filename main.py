@@ -1183,6 +1183,12 @@ async def line_oauth(body: LineOAuthRequest):
         "picture_url":  profile.get("pictureUrl"),
     }, on_conflict="line_user_id").execute()
 
+    # อัปเดต picture_url แยกเพื่อให้แน่ใจว่าอัปเดตจริง (upsert อาจ skip ถ้า row มีอยู่แล้ว)
+    sb.table("customers").update({
+        "display_name": profile.get("displayName"),
+        "picture_url":  profile.get("pictureUrl"),
+    }).eq("line_user_id", profile["userId"]).execute()
+
     res = sb.table("customers").select("*").eq("line_user_id", profile["userId"]).execute()
     customer = res.data[0] if res.data else None
 
