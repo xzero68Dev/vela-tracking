@@ -188,9 +188,12 @@ STATUS_MAP = {
     "211": ("in_transit",        "รับเข้าศูนย์คัดแยก"),
     "212": ("in_transit",        "อยู่ระหว่างขนส่ง"),
     "301": ("in_transit",        "อยู่ระหว่างขนส่ง"),
+    "302": ("in_transit",        "อยู่ระหว่างขนส่ง"),
     "303": ("delivered",         "ผู้รับมารับเอง"),
     "304": ("problem",           "ติดต่อผู้รับไม่ได้"),
-    "302": ("in_transit",        "อยู่ระหว่างขนส่ง"),
+    "305": ("returned",          "ผู้รับปฏิเสธการรับ"),  # นำจ่ายไม่สำเร็จ - ปฏิเสธรับ
+    "306": ("returned",          "ส่งคืนต้นทาง"),         # ส่งคืนต้นทาง
+    "307": ("returned",          "ผู้รับปฏิเสธการรับ"),
     "401": ("out_for_delivery",  "ออกนำจ่ายแล้ว"),
     "402": ("out_for_delivery",  "ออกนำจ่ายแล้ว"),
     "501": ("delivered",         "จัดส่งสำเร็จ"),
@@ -200,7 +203,7 @@ STATUS_MAP = {
     "600": ("returned",          "ตีกลับ"),
     "601": ("returned",          "ตีกลับ"),
     "602": ("returned",          "ตีกลับ"),
-    "603": ("returned",          "ตีกลับ"),
+    "603": ("returned",          "ส่งคืนต้นทาง"),
     "700": ("problem",           "มีปัญหา"),
     "701": ("problem",           "มีปัญหา"),
 }
@@ -465,20 +468,58 @@ async def track_single(barcode: str):
 
 @app.post("/track/bulk")
 async def track_bulk(body: BulkRequest):
-    """เช็คสถานะพัสดุหลายชิ้นพร้อมกัน (real-time, สูงสุด 20)"""
+    """เช็คสถานะพัสดุหลายชิ้นพร้อมกัน (real-time, สูงสุด 20)
+    ตรวจสอบก่อนว่าเลข tracking อยู่ในระบบร้านไหม เพื่อป้องกันการเช็คเลขของคนอื่น
+    """
     barcodes = [b.upper().strip() for b in body.barcodes if b.strip()]
     if not barcodes:
         raise HTTPException(status_code=400, detail="กรุณาระบุ barcodes")
     if len(barcodes) > 20:
         raise HTTPException(status_code=400, detail="ส่งได้สูงสุด 20 เลขต่อครั้ง")
-    tasks   = [fetch_tracking(b) for b in barcodes]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    output  = []
-    for barcode, result in zip(barcodes, results):
-        if isinstance(result, Exception):
-            output.append({"barcode": barcode, "status": "error", "error": str(result)})
+
+    # เช็คก่อนว่าเลขเหล่านี้อยู่ในระบบร้านไหม (shipments หรือ shipping table)
+    sb = get_supabase()
+    barcodes_str = ",".join(f'"{b}"' for b in barcodes)
+
+    valid_barcodes = set()
+    try:
+        # เช็คจาก shipments table (cron tracking)
+        res1 = sb.table("shipments").select("barcode").in_("barcode", barcodes).execute()
+        for row in (res1.data or []):
+            valid_barcodes.add(row["barcode"].upper())
+
+        # เช็คจาก shipping table (เลข tracking จาก admin)
+        res2 = sb.table("shipping").select("tracking").in_("tracking", barcodes).execute()
+        for row in (res2.data or []):
+            if row.get("tracking"):
+                valid_barcodes.add(row["tracking"].upper())
+    except Exception as e:
+        print(f"[track/bulk] เช็ค DB error: {e}")
+        # ถ้า DB error ให้ผ่านไปได้เลย ไม่ block ลูกค้า
+        valid_barcodes = set(barcodes)
+
+    output = []
+    valid_to_fetch = []
+    for b in barcodes:
+        if b in valid_barcodes:
+            valid_to_fetch.append(b)
         else:
-            output.append(result)
+            # เลขไม่อยู่ในระบบร้าน — ไม่เรียก API ขนส่ง
+            output.append({
+                "barcode": b,
+                "status": "not_found",
+                "status_th": "ไม่พบเลขพัสดุในระบบ",
+            })
+
+    if valid_to_fetch:
+        tasks   = [fetch_tracking(b) for b in valid_to_fetch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for barcode, result in zip(valid_to_fetch, results):
+            if isinstance(result, Exception):
+                output.append({"barcode": barcode, "status": "error", "error": str(result)})
+            else:
+                output.append(result)
+
     return {"results": output, "total": len(output)}
 
 
@@ -915,6 +956,16 @@ async def create_order(body: CreateOrderRequest):
         "revenue":    body.total,
     }, on_conflict="order_id").execute()
 
+    # แจ้ง admin ตอนมีออเดอร์ใหม่จากเว็บ
+    sku_summary = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
+    await send_line_notify(
+        ADMIN_LINE_USER_ID,
+        f"🛒 ออเดอร์ใหม่! {body.customer} ({body.phone})\n"
+        f"สินค้า: {sku_summary}\n"
+        f"ยอด: ฿{body.total:,.0f}\n"
+        f"Order ID: {body.order_id}"
+    )
+
     return {"success": True, "order_id": body.order_id}
 
 
@@ -1131,6 +1182,12 @@ async def verify_otp(body: OTPVerifyBody):
             "display_name": name,
         }).execute()
         customer = ins.data[0] if ins.data else {"phone": phone, "display_name": name}
+
+        # แจ้ง admin ตอนมีสมาชิกใหม่สมัครด้วยเบอร์โทร
+        await send_line_notify(
+            ADMIN_LINE_USER_ID,
+            f"🆕 สมาชิกใหม่! {name} ({phone}) สมัครผ่านเว็บ velacoldbrew.com"
+        )
 
     return {"success": True, "customer": customer}
 
