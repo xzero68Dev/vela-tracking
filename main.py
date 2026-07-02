@@ -1088,6 +1088,45 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
     return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
 
 
+@app.post("/admin/confirm-delivered")
+async def confirm_delivered(order_id: str, x_api_key: str = Header(default="")):
+    """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+
+    res = sb.table("orders").select("*").eq("order_id", order_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ order_id: {order_id}")
+    order = res.data[0]
+
+    sb.table("orders").update({"status": "จัดส่งสำเร็จ"}).eq("order_id", order_id).execute()
+
+    phone    = order.get("phone", "")
+    customer = order.get("customer", "")
+
+    ship_res = sb.table("shipping").select("tracking").eq("order_id", order_id).execute()
+    tracking = ship_res.data[0].get("tracking", "") if ship_res.data else ""
+
+    if phone:
+        notify   = "sms"
+        line_uid = ""
+        try:
+            cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
+            if cust.data:
+                notify   = cust.data[0].get("notify_channel") or "sms"
+                line_uid = cust.data[0].get("line_user_id") or ""
+        except:
+            pass
+
+        msg = "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com"
+        if notify == "line" and line_uid:
+            await send_line_notify(line_uid, msg)
+        else:
+            await send_sms(phone, msg, barcode=tracking, status="delivered", customer=customer)
+
+    return {"success": True, "order_id": order_id, "notified": bool(phone)}
+
+
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     """
     ยืนยันการชำระเงินของ order — แทนที่การ PATCH ตรงไปยัง Supabase จากหน้า admin เดิม
