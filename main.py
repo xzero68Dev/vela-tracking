@@ -969,7 +969,36 @@ async def create_order(body: CreateOrderRequest):
     return {"success": True, "order_id": body.order_id}
 
 
-@app.post("/admin/confirm-payment")
+class SlipNotifyRequest(BaseModel):
+    order_id: str
+    slip_url: str
+
+@app.post("/orders/slip-notify")
+async def slip_notify(body: SlipNotifyRequest):
+    """แจ้ง admin ตอนลูกค้าอัปโหลดสลิปชำระเงิน"""
+    sb = get_supabase()
+
+    # ดึงข้อมูล order
+    res = sb.table("orders").select("customer,phone,total").eq("order_id", body.order_id).execute()
+    order = res.data[0] if res.data else {}
+    customer = order.get("customer", "ลูกค้า")
+    phone    = order.get("phone", "")
+    total    = order.get("total", 0)
+
+    # แจ้ง admin ผ่าน LINE
+    msg = (
+        f"💳 ลูกค้าส่งสลิปแล้ว!\n"
+        f"ชื่อ: {customer}"
+        + (f" ({phone})" if phone else "") +
+        f"\nOrder: {body.order_id}"
+        + (f"\nยอด: ฿{total:,.0f}" if total else "") +
+        f"\nกรุณายืนยันชำระเงินใน /admin/orders"
+    )
+    await send_line_notify(ADMIN_LINE_USER_ID, msg)
+
+    return {"success": True}
+
+
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     """ยืนยันการชำระเงิน — อัปเดตสถานะเป็น 'ชำระแล้ว' และให้ point ทันที"""
     check_admin_key(x_api_key)
