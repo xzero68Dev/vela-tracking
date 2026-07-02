@@ -1289,9 +1289,24 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
         if p not in totals:
             totals[p] = {"phone": p, "customer": r.get("customer") or "", "points": 0.0}
         totals[p]["points"] += float(r.get("points") or 0)
-        # ใช้ชื่อล่าสุดที่เจอ (เผื่อชื่อเปลี่ยนระหว่างเดือน)
         if r.get("customer"):
             totals[p]["customer"] = r["customer"]
+
+    # ดึงชื่อที่แสดงจาก customers table (customers.name ที่ลูกค้าตั้งเอง หรือ display_name จาก LINE)
+    phones = list(totals.keys())
+    if phones:
+        try:
+            cust_res = sb.table("customers").select("phone,name,display_name") \
+                .in_("phone", phones).execute()
+            for c in (cust_res.data or []):
+                p = c.get("phone")
+                if p and p in totals:
+                    # ใช้ customers.name ถ้ามี (ลูกค้าตั้งเอง) ไม่งั้นใช้ display_name (LINE)
+                    display = c.get("name") or c.get("display_name") or totals[p]["customer"]
+                    if display:
+                        totals[p]["customer"] = display
+        except Exception:
+            pass
 
     # จัดอันดับทั้งหมดก่อน (ไม่ตัด limit) เพื่อให้หา rank ของเบอร์เฉพาะได้แม้อยู่นอก top N
     full_ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)
