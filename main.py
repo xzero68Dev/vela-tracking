@@ -1331,6 +1331,14 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
                 break
         response["me"] = my_rank  # None ถ้าเบอร์นี้ยังไม่มี point เดือนนี้
 
+        # point สะสมทั้งหมดตลอดกาล (ไม่กรองตามเดือน)
+        all_rows = sb.table("point_ledger") \
+            .select("points") \
+            .eq("phone", phone) \
+            .execute()
+        total_all = sum(float(r.get("points") or 0) for r in (all_rows.data or []))
+        response["total_points_all_time"] = round(total_all, 1)
+
     return response
 
 
