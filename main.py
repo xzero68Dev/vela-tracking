@@ -4,7 +4,7 @@ import time
 import httpx
 import asyncio
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -291,6 +291,23 @@ async def run_cron():
 
     print("[cron] เริ่มเช็คสถานะพัสดุที่ยังไม่เสร็จ...")
     sb = get_supabase()
+
+    # ลบ order เว็บที่รอชำระเกิน 48 ชั่วโมง
+    try:
+        expire_cutoff = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+        expired = sb.table("orders") \
+            .select("order_id,customer,phone") \
+            .eq("status", "รอชำระเงิน") \
+            .eq("channel", "web") \
+            .lt("created_at", expire_cutoff) \
+            .execute()
+        if expired.data:
+            expired_ids = [r["order_id"] for r in expired.data]
+            sb.table("orders").delete().in_("order_id", expired_ids).execute()
+            print(f"[cron] ลบ order หมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
+    except Exception as e:
+        print(f"[cron] expire error: {e}")
+
     rows = sb.table("shipments").select("barcode").eq("is_done", False).execute()
     barcodes = [r["barcode"] for r in (rows.data or [])]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
