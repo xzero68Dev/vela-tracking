@@ -239,60 +239,63 @@ async def get_access_token() -> str:
 
 
 def detect_carrier(barcode: str) -> str:
-    """ตรวจสอบขนส่งจาก format เลข tracking"""
+    """ตรวจสอบขนส่งจาก format เลข tracking — ใช้ courier code ของ eTrackings"""
     b = barcode.upper()
-    if re.match(r'^(TH|SCPK|SXF)', b):   return "kerry_express"
-    if re.match(r'^(FLE|FEX)', b):         return "flash_express"
-    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt_express"
-    if re.match(r'^SCG', b):               return "scg_express"
-    return "thailand_post"  # default
+    if re.match(r'^(TH|SCPK|SXF)', b):   return "kex-express"
+    if re.match(r'^(FLE|FEX)', b):         return "flash-express"
+    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt-express"
+    if re.match(r'^SCG', b):               return "scg-express"
+    return "thailand_post"  # default ไปรษณีย์ไทย
 
 
 async def fetch_etrackings(barcode: str, courier: str) -> dict:
     """ดึงสถานะพัสดุจาก eTrackings API (Kerry, Flash, J&T)"""
     ETRACK_STATUS_MAP = {
-        "delivered":     ("delivered",        "จัดส่งสำเร็จ"),
-        "in_transit":    ("in_transit",        "อยู่ระหว่างขนส่ง"),
-        "out_for_delivery": ("out_for_delivery", "ออกนำจ่ายแล้ว"),
-        "pickup":        ("accepted",          "รับฝากแล้ว"),
-        "failed":        ("problem",           "จัดส่งไม่สำเร็จ"),
-        "returned":      ("returned",          "ส่งคืนต้นทาง"),
-        "exception":     ("problem",           "มีปัญหา"),
+        "ON_DELIVERED":    ("delivered",         "จัดส่งสำเร็จ"),
+        "ON_SHIPPING":     ("out_for_delivery",   "กำลังจัดส่ง"),
+        "ON_PICKED_UP":    ("accepted",           "รับฝากแล้ว"),
+        "ON_TRANSIT":      ("in_transit",         "อยู่ระหว่างขนส่ง"),
+        "ON_OTHER_STATUS": ("in_transit",         "อยู่ระหว่างขนส่ง"),
+        "ON_RETURNED":     ("returned",           "ส่งคืนต้นทาง"),
+        "ON_FAILED":       ("problem",            "จัดส่งไม่สำเร็จ"),
+        "ON_EXCEPTION":    ("problem",            "มีปัญหา"),
     }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             res = await client.post(
                 "https://api.etrackings.com/api/v3/tracks/find",
                 headers={
-                    "Content-Type":        "application/json",
-                    "Etrackings-Api-Key":  ETRACKINGS_API_KEY,
+                    "Content-Type":          "application/json",
+                    "Etrackings-Api-Key":    ETRACKINGS_API_KEY,
                     "Etrackings-Key-Secret": ETRACKINGS_KEY_SECRET,
+                    "Accept-Language":       "th",
                 },
-                json={"courier": courier, "tracking_number": barcode},
+                json={"courier": courier, "trackingNo": barcode},
             )
-            data = res.json()
-            if res.status_code != 200 or not data.get("data"):
+            body = res.json()
+            if res.status_code != 200 or not body.get("data"):
+                print(f"[eTrackings] {barcode} → {body.get('meta', {})}")
                 return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล"}
 
-            track = data["data"]
-            raw_status = track.get("status", "").lower()
-            status, status_th = ETRACK_STATUS_MAP.get(raw_status, ("in_transit", raw_status))
+            track = body["data"]
+            raw_status = track.get("status", "")
+            status, status_th = ETRACK_STATUS_MAP.get(raw_status, ("in_transit", track.get("currentStatus", raw_status)))
 
-            # สร้าง events จาก activities
+            # สร้าง events จาก timelines
             events = []
-            for act in (track.get("activities") or []):
-                events.append({
-                    "datetime":    act.get("timestamp", ""),
-                    "description": act.get("description", ""),
-                    "status_th":   act.get("description", ""),
-                    "location":    act.get("location", ""),
-                })
+            for day in (track.get("timelines") or []):
+                for detail in (day.get("details") or []):
+                    events.append({
+                        "datetime":    detail.get("dateTime", ""),
+                        "description": detail.get("description", ""),
+                        "status_th":   detail.get("description", ""),
+                    })
 
             return {
                 "barcode":         barcode,
                 "status":          status,
                 "status_th":       status_th,
-                "latest_location": track.get("current_location", ""),
+                "latest_location": track.get("currentStatus", ""),
                 "events":          events,
             }
     except Exception as e:
