@@ -566,21 +566,28 @@ async def track_bulk(body: BulkRequest):
     sb = get_supabase()
     barcodes_str = ",".join(f'"{b}"' for b in barcodes)
 
-    valid_barcodes = set()
-    try:
-        # เช็คจาก shipments table (cron tracking)
-        res1 = sb.table("shipments").select("barcode").in_("barcode", barcodes).execute()
-        for row in (res1.data or []):
-            valid_barcodes.add(row["barcode"].upper())
+    # ยกเว้น Kerry/Flash/J&T/SCG จาก validation — เรียก eTrackings ได้เลยไม่ต้องอยู่ใน DB
+    def is_third_party(b: str) -> bool:
+        return bool(re.match(r'^(TH|SCPK|SXF|FLE|FEX|TDE|JPT|JTTH|SCG)', b, re.I))
 
-        # เช็คจาก shipping table (เลข tracking จาก admin)
-        res2 = sb.table("shipping").select("tracking").in_("tracking", barcodes).execute()
-        for row in (res2.data or []):
-            if row.get("tracking"):
-                valid_barcodes.add(row["tracking"].upper())
+    third_party = [b for b in barcodes if is_third_party(b)]
+    need_check  = [b for b in barcodes if not is_third_party(b)]
+
+    valid_barcodes = set(third_party)  # third-party ผ่านได้เลย
+    try:
+        if need_check:
+            # เช็คจาก shipments table (cron tracking)
+            res1 = sb.table("shipments").select("barcode").in_("barcode", need_check).execute()
+            for row in (res1.data or []):
+                valid_barcodes.add(row["barcode"].upper())
+
+            # เช็คจาก shipping table (เลข tracking จาก admin)
+            res2 = sb.table("shipping").select("tracking").in_("tracking", need_check).execute()
+            for row in (res2.data or []):
+                if row.get("tracking"):
+                    valid_barcodes.add(row["tracking"].upper())
     except Exception as e:
         print(f"[track/bulk] เช็ค DB error: {e}")
-        # ถ้า DB error ให้ผ่านไปได้เลย ไม่ block ลูกค้า
         valid_barcodes = set(barcodes)
 
     output = []
