@@ -13,7 +13,9 @@ from supabase import create_client, Client
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---- Config ----
-THAIPOST_API_KEY = os.getenv("THAIPOST_API_KEY", "")
+THAIPOST_API_KEY      = os.getenv("THAIPOST_API_KEY", "")
+ETRACKINGS_API_KEY    = os.getenv("ETRACKINGS_API_KEY", "")
+ETRACKINGS_KEY_SECRET = os.getenv("ETRACKINGS_KEY_SECRET", "")
 SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY     = os.getenv("SUPABASE_KEY", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -236,6 +238,68 @@ async def get_access_token() -> str:
         return token
 
 
+def detect_carrier(barcode: str) -> str:
+    """ตรวจสอบขนส่งจาก format เลข tracking"""
+    b = barcode.upper()
+    if re.match(r'^(TH|SCPK|SXF)', b):   return "kerry_express"
+    if re.match(r'^(FLE|FEX)', b):         return "flash_express"
+    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt_express"
+    if re.match(r'^SCG', b):               return "scg_express"
+    return "thailand_post"  # default
+
+
+async def fetch_etrackings(barcode: str, courier: str) -> dict:
+    """ดึงสถานะพัสดุจาก eTrackings API (Kerry, Flash, J&T)"""
+    ETRACK_STATUS_MAP = {
+        "delivered":     ("delivered",        "จัดส่งสำเร็จ"),
+        "in_transit":    ("in_transit",        "อยู่ระหว่างขนส่ง"),
+        "out_for_delivery": ("out_for_delivery", "ออกนำจ่ายแล้ว"),
+        "pickup":        ("accepted",          "รับฝากแล้ว"),
+        "failed":        ("problem",           "จัดส่งไม่สำเร็จ"),
+        "returned":      ("returned",          "ส่งคืนต้นทาง"),
+        "exception":     ("problem",           "มีปัญหา"),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            res = await client.post(
+                "https://api.etrackings.com/api/v3/tracks/find",
+                headers={
+                    "Content-Type":        "application/json",
+                    "Etrackings-Api-Key":  ETRACKINGS_API_KEY,
+                    "Etrackings-Key-Secret": ETRACKINGS_KEY_SECRET,
+                },
+                json={"courier": courier, "tracking_number": barcode},
+            )
+            data = res.json()
+            if res.status_code != 200 or not data.get("data"):
+                return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล"}
+
+            track = data["data"]
+            raw_status = track.get("status", "").lower()
+            status, status_th = ETRACK_STATUS_MAP.get(raw_status, ("in_transit", raw_status))
+
+            # สร้าง events จาก activities
+            events = []
+            for act in (track.get("activities") or []):
+                events.append({
+                    "datetime":    act.get("timestamp", ""),
+                    "description": act.get("description", ""),
+                    "status_th":   act.get("description", ""),
+                    "location":    act.get("location", ""),
+                })
+
+            return {
+                "barcode":         barcode,
+                "status":          status,
+                "status_th":       status_th,
+                "latest_location": track.get("current_location", ""),
+                "events":          events,
+            }
+    except Exception as e:
+        print(f"[eTrackings] error {barcode}: {e}")
+        return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้"}
+
+
 async def fetch_tracking_batch(barcodes: list) -> list:
     """เรียก Thailand Post API แบบ batch สูงสุด 20 เลขต่อครั้ง"""
     token = await get_access_token()
@@ -283,6 +347,10 @@ async def fetch_tracking_batch(barcodes: list) -> list:
 
 
 async def fetch_tracking(barcode: str) -> dict:
+    """ดึงสถานะพัสดุ — route อัตโนมัติตาม carrier"""
+    carrier = detect_carrier(barcode)
+    if carrier != "thailand_post" and ETRACKINGS_API_KEY:
+        return await fetch_etrackings(barcode, carrier)
     return (await fetch_tracking_batch([barcode]))[0]
 
 
