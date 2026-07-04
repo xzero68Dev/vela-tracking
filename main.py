@@ -870,9 +870,11 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
             "shipping_cost": float(str(cost).replace(",","")) if pd.notna(cost) and str(cost).strip() not in ["", "-", "N/A"] else None,
         })
 
-        # เก็บ tracking POST SABUY ไว้เพิ่มใน shipments
-        if carrier == "POST SABUY" and tracking and str(tracking).strip():
-            tracking_to_add.append(str(tracking).strip().upper())
+        # เก็บ tracking ที่ต้องให้ cron เช็ค (POST SABUY และ KEX)
+        if tracking and str(tracking).strip():
+            c_upper = carrier.upper()
+            if "POST" in c_upper or "SABUY" in c_upper or "KEX" in c_upper or "KERRY" in c_upper:
+                tracking_to_add.append(str(tracking).strip().upper())
 
     # กรองเฉพาะ row ที่มี order_id จริงๆ
     shipping_rows = [r for r in shipping_rows if r.get("order_id") and r["order_id"].strip()]
