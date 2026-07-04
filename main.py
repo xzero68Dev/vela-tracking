@@ -390,6 +390,26 @@ async def run_cron():
     etracking_barcodes = [b for b in barcodes if detect_carrier(b) != "thailand_post"]
     print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, eTrackings: {len(etracking_barcodes)}")
 
+    # เช็ค Kerry/Flash/J&T เฉพาะหลัง 13:00 น. (ประหยัด credit — ส่วนใหญ่ออกส่งบ่ายโมงขึ้นไป)
+    thai_hour = (datetime.utcnow().hour + 7) % 24  # UTC+7
+    if thai_hour < 13:
+        print(f"[cron] ข้าม eTrackings — เวลา {thai_hour}:xx น. ยังไม่ถึงบ่ายโมง")
+        etracking_barcodes = []
+
+    # เช็ค Kerry เฉพาะเลขที่ไม่เกิน 7 วัน (ประหยัด credit)
+    if etracking_barcodes:
+        cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        try:
+            new_rows = sb.table("shipments") \
+                .select("barcode") \
+                .in_("barcode", etracking_barcodes) \
+                .gte("created_at", cutoff_7d) \
+                .execute()
+            etracking_barcodes = [r["barcode"] for r in (new_rows.data or [])]
+            print(f"[cron] eTrackings หลังกรอง 7 วัน: {len(etracking_barcodes)} รายการ")
+        except Exception as e:
+            print(f"[cron] eTrackings filter error: {e}")
+
     # ดึง status เก่าทั้งหมดก่อน
     old_rows = sb.table("shipments").select("barcode,status").in_("barcode", barcodes).execute()
     old_status_map = {r["barcode"]: r["status"] for r in (old_rows.data or [])}
