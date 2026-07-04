@@ -281,7 +281,7 @@ async def fetch_etrackings(barcode: str, courier: str) -> dict:
             raw_status = track.get("status", "")
             status, status_th = ETRACK_STATUS_MAP.get(raw_status, ("in_transit", track.get("currentStatus", raw_status)))
 
-            # สร้าง events จาก timelines
+            # สร้าง events จาก timelines — เรียงจากเก่าสุดไปใหม่สุด
             events = []
             for day in (track.get("timelines") or []):
                 for detail in (day.get("details") or []):
@@ -290,6 +290,8 @@ async def fetch_etrackings(barcode: str, courier: str) -> dict:
                         "description": detail.get("description", ""),
                         "status_th":   detail.get("description", ""),
                     })
+            # eTrackings ส่งมาจากใหม่ไปเก่า → reverse ให้เรียงจากเก่าไปใหม่
+            events = list(reversed(events))
 
             return {
                 "barcode":         barcode,
