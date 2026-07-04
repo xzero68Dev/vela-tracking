@@ -1222,6 +1222,7 @@ async def confirm_delivered(order_id: str, x_api_key: str = Header(default="")):
     return {"success": True, "order_id": order_id, "notified": bool(phone)}
 
 
+@app.post("/admin/confirm-payment")
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     """
     ยืนยันการชำระเงินของ order — แทนที่การ PATCH ตรงไปยัง Supabase จากหน้า admin เดิม
