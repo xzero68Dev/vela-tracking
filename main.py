@@ -1230,6 +1230,19 @@ async def confirm_delivered(order_id: str, x_api_key: str = Header(default="")):
     ship_res = sb.table("shipping").select("tracking").eq("order_id", order_id).execute()
     tracking = ship_res.data[0].get("tracking", "") if ship_res.data else ""
 
+    # mark shipments.is_done = true ถ้ามีเลข tracking อยู่ใน shipments table
+    if tracking:
+        try:
+            sb.table("shipments").update({
+                "is_done":         True,
+                "status":          "delivered",
+                "status_th":       "จัดส่งสำเร็จ",
+                "last_checked_at": datetime.utcnow().isoformat(),
+            }).eq("barcode", tracking.upper()).execute()
+            print(f"[confirm-delivered] mark shipments done: {tracking}")
+        except Exception as e:
+            print(f"[confirm-delivered] shipments update error: {e}")
+
     if phone:
         notify   = "sms"
         line_uid = ""
