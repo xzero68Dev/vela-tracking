@@ -383,14 +383,37 @@ async def run_cron():
     barcodes = [r["barcode"] for r in (rows.data or [])]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
 
+    # แยก barcode เป็น 2 กลุ่ม
+    thaipost_barcodes  = [b for b in barcodes if detect_carrier(b) == "thailand_post"]
+    etracking_barcodes = [b for b in barcodes if detect_carrier(b) != "thailand_post"]
+    print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, eTrackings: {len(etracking_barcodes)}")
+
     # ดึง status เก่าทั้งหมดก่อน
     old_rows = sb.table("shipments").select("barcode,status").in_("barcode", barcodes).execute()
     old_status_map = {r["barcode"]: r["status"] for r in (old_rows.data or [])}
 
-    # เช็คเป็น batch ทีละ 20 เลข — 1 request ต่อ batch แทนที่จะเรียกทีละเลข
+    all_results = []
+
+    # เช็ค Kerry/Flash/J&T ผ่าน eTrackings
+    for b in etracking_barcodes:
+        try:
+            res = await fetch_etrackings(b, detect_carrier(b))
+            all_results.append({
+                "barcode":      b,
+                "status":       res.get("status", "unknown"),
+                "status_th":    res.get("status_th", ""),
+                "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[0].get("datetime", "")},
+                "events":       res.get("events", []),
+            })
+            print(f"[cron] eTrackings {b} → {res.get('status')}")
+        except Exception as e:
+            print(f"[cron] eTrackings error {b}: {e}")
+
+    # เช็ค Thailand Post แบบ batch ทีละ 20 เลข
     batch_size = 20
-    for i in range(0, len(barcodes), batch_size):
-        batch = barcodes[i:i+batch_size]
+    for i in range(0, len(thaipost_barcodes), batch_size):
+        batch = thaipost_barcodes[i:i+batch_size]
+        # batch ถูก set ใน new structure แล้ว
         try:
             results = await fetch_tracking_batch(batch)
         except Exception as e:
@@ -409,86 +432,89 @@ async def run_cron():
                     print(f"[cron] หยุดเช็ค batch นี้: {e3}")
                     continue
 
-        for result in results:
-            barcode    = result["barcode"]
-            status     = result["status"]
-            is_done    = status in DONE_STATUSES
-            latest     = result["latest_event"] or {}
-            old_status = old_status_map.get(barcode, "pending")
+        all_results.extend(results)
 
-            # ถ้า API ส่ง events ว่างมา (Thailand Post มีปัญหา) → ข้ามไปไม่ทับสถานะเดิม
-            if not result.get("events") and status == "pending":
-                print(f"[cron] {barcode} → ข้าม (API ไม่มีข้อมูล)")
-                continue
+    # process ทุก results รวมกัน (Thailand Post + eTrackings)
+    for result in all_results:
+        barcode    = result["barcode"]
+        status     = result["status"]
+        is_done    = status in DONE_STATUSES
+        latest     = result.get("latest_event") or {}
+        old_status = old_status_map.get(barcode, "pending")
 
-            sb.table("shipments").update({
-                "status":          status,
-                "status_th":       result["status_th"],
-                "latest_location": latest.get("location"),
-                "latest_datetime": latest.get("datetime"),
-                "is_done":         is_done,
-                "last_checked_at": datetime.utcnow().isoformat(),
-            }).eq("barcode", barcode).execute()
-            print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
+        # ถ้า API ส่ง events ว่างมา (Thailand Post มีปัญหา) → ข้ามไปไม่ทับสถานะเดิม
+        if not result.get("events") and status == "pending":
+            print(f"[cron] {barcode} → ข้าม (API ไม่มีข้อมูล)")
+            continue
 
-            # แจ้งเตือนถ้าสถานะเปลี่ยน
-            # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
-            sms_status = status
-            if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
-                sms_status = "accepted"
-            # เลือก template ตาม channel
-            line_msg = LINE_TEMPLATES.get(sms_status)
-            sms_msg  = SMS_TEMPLATES.get(sms_status)
-            has_notify = (line_msg or sms_msg)
-            if status != old_status and has_notify:
-                msg = line_msg or sms_msg
-                ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
-                if ship_row.data:
-                    order_id  = ship_row.data[0]["order_id"]
-                    order_row = sb.table("orders").select("phone,customer").eq("order_id", order_id).execute()
-                    if order_row.data:
-                        phone    = order_row.data[0].get("phone", "")
-                        customer = order_row.data[0].get("customer", "")
-                        if phone:
-                            # เช็ค notify_channel จาก customers table
-                            notify       = "sms"
-                            line_uid     = ""
-                            try:
-                                cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
-                                if cust.data:
-                                    notify   = cust.data[0].get("notify_channel") or "sms"
-                                    line_uid = cust.data[0].get("line_user_id") or ""
-                            except:
-                                pass
+        sb.table("shipments").update({
+            "status":          status,
+            "status_th":       result["status_th"],
+            "latest_location": latest.get("location"),
+            "latest_datetime": latest.get("datetime"),
+            "is_done":         is_done,
+            "last_checked_at": datetime.utcnow().isoformat(),
+        }).eq("barcode", barcode).execute()
+        print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
 
-                            final_msg = msg.replace("{barcode}", barcode)
+        # แจ้งเตือนถ้าสถานะเปลี่ยน
+        # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
+        sms_status = status
+        if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
+            sms_status = "accepted"
+        # เลือก template ตาม channel
+        line_msg = LINE_TEMPLATES.get(sms_status)
+        sms_msg  = SMS_TEMPLATES.get(sms_status)
+        has_notify = (line_msg or sms_msg)
+        if status != old_status and has_notify:
+            msg = line_msg or sms_msg
+            ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+            if ship_row.data:
+                order_id  = ship_row.data[0]["order_id"]
+                order_row = sb.table("orders").select("phone,customer").eq("order_id", order_id).execute()
+                if order_row.data:
+                    phone    = order_row.data[0].get("phone", "")
+                    customer = order_row.data[0].get("customer", "")
+                    if phone:
+                        # เช็ค notify_channel จาก customers table
+                        notify       = "sms"
+                        line_uid     = ""
+                        try:
+                            cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
+                            if cust.data:
+                                notify   = cust.data[0].get("notify_channel") or "sms"
+                                line_uid = cust.data[0].get("line_user_id") or ""
+                        except:
+                            pass
 
-                            if notify == "none":
-                                print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
-                            elif notify == "line" and line_uid:
-                                # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
-                                if line_msg:
-                                    final_line_msg = line_msg.replace("{barcode}", barcode)
-                                    await send_line_notify(line_uid, final_line_msg, barcode=barcode, status=sms_status, customer=customer, phone=phone)
-                                    print(f"[LINE] แจ้ง {customer} → {status}")
-                                else:
-                                    print(f"[LINE] ข้าม {customer} → ไม่มี LINE template สำหรับ {sms_status}")
+                        final_msg = msg.replace("{barcode}", barcode)
+
+                        if notify == "none":
+                            print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
+                        elif notify == "line" and line_uid:
+                            # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
+                            if line_msg:
+                                final_line_msg = line_msg.replace("{barcode}", barcode)
+                                await send_line_notify(line_uid, final_line_msg, barcode=barcode, status=sms_status, customer=customer, phone=phone)
+                                print(f"[LINE] แจ้ง {customer} → {status}")
                             else:
-                                # SMS ใช้ SMS_TEMPLATES (เฉพาะ delivered)
-                                if sms_msg:
-                                    final_sms_msg = sms_msg.replace("{barcode}", barcode)
-                                    await send_sms(phone, final_sms_msg, barcode=barcode, status=sms_status, customer=customer)
-                                    print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
-                                else:
-                                    print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
+                                print(f"[LINE] ข้าม {customer} → ไม่มี LINE template สำหรับ {sms_status}")
+                        else:
+                            # SMS ใช้ SMS_TEMPLATES (เฉพาะ delivered)
+                            if sms_msg:
+                                final_sms_msg = sms_msg.replace("{barcode}", barcode)
+                                await send_sms(phone, final_sms_msg, barcode=barcode, status=sms_status, customer=customer)
+                                print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+                            else:
+                                print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
 
-                            # แจ้ง admin ถ้ามีปัญหา
-                            if status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
-                                admin_msg = f"⚠ VeLA Alert: พัสดุ {barcode} ของ {customer} ({phone}) สถานะ: {status_th or status}"
-                                await send_line_notify(ADMIN_LINE_USER_ID, admin_msg)
-                                print(f"[ADMIN] แจ้ง admin → {barcode} {status}")
+                        # แจ้ง admin ถ้ามีปัญหา
+                        if status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
+                            admin_msg = f"⚠ VeLA Alert: พัสดุ {barcode} ของ {customer} ({phone}) สถานะ: {status_th or status}"
+                            await send_line_notify(ADMIN_LINE_USER_ID, admin_msg)
+                            print(f"[ADMIN] แจ้ง admin → {barcode} {status}")
 
-        if i + batch_size < len(barcodes):
+        if i + batch_size < len(thaipost_barcodes):
             await asyncio.sleep(1)
 
     print("[cron] เสร็จแล้ว")
