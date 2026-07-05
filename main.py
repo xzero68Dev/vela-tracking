@@ -239,13 +239,13 @@ async def get_access_token() -> str:
 
 
 def detect_carrier(barcode: str) -> str:
-    """ตรวจสอบขนส่งจาก format เลข tracking — ใช้ courier code ของ eTrackings"""
+    """ตรวจสอบขนส่งจาก format เลข tracking"""
     b = barcode.upper()
-    if re.match(r'^(TH|SCPK|SXF)', b):   return "kex-express"
-    if re.match(r'^(FLE|FEX)', b):         return "flash-express"
-    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt-express"
-    if re.match(r'^SCG', b):               return "scg-express"
-    return "thailand_post"  # default ไปรษณีย์ไทย
+    if re.match(r'^(TH|SCPK|SXF)', b):   return "kex"        # Kerry Express → scrape โดยตรง
+    if re.match(r'^(FLE|FEX)', b):         return "kex-express"  # Flash → eTrackings
+    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt-express"   # J&T → eTrackings
+    if re.match(r'^SCG', b):               return "scg-express"  # SCG → eTrackings
+    return "thailand_post"
 
 
 async def fetch_etrackings(barcode: str, courier: str) -> dict:
@@ -354,8 +354,14 @@ async def fetch_tracking_batch(barcodes: list) -> list:
 async def fetch_tracking(barcode: str) -> dict:
     """ดึงสถานะพัสดุ — route อัตโนมัติตาม carrier"""
     carrier = detect_carrier(barcode)
-    if carrier != "thailand_post" and ETRACKINGS_API_KEY:
+    if carrier == "kex":
+        # Kerry Express → scrape โดยตรง ฟรี ไม่มีค่า API
+        from kex_scraper import fetch_kex_tracking
+        return await fetch_kex_tracking(barcode)
+    elif carrier != "thailand_post" and ETRACKINGS_API_KEY:
+        # Flash/J&T/SCG → eTrackings API
         return await fetch_etrackings(barcode, carrier)
+    # ไปรษณีย์ไทย
     return (await fetch_tracking_batch([barcode]))[0]
 
 
