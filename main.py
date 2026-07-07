@@ -273,7 +273,6 @@ async def fetch_etrackings(barcode: str, courier: str) -> dict:
                 json={"courier": courier, "trackingNo": barcode},
             )
             body = res.json()
-            print(f"[eTrackings] {barcode} HTTP={res.status_code} keys={list(body.get('data', {}).keys()) if body.get('data') else body.get('meta')}")
             if res.status_code != 200 or not body.get("data"):
                 print(f"[eTrackings] {barcode} → {body.get('meta', {})}")
                 return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล"}
