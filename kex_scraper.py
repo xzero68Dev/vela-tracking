@@ -1,140 +1,105 @@
 """
-KEX Express scraper ใช้ Playwright
-ดึงสถานะพัสดุจาก th.kex-express.com โดยตรง ฟรี ไม่มีค่า API
+KEX Express API client — ดึงสถานะพัสดุโดยตรงจาก KEX API
+ไม่ต้องการ browser, ไม่มีค่าใช้จ่าย
 """
 import asyncio
-from playwright.async_api import async_playwright
+import base64
+from datetime import datetime
+import httpx
 
 KEX_STATUS_MAP = {
-    "จัดส่งพัสดุสำเร็จ":                            ("delivered",        "จัดส่งสำเร็จ"),
-    "จัดส่งสำเร็จ":                                  ("delivered",        "จัดส่งสำเร็จ"),
-    "กำลังจัดส่งพัสดุ":                             ("out_for_delivery", "กำลังจัดส่ง"),
-    "พนักงานติดต่อผู้รับ":                          ("out_for_delivery", "กำลังจัดส่ง"),
-    "พัสดุถึงคลังสินค้าปลายทาง":                   ("in_transit",       "ถึงคลังปลายทาง"),
-    "พัสดุออกจากศูนย์กระจายสินค้า":               ("in_transit",       "อยู่ระหว่างขนส่ง"),
-    "พัสดุถึงศูนย์กระจายสินค้า":                   ("in_transit",       "อยู่ระหว่างขนส่ง"),
-    "พนักงานเข้ารับพัสดุแล้ว":                     ("accepted",         "รับพัสดุแล้ว"),
-    "ผู้ส่งมาส่งพัสดุที่สาขา":                      ("accepted",         "รับฝากแล้ว"),
-    "ผู้ส่งมาส่งพัสดุที่สาขาเคอีเอ็กซ์ พาร์ทเนอร์": ("accepted",      "รับฝากแล้ว"),
-    "จัดส่งไม่สำเร็จ":                             ("problem",          "จัดส่งไม่สำเร็จ"),
-    "ส่งคืนต้นทาง":                                 ("returned",         "ส่งคืนต้นทาง"),
+    "POD":    ("delivered",         "จัดส่งสำเร็จ"),
+    "045":    ("out_for_delivery",  "กำลังจัดส่ง"),
+    "040":    ("out_for_delivery",  "กำลังจัดส่ง"),
+    "103":    ("in_transit",        "ถึงคลังปลายทาง"),
+    "110":    ("in_transit",        "ออกจากศูนย์กระจาย"),
+    "109":    ("in_transit",        "ถึงศูนย์กระจาย"),
+    "010":    ("in_transit",        "รับพัสดุแล้ว"),
+    "DROPPN": ("accepted",          "รับฝากที่สาขา KEX"),
+    "005":    ("accepted",          "รับฝากแล้ว"),
+    "RTN":    ("returned",          "ส่งคืนต้นทาง"),
+    "RETURN": ("returned",          "ส่งคืนต้นทาง"),
+    "FAIL":   ("problem",           "จัดส่งไม่สำเร็จ"),
 }
+
+def make_track_param(barcode: str) -> str:
+    """สร้าง ?track= parameter — Base64 encode ของ barcode"""
+    # KEX ใช้ Base64 ของ barcode เป็น URL parameter
+    return base64.b64encode(barcode.encode()).decode()
 
 
 async def fetch_kex_tracking(barcode: str) -> dict:
-    """Scrape KEX tracking page และดึงสถานะพัสดุ"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-            ]
-        )
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/120.0.0.0 Safari/537.36'
-                )
-            )
-            page = await context.new_page()
+    """ดึงสถานะพัสดุ KEX ผ่าน API โดยตรง ไม่ต้องใช้ browser"""
+    track_param = make_track_param(barcode)
+    url = f"https://th.kex-express.com/th/track/?track={track_param}"
 
-            url = f"https://th.kex-express.com/th/track/?track={barcode}"
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+    headers = {
+        "Accept":        "application/json, text/plain, */*",
+        "Content-Type":  "application/json",
+        "kett-lang":     "th",
+        "X-KE-ID":       "{xkeid}",
+        "Referer":       url,
+        "User-Agent":    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
+        "sec-ch-ua":     '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "sec-ch-ua-mobile":   "?1",
+        "sec-ch-ua-platform": '"Android"',
+    }
 
-            # รอ Angular bootstrap ก่อน (Angular app ใช้เวลา)
-            await page.wait_for_timeout(5000)
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            res = await client.post(url, json={"tracking_no": barcode}, headers=headers)
 
-            # scroll เพื่อ trigger lazy rendering
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(3000)
+        if res.status_code != 200:
+            print(f"[KEX API] {barcode} → HTTP {res.status_code}")
+            return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
 
-            # รอให้ tracking results โหลด
-            try:
-                await page.wait_for_selector('li.status-line', timeout=20000)
-            except Exception:
-                content = await page.content()
-                has_status = 'status-line' in content
-                has_tracking = barcode in content
-                print(f"[KEX] ไม่พบ li.status-line ใน {len(content)} chars")
-                print(f"[KEX] has status-line: {has_status}, has barcode: {has_tracking}")
-                return {
-                    "barcode":   barcode,
-                    "status":    "unknown",
-                    "status_th": "ไม่พบข้อมูล",
-                    "events":    [],
-                }
+        data = res.json()
 
-            # ดึง events ทั้งหมด
-            events = await page.evaluate("""
-            () => {
-                const items = document.querySelectorAll('li.status-line');
-                return [...items].map(item => {
-                    const statusEl = item.querySelector('.header.bold span');
-                    const status   = statusEl ? statusEl.innerText.trim() : '';
+        # response เป็น list
+        if isinstance(data, list):
+            data = data[0] if data else {}
 
-                    const lights   = [...item.querySelectorAll('.text-1418.light')];
-                    const location = lights[0] ? lights[0].innerText.trim() : '';
-                    const dateTxt  = lights.find(el => el.innerText.includes('วันที่'));
-                    const timeTxt  = lights.find(el => el.innerText.includes('เวลา'));
-                    const date     = dateTxt ? dateTxt.innerText.replace('วันที่', '').trim() : '';
-                    const time     = timeTxt ? timeTxt.innerText.replace('เวลา', '').trim() : '';
+        ref = data.get("ref", {})
+        shipment = ref.get("shipment", {})
+        statuses = ref.get("shipment_status", [])
 
-                    return {
-                        description: status,
-                        location:    location,
-                        date:        date,
-                        time:        time,
-                        datetime:    (date + ' ' + time).trim()
-                    };
-                }).filter(e => e.description);
+        if not statuses:
+            return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
+
+        # status ล่าสุด = indx สูงสุด
+        latest = max(statuses, key=lambda x: x.get("indx", 0))
+        s_code = latest.get("s_code", "")
+        s_desc = latest.get("s_desc", "")
+        status, status_th = KEX_STATUS_MAP.get(s_code, ("in_transit", s_desc))
+
+        # events เรียงจากเก่าไปใหม่ (indx น้อยไปมาก)
+        events = sorted(statuses, key=lambda x: x.get("indx", 0))
+        events_clean = [
+            {
+                "datetime":    e.get("s_datetime", ""),
+                "description": e.get("s_desc", ""),
+                "status_th":   e.get("s_desc", ""),
+                "location":    e.get("loc", ""),
             }
-            """)
+            for e in events
+        ]
 
-            if not events:
-                return {
-                    "barcode":   barcode,
-                    "status":    "unknown",
-                    "status_th": "ไม่พบข้อมูล",
-                    "events":    [],
-                }
+        return {
+            "barcode":         barcode,
+            "status":          status,
+            "status_th":       status_th,
+            "latest_location": latest.get("loc", ""),
+            "events":          events_clean,
+        }
 
-            # สถานะล่าสุดจาก event แรก (KEX เรียงจากใหม่ไปเก่า)
-            latest_desc = events[0]["description"]
-            status, status_th = KEX_STATUS_MAP.get(
-                latest_desc, ("in_transit", latest_desc)
-            )
-
-            # เรียงกลับให้เก่าสุดอยู่ก่อน (เหมือน Thailand Post)
-            events_sorted = list(reversed(events))
-
-            return {
-                "barcode":         barcode,
-                "status":          status,
-                "status_th":       status_th,
-                "latest_location": events[0].get("location", ""),
-                "events":          events_sorted,
-            }
-
-        except Exception as e:
-            print(f"[KEX scraper] error {barcode}: {e}")
-            return {
-                "barcode":   barcode,
-                "status":    "error",
-                "status_th": "เชื่อมต่อไม่ได้",
-                "events":    [],
-            }
-        finally:
-            await browser.close()
+    except Exception as e:
+        print(f"[KEX API] error {barcode}: {e}")
+        return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้", "events": []}
 
 
 # ทดสอบ manual
 if __name__ == "__main__":
     import sys, json
-    code = sys.argv[1] if len(sys.argv) > 1 else "SXF112970001471"
+    code = sys.argv[1] if len(sys.argv) > 1 else "SXF112970001475"
     result = asyncio.run(fetch_kex_tracking(code))
     print(json.dumps(result, ensure_ascii=False, indent=2))
