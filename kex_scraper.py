@@ -46,15 +46,22 @@ async def fetch_kex_tracking(barcode: str) -> dict:
             url = f"https://th.kex-express.com/th/track/?track={barcode}"
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
 
-            # รอให้ Angular โหลดและ render ผลลัพธ์
+            # รอ Angular bootstrap ก่อน (Angular app ใช้เวลา)
+            await page.wait_for_timeout(5000)
+
+            # scroll เพื่อ trigger lazy rendering
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(3000)
+
+            # รอให้ tracking results โหลด
             try:
-                await page.wait_for_selector('li.status-line', timeout=25000)
+                await page.wait_for_selector('li.status-line', timeout=20000)
             except Exception:
-                # ลอง debug ดู HTML ที่ได้
                 content = await page.content()
+                has_status = 'status-line' in content
+                has_tracking = barcode in content
                 print(f"[KEX] ไม่พบ li.status-line ใน {len(content)} chars")
-                has_track = 'status-line' in content
-                print(f"[KEX] has status-line in HTML: {has_track}")
+                print(f"[KEX] has status-line: {has_status}, has barcode: {has_tracking}")
                 return {
                     "barcode":   barcode,
                     "status":    "unknown",
