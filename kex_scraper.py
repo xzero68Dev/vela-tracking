@@ -46,13 +46,15 @@ async def fetch_kex_tracking(barcode: str) -> dict:
     }
 
     try:
+        print(f"[KEX API] POST {url} body={{'tracking_no': '{barcode}'}}")
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             res = await client.post(url, json={"tracking_no": barcode}, headers=headers)
 
-        if res.status_code != 200:
-            print(f"[KEX API] {barcode} → HTTP {res.status_code}")
-            return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
+        print(f"[KEX API] {barcode} → HTTP {res.status_code}, {len(res.text)} chars")
 
+        if res.status_code != 200:
+            print(f"[KEX API] non-200 {res.status_code}: {res.text[:300]}")
+            return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
         data = res.json()
 
         # response เป็น list
@@ -92,8 +94,14 @@ async def fetch_kex_tracking(barcode: str) -> dict:
             "events":          events_clean,
         }
 
+    except httpx.HTTPStatusError as e:
+        print(f"[KEX API] HTTP error {barcode}: {e.response.status_code} — {e.response.text[:200]}")
+        return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้", "events": []}
+    except httpx.RequestError as e:
+        print(f"[KEX API] Request error {barcode}: {type(e).__name__} — {e}")
+        return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้", "events": []}
     except Exception as e:
-        print(f"[KEX API] error {barcode}: {e}")
+        print(f"[KEX API] Unexpected error {barcode}: {type(e).__name__} — {e}")
         return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้", "events": []}
 
 
