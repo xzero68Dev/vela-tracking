@@ -1124,30 +1124,126 @@ class SlipNotifyRequest(BaseModel):
     order_id: str
     slip_url: str
 
+SLIPOK_API_URL = os.getenv("SLIPOK_URL", "https://api.slipok.com/api/line/apikey/70860")
+SLIPOK_API_KEY = os.getenv("SLIPOK_API_KEY", "")
+
 @app.post("/orders/slip-notify")
 async def slip_notify(body: SlipNotifyRequest):
-    """แจ้ง admin ตอนลูกค้าอัปโหลดสลิปชำระเงิน"""
+    """ตรวจสอบสลิปผ่าน SlipOK แล้ว auto-confirm ถ้ายอดตรง หรือแจ้ง admin ถ้าตรวจสอบไม่ได้"""
     sb = get_supabase()
 
     # ดึงข้อมูล order
-    res = sb.table("orders").select("customer,phone,total").eq("order_id", body.order_id).execute()
+    res = sb.table("orders").select("customer,phone,total,status").eq("order_id", body.order_id).execute()
     order = res.data[0] if res.data else {}
     customer = order.get("customer", "ลูกค้า")
     phone    = order.get("phone", "")
-    total    = order.get("total", 0)
+    total    = float(order.get("total") or 0)
 
-    # แจ้ง admin ผ่าน LINE
-    msg = (
-        f"💳 ลูกค้าส่งสลิปแล้ว!\n"
-        f"ชื่อ: {customer}"
-        + (f" ({phone})" if phone else "") +
-        f"\nOrder: {body.order_id}"
-        + (f"\nยอด: ฿{total:,.0f}" if total else "") +
-        f"\nกรุณายืนยันชำระเงินใน /admin/orders"
-    )
-    await send_line_notify(ADMIN_LINE_USER_ID, msg)
+    # ถ้า order ยืนยันชำระแล้ว ไม่ต้องทำซ้ำ
+    if order.get("status") in ("ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
+        return {"success": True, "verified": False, "reason": "already_paid"}
 
-    return {"success": True}
+    # ตรวจสอบสลิปผ่าน SlipOK
+    slip_verified = False
+    slip_amount   = None
+    slip_ref      = None
+    slip_error    = None
+
+    if SLIPOK_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    SLIPOK_API_URL,
+                    headers={"x-authorization": SLIPOK_API_KEY},
+                    data={"url": body.slip_url},
+                )
+                rdata = r.json()
+                if rdata.get("success"):
+                    slip_amount = float(rdata.get("data", {}).get("amount") or 0)
+                    slip_ref    = rdata.get("data", {}).get("transRef", "")
+                    # เช็คยอดตรงกับ order (อนุญาตคลาดเคลื่อน ±1 บาท)
+                    if total > 0 and abs(slip_amount - total) <= 1:
+                        slip_verified = True
+                    else:
+                        slip_error = f"ยอดในสลิป ฿{slip_amount:,.0f} ไม่ตรงกับยอด order ฿{total:,.0f}"
+                else:
+                    slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
+        except Exception as e:
+            slip_error = f"SlipOK error: {e}"
+            print(f"[SlipOK] error: {e}")
+
+    if slip_verified:
+        # Auto-confirm payment
+        sb.table("orders").update({
+            "status":   "ชำระแล้ว",
+            "paid_at":  datetime.utcnow().isoformat(),
+            "slip_url": body.slip_url,
+        }).eq("order_id", body.order_id).execute()
+
+        # Award points
+        try:
+            await _award_points(sb, body.order_id)
+        except Exception as e:
+            print(f"[SlipOK] point error: {e}")
+
+        # แจ้ง admin
+        await send_line_notify(
+            ADMIN_LINE_USER_ID,
+            f"✅ Auto-confirm! {customer} ({phone})\n"
+            f"Order: {body.order_id}\n"
+            f"ยอด: ฿{slip_amount:,.0f} ✓ ตรงกัน\n"
+            f"Ref: {slip_ref}"
+        )
+        return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
+    else:
+        # แจ้ง admin ตรวจสอบเอง
+        msg = (
+            f"💳 ลูกค้าส่งสลิปแล้ว!\n"
+            f"ชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+            f"\nOrder: {body.order_id}" +
+            (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+            (f"\n⚠️ {slip_error}" if slip_error else "") +
+            f"\nกรุณายืนยันชำระเงินใน /admin/orders"
+        )
+        await send_line_notify(ADMIN_LINE_USER_ID, msg)
+        return {"success": True, "verified": False, "reason": slip_error or "manual_check"}
+
+
+async def _award_points(sb, order_id: str):
+    """ให้ point จาก order — แยกออกมาเพื่อให้เรียกซ้ำได้"""
+    res = sb.table("orders").select("*").eq("order_id", order_id).execute()
+    if not res.data:
+        return
+    order = res.data[0]
+    # reuse logic เดิมจาก confirm_payment
+    from_sku = order.get("sku", "")
+    phone    = order.get("phone", "")
+    customer = order.get("customer", "")
+    # คำนวณ point จาก SKU (100ml = 1 point)
+    total_ml = 0
+    for item in (from_sku or "").split(","):
+        item = item.strip()
+        if "1000" in item or "1L" in item.upper():
+            try:
+                qty = int(item.split("x")[-1].strip()) if "x" in item else 1
+                total_ml += 1000 * qty
+            except:
+                total_ml += 1000
+    points = total_ml / 100
+    if points > 0 and phone:
+        try:
+            sb.table("point_ledger").insert({
+                "order_id":   order_id,
+                "phone":      phone,
+                "customer":   customer,
+                "channel":    order.get("channel", "web"),
+                "ml_total":   total_ml,
+                "points":     points,
+                "order_date": order.get("order_date", datetime.utcnow().strftime("%Y-%m-%d")),
+            }).execute()
+        except Exception as e:
+            print(f"[point_ledger] {order_id}: {e}")
+
 
 
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
