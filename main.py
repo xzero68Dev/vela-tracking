@@ -336,7 +336,15 @@ async def fetch_tracking_batch(barcodes: list) -> list:
                 "location":     e.get("location"),
             })
         latest = events[-1] if events else None
-        current_status, current_status_th = map_status(latest["status_code"] if latest else "")
+        # ถ้ามี delivered ใน events ใดๆ → ใช้ delivered เสมอ
+        # เพราะไปรษณีย์บางทีบันทึก "ติดต่อไม่ได้" พร้อมกับ "นำจ่ายสำเร็จ" ห่างกันแค่วินาทีเดียว
+        has_delivered = any(e["status"] in DONE_STATUSES for e in events)
+        if has_delivered:
+            delivered_event = next((e for e in reversed(events) if e["status"] in DONE_STATUSES), None)
+            current_status = delivered_event["status"] if delivered_event else "delivered"
+            current_status_th = delivered_event["description"] if delivered_event else "จัดส่งสำเร็จ"
+        else:
+            current_status, current_status_th = map_status(latest["status_code"] if latest else "")
         results.append({
             "barcode":           barcode,
             "status":            current_status,
