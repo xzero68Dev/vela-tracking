@@ -1183,9 +1183,10 @@ async def slip_notify(body: SlipNotifyRequest):
     if slip_verified:
         # Auto-confirm payment
         sb.table("orders").update({
-            "status":   "ชำระแล้ว",
-            "paid_at":  datetime.utcnow().isoformat(),
-            "slip_url": body.slip_url,
+            "status":      "ชำระแล้ว",
+            "paid_at":     datetime.utcnow().isoformat(),
+            "slip_url":    body.slip_url,
+            "slip_status": "verified",
         }).eq("order_id", body.order_id).execute()
 
         # Award points
@@ -1204,6 +1205,20 @@ async def slip_notify(body: SlipNotifyRequest):
         )
         return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
     else:
+        # บันทึก slip_status ตามสาเหตุ
+        if slip_error:
+            # error ชัดเจน (โอนผิดบัญชี/ซ้ำ/ยอดไม่ตรง) → rejected
+            sb.table("orders").update({
+                "slip_url":    body.slip_url,
+                "slip_status": "rejected",
+            }).eq("order_id", body.order_id).execute()
+        else:
+            # ไม่มี SlipOK key หรือ error อื่น → pending รอ admin
+            sb.table("orders").update({
+                "slip_url":    body.slip_url,
+                "slip_status": "pending",
+            }).eq("order_id", body.order_id).execute()
+
         # แจ้ง admin ตรวจสอบเอง
         msg = (
             f"💳 ลูกค้าส่งสลิปแล้ว!\n"
