@@ -1155,28 +1155,27 @@ async def slip_notify(body: SlipNotifyRequest):
                 r = await client.post(
                     SLIPOK_API_URL,
                     headers={"x-authorization": SLIPOK_API_KEY},
-                    data={"url": body.slip_url},
+                    data={
+                        "url":    body.slip_url,
+                        "log":    "true",
+                        "amount": str(int(total)) if total > 0 else "",
+                    },
                 )
                 rdata = r.json()
                 if rdata.get("success"):
-                    slip_amount = float(rdata.get("data", {}).get("amount") or 0)
-                    slip_ref    = rdata.get("data", {}).get("transRef", "")
-
-                    # เช็ค transRef ซ้ำ — ป้องกันนำสลิปเดิมมาใช้กับหลาย order
-                    if slip_ref:
-                        dup = sb.table("orders").select("order_id").eq("slip_ref", slip_ref).neq("order_id", body.order_id).execute()
-                        if dup.data:
-                            slip_error = f"สลิปนี้ถูกใช้ไปแล้วใน order {dup.data[0]['order_id']}"
-                        elif total > 0 and abs(slip_amount - total) <= 1:
-                            slip_verified = True
-                            # บันทึก transRef ลง order
-                            sb.table("orders").update({"slip_ref": slip_ref}).eq("order_id", body.order_id).execute()
-                        else:
-                            slip_error = f"ยอดในสลิป ฿{slip_amount:,.0f} ไม่ตรงกับยอด order ฿{total:,.0f}"
-                    else:
-                        slip_error = "ไม่พบ transRef ในสลิป"
+                    slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
+                    slip_ref      = rdata.get("data", {}).get("transRef", "")
+                    slip_verified = True  # log=true → SlipOK เช็คบัญชีร้านและสลิปซ้ำให้แล้ว
                 else:
-                    slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
+                    err_code = rdata.get("code", 0)
+                    if err_code == 1013:
+                        slip_error = f"ยอดในสลิปไม่ตรงกับยอด order ฿{total:,.0f}"
+                    elif err_code == 1014:
+                        slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีร้าน"
+                    elif err_code == 1010:
+                        slip_error = "สลิปซ้ำ เคยใช้ไปแล้ว"
+                    else:
+                        slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
         except Exception as e:
             slip_error = f"SlipOK error: {e}"
             print(f"[SlipOK] error: {e}")
