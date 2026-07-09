@@ -1161,11 +1161,20 @@ async def slip_notify(body: SlipNotifyRequest):
                 if rdata.get("success"):
                     slip_amount = float(rdata.get("data", {}).get("amount") or 0)
                     slip_ref    = rdata.get("data", {}).get("transRef", "")
-                    # เช็คยอดตรงกับ order (อนุญาตคลาดเคลื่อน ±1 บาท)
-                    if total > 0 and abs(slip_amount - total) <= 1:
-                        slip_verified = True
+
+                    # เช็ค transRef ซ้ำ — ป้องกันนำสลิปเดิมมาใช้กับหลาย order
+                    if slip_ref:
+                        dup = sb.table("orders").select("order_id").eq("slip_ref", slip_ref).neq("order_id", body.order_id).execute()
+                        if dup.data:
+                            slip_error = f"สลิปนี้ถูกใช้ไปแล้วใน order {dup.data[0]['order_id']}"
+                        elif total > 0 and abs(slip_amount - total) <= 1:
+                            slip_verified = True
+                            # บันทึก transRef ลง order
+                            sb.table("orders").update({"slip_ref": slip_ref}).eq("order_id", body.order_id).execute()
+                        else:
+                            slip_error = f"ยอดในสลิป ฿{slip_amount:,.0f} ไม่ตรงกับยอด order ฿{total:,.0f}"
                     else:
-                        slip_error = f"ยอดในสลิป ฿{slip_amount:,.0f} ไม่ตรงกับยอด order ฿{total:,.0f}"
+                        slip_error = "ไม่พบ transRef ในสลิป"
                 else:
                     slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
         except Exception as e:
