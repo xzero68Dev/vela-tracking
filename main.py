@@ -31,7 +31,7 @@ SMS_SENDER     = "VeLA"
 
 # SMS — ส่งเฉพาะตอนถึงเท่านั้น (ประหยัดเครดิต)
 SMS_TEMPLATES = {
-    "accepted":         None,  # ไม่ส่ง SMS
+    "accepted":         "VeLA Cold Brew: ร้านได้จัดกาแฟของคุณแล้ว 📦 ติดตามพัสดุได้เลย: velacoldbrew.com/track/{barcode}",
     "in_transit":       None,  # ไม่ส่ง SMS
     "out_for_delivery": None,  # ไม่ส่ง SMS
     "delivered": "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com",
