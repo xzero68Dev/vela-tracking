@@ -335,6 +335,8 @@ async def fetch_tracking_batch(barcodes: list) -> list:
                 "datetime":     e.get("status_date"),
                 "location":     e.get("location"),
             })
+        # Thailand Post ส่งมาจากใหม่ไปเก่า → reverse ให้เก่าสุดอยู่ก่อน
+        events = list(reversed(events))
         latest = events[-1] if events else None
         # ถ้ามี delivered ใน events ใดๆ → ใช้ delivered เสมอ
         # เพราะไปรษณีย์บางทีบันทึก "ติดต่อไม่ได้" พร้อมกับ "นำจ่ายสำเร็จ" ห่างกันแค่วินาทีเดียว
