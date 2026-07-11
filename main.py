@@ -1126,8 +1126,111 @@ class SlipNotifyRequest(BaseModel):
     order_id: str
     slip_url: str
 
-SLIPOK_API_URL = os.getenv("SLIPOK_URL", "https://api.slipok.com/api/line/apikey/70860")
-SLIPOK_API_KEY = os.getenv("SLIPOK_API_KEY", "")
+SLIPOK_API_URL  = os.getenv("SLIPOK_URL", "https://api.slipok.com/api/line/apikey/70860")
+SLIPOK_API_KEY  = os.getenv("SLIPOK_API_KEY", "")
+PROMPTPAY_ID    = os.getenv("PROMPTPAY_ID", "")
+
+
+@app.get("/orders/qr/{order_id}")
+async def get_order_qr(order_id: str):
+    """สร้าง PromptPay QR Code เฉพาะ order นี้ พร้อม ref1=order_id"""
+    if not PROMPTPAY_ID:
+        raise HTTPException(status_code=500, detail="PROMPTPAY_ID not configured")
+
+    sb = get_supabase()
+    res = sb.table("orders").select("total,status").eq("order_id", order_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="order not found")
+    order = res.data[0]
+    total = float(order.get("total") or 0)
+
+    try:
+        from promptpay import qrcode as pp_qrcode
+        import qrcode as qr_lib
+        import io, base64
+
+        # สร้าง PromptPay payload พร้อม amount และ ref1=order_id
+        payload = pp_qrcode.generate_payload(
+            PROMPTPAY_ID,
+            {"amount": total, "ref1": order_id[:20]}  # ref1 max 20 chars
+        )
+
+        # สร้าง QR image
+        img = qr_lib.make(payload, error_correction=qr_lib.constants.ERROR_CORRECT_M)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        return {
+            "order_id": order_id,
+            "amount":   total,
+            "payload":  payload,
+            "qr_base64": f"data:image/png;base64,{b64}",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"QR generation error: {e}")
+
+
+@app.post("/webhook/slipok")
+async def slipok_webhook(request: Request):
+    """รับ webhook จาก SlipOK เมื่อมีเงินเข้า PromptPay → auto-confirm order"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    data = body.get("data", {})
+    amount    = float(data.get("amount") or 0)
+    ref1      = (data.get("ref1") or "").strip()
+    trans_ref = data.get("transRef", "")
+
+    print(f"[SlipOK Webhook] amount={amount} ref1={ref1} transRef={trans_ref}")
+
+    if not ref1:
+        return {"ok": True, "matched": False, "reason": "no ref1"}
+
+    sb = get_supabase()
+
+    # หา order จาก ref1 (order_id)
+    res = sb.table("orders").select("*").eq("order_id", ref1).execute()
+    if not res.data:
+        return {"ok": True, "matched": False, "reason": "order not found"}
+
+    order = res.data[0]
+    if order.get("status") in ("ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
+        return {"ok": True, "matched": True, "reason": "already paid"}
+
+    total = float(order.get("total") or 0)
+    if abs(amount - total) > 1:
+        return {"ok": True, "matched": False, "reason": f"amount mismatch: {amount} vs {total}"}
+
+    # Auto-confirm!
+    sb.table("orders").update({
+        "status":      "ชำระแล้ว",
+        "paid_at":     datetime.utcnow().isoformat(),
+        "slip_status": "verified",
+        "slip_ref":    trans_ref,
+    }).eq("order_id", ref1).execute()
+
+    # ให้ points
+    try:
+        await _award_points(sb, ref1)
+    except Exception as e:
+        print(f"[Webhook] point error: {e}")
+
+    # แจ้ง admin
+    customer = order.get("customer", "")
+    phone    = order.get("phone", "")
+    await send_line_notify(
+        ADMIN_LINE_USER_ID,
+        f"✅ ชำระแล้ว (QR Auto)! {customer} ({phone})\n"
+        f"Order: {ref1}\nยอด: ฿{amount:,.0f}\nRef: {trans_ref}"
+    )
+
+    print(f"[SlipOK Webhook] ✅ auto-confirmed {ref1}")
+    return {"ok": True, "matched": True, "order_id": ref1}
+
+
 
 @app.post("/orders/slip-notify")
 async def slip_notify(body: SlipNotifyRequest):
