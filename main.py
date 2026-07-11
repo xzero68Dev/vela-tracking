@@ -604,6 +604,55 @@ async def health():
     return {"status": "ok", "service": "VeLA Tracking API v2"}
 
 
+@app.get("/products")
+async def get_products():
+    """ดึงสินค้าทั้งหมด พร้อมราคาหลังลด"""
+    sb = get_supabase()
+    res = sb.table("products").select("*").eq("active", True).order("sort_order").execute()
+    products = []
+    for p in (res.data or []):
+        price      = int(p.get("price") or 0)
+        disc_pct   = int(p.get("discount_pct") or 0)
+        disc_price = round(price * (1 - disc_pct / 100))
+        products.append({
+            **p,
+            "price":          price,
+            "price_original": price,
+            "price_discounted": disc_price,
+            "discount_pct":   disc_pct,
+            "discount_amount": price - disc_price,
+        })
+    return {"products": products}
+
+
+@app.get("/products/check-first-order")
+async def check_first_order(phone: str):
+    """เช็คว่าลูกค้าเบอร์นี้มีสิทธิ์ส่วนลด 50% (สั่งครั้งแรกในระบบ) ไหม"""
+    sb = get_supabase()
+    # เช็คจาก customers table
+    cust = sb.table("customers").select("first_order_used").eq("phone", phone).execute()
+    if cust.data:
+        used = cust.data[0].get("first_order_used", False)
+        return {"eligible": not used, "discount_pct": 50 if not used else 0}
+    # ไม่มีใน customers → เช็คจาก orders ว่าเคยสั่งไหม
+    orders = sb.table("orders").select("order_id").eq("phone", phone).limit(1).execute()
+    eligible = len(orders.data or []) == 0
+    return {"eligible": eligible, "discount_pct": 50 if eligible else 0}
+
+
+@app.post("/admin/products/{product_id}")
+async def update_product(product_id: int, body: dict, x_api_key: str = Header(default="")):
+    """Admin — อัปเดตราคา/รายละเอียดสินค้า"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    allowed = {"name", "description", "flavor", "roast", "process", "price", "discount_pct", "image_url", "active"}
+    update_data = {k: v for k, v in body.items() if k in allowed}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="no valid fields")
+    sb.table("products").update(update_data).eq("id", product_id).execute()
+    return {"success": True}
+
+
 @app.get("/track/{barcode}")
 async def track_single(barcode: str):
     """เช็คสถานะพัสดุ 1 ชิ้น (real-time)"""
@@ -1013,17 +1062,18 @@ class OrderItem(BaseModel):
     name: str
 
 class CreateOrderRequest(BaseModel):
-    order_id:     str
-    customer:     str
-    phone:        str
-    full_address: str
-    province:     str
-    zip:          str
-    note:         Optional[str] = ""
-    items:        list[OrderItem]
-    total:        float
-    channel:      str = "web"
-    status:       str = "รอชำระเงิน"
+    order_id:             str
+    customer:             str
+    phone:                str
+    full_address:         str
+    province:             str
+    zip:                  str
+    note:                 Optional[str] = ""
+    items:                list[OrderItem]
+    total:                float
+    channel:              str = "web"
+    status:               str = "รอชำระเงิน"
+    first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก
 
 def sku_code_to_ml(sku_code: str) -> int:
     """แปลง SKU code (เช่น ORIGINAL-200, KYOHO, ORIGINAL) เป็น ml — ใช้กับ order จากเว็บเท่านั้น"""
@@ -1099,7 +1149,15 @@ async def create_order(body: CreateOrderRequest):
         "channel":      body.channel,
         "status":       body.status,
         "total":        body.total,
+        "first_order_discount": body.first_order_discount,
     }).execute()
+
+    # mark first_order_used ถ้าใช้ส่วนลดครั้งแรก
+    if body.first_order_discount:
+        try:
+            sb.table("customers").update({"first_order_used": True}).eq("phone", body.phone).execute()
+        except Exception as e:
+            print(f"[first_order] mark error: {e}")
 
     # บันทึก revenue ลง accounting ด้วย เพื่อให้นับรวมใน leaderboard/ranking
     sb.table("accounting").upsert({
