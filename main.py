@@ -1174,7 +1174,7 @@ async def create_order(body: CreateOrderRequest):
         "first_order_discount": body.first_order_discount,
     }).execute()
 
-    # mark first_order_used ถ้าใช้ส่วนลดครั้งแรก
+    # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
     if body.first_order_discount:
         try:
             sb.table("customers").upsert({
@@ -1212,6 +1212,78 @@ class SlipNotifyRequest(BaseModel):
 SLIPOK_API_URL  = os.getenv("SLIPOK_URL", "https://api.slipok.com/api/line/apikey/70860")
 SLIPOK_API_KEY  = os.getenv("SLIPOK_API_KEY", "")
 PROMPTPAY_ID    = os.getenv("PROMPTPAY_ID", "")
+
+
+@app.post("/orders/slip-notify")
+async def slip_notify(body: SlipNotifyRequest):
+    """ตรวจสอบสลิปผ่าน SlipOK → auto-confirm ถ้ายอดตรง หรือแจ้ง admin"""
+    sb = get_supabase()
+    res = sb.table("orders").select("customer,phone,total,status,first_order_discount").eq("order_id", body.order_id).execute()
+    order = res.data[0] if res.data else {}
+    customer = order.get("customer", "ลูกค้า")
+    phone    = order.get("phone", "")
+    total    = float(order.get("total") or 0)
+
+    if order.get("status") in ("ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
+        return {"success": True, "verified": False, "reason": "already_paid"}
+
+    slip_verified = False
+    slip_amount   = None
+    slip_ref      = None
+    slip_error    = None
+
+    if SLIPOK_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    SLIPOK_API_URL,
+                    headers={"x-authorization": SLIPOK_API_KEY},
+                    data={"url": body.slip_url, "log": "true", "amount": str(int(total)) if total > 0 else ""},
+                )
+                rdata = r.json()
+                if rdata.get("success"):
+                    slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
+                    slip_ref      = rdata.get("data", {}).get("transRef", "")
+                    slip_verified = True
+                else:
+                    err_code = rdata.get("code", 0)
+                    if err_code == 1013:   slip_error = "ยอดในสลิปไม่ตรงกับยอด order"
+                    elif err_code == 1014: slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีร้าน"
+                    elif err_code == 1010: slip_error = "สลิปซ้ำ เคยใช้ไปแล้ว"
+                    else:                  slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
+        except Exception as e:
+            slip_error = f"SlipOK error: {e}"
+            print(f"[SlipOK] error: {e}")
+
+    if slip_verified:
+        sb.table("orders").update({
+            "status":      "ชำระแล้ว",
+            "paid_at":     datetime.utcnow().isoformat(),
+            "slip_url":    body.slip_url,
+            "slip_status": "verified",
+        }).eq("order_id", body.order_id).execute()
+        # ให้ points + mark first_order_used
+        try:
+            await _award_points(sb, body.order_id)
+            await _mark_first_order_used(sb, body.order_id)
+        except Exception as e:
+            print(f"[SlipOK] post-confirm error: {e}")
+        await send_line_notify(ADMIN_LINE_USER_ID,
+            f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}")
+        return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
+    else:
+        sb.table("orders").update({
+            "slip_url":    body.slip_url,
+            "slip_status": "rejected" if slip_error else "pending",
+        }).eq("order_id", body.order_id).execute()
+        msg = (f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" +
+               (f" ({phone})" if phone else "") +
+               f"\nOrder: {body.order_id}" +
+               (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+               (f"\n⚠️ {slip_error}" if slip_error else "") +
+               f"\nกรุณายืนยันชำระเงินใน /admin/orders")
+        await send_line_notify(ADMIN_LINE_USER_ID, msg)
+        return {"success": True, "verified": False, "reason": slip_error or "manual_check"}
 
 
 @app.get("/orders/qr/{order_id}")
@@ -1253,6 +1325,26 @@ async def get_order_qr(order_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"QR generation error: {e}")
 
+
+
+
+async def _mark_first_order_used(sb, order_id: str):
+    """mark first_order_used = true ถ้า order นี้ใช้ส่วนลด 50% ครั้งแรก"""
+    try:
+        res = sb.table("orders").select("phone,first_order_discount").eq("order_id", order_id).execute()
+        if not res.data:
+            return
+        order = res.data[0]
+        if order.get("first_order_discount"):
+            phone = order.get("phone")
+            if phone:
+                sb.table("customers").upsert({
+                    "phone":            phone,
+                    "first_order_used": True,
+                }, on_conflict="phone").execute()
+                print(f"[first_order] marked used for {phone}")
+    except Exception as e:
+        print(f"[first_order] mark error: {e}")
 
 async def _award_points(sb, order_id: str):
     """ให้ point จาก order — แยกออกมาเพื่อให้เรียกซ้ำได้"""
@@ -1478,6 +1570,12 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
             print(f"[point_ledger] insert error (confirm-payment {order_id}): {e}")
     else:
         print(f"[point_ledger] ข้าม {order_id} — ไม่มีเบอร์โทร")
+
+    # mark first_order_used ถ้า order นี้ใช้ส่วนลด 50%
+    try:
+        await _mark_first_order_used(sb, order_id)
+    except Exception as e:
+        print(f"[first_order] mark error: {e}")
 
     return {
         "success":  True,
