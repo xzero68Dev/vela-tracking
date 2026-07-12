@@ -14,8 +14,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---- Config ----
 THAIPOST_API_KEY      = os.getenv("THAIPOST_API_KEY", "")
+ETRACKINGS_API_URL    = "https://api.etrackings.com/api/v3/tracks/find"
 ETRACKINGS_API_KEY    = os.getenv("ETRACKINGS_API_KEY", "")
 ETRACKINGS_KEY_SECRET = os.getenv("ETRACKINGS_KEY_SECRET", "")
+KEX_SCRAPER_URL       = os.getenv("KEX_SCRAPER_URL", "")   # Railway microservice URL
+KEX_SCRAPER_KEY       = os.getenv("KEX_SCRAPER_KEY", "vela-kex-scraper")
 SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY     = os.getenv("SUPABASE_KEY", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
@@ -362,7 +365,26 @@ async def fetch_tracking_batch(barcodes: list) -> list:
 async def fetch_tracking(barcode: str) -> dict:
     """ดึงสถานะพัสดุ — route อัตโนมัติตาม carrier"""
     carrier = detect_carrier(barcode)
-    if carrier != "thailand_post" and ETRACKINGS_API_KEY:
+    if carrier == "kex-express":
+        # Kerry → ลอง Railway scraper ก่อน ถ้าไม่มีค่อย eTrackings
+        if KEX_SCRAPER_URL:
+            try:
+                async with httpx.AsyncClient(timeout=35) as client:
+                    r = await client.get(
+                        f"{KEX_SCRAPER_URL}/track/{barcode}",
+                        headers={"x-api-key": KEX_SCRAPER_KEY},
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("status") not in ("unknown", "error", None):
+                            return data
+            except Exception as e:
+                print(f"[KEX Scraper] Railway error {barcode}: {e}")
+        # fallback eTrackings
+        if ETRACKINGS_API_KEY:
+            return await fetch_etrackings(barcode, carrier)
+        return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
+    elif carrier != "thailand_post" and ETRACKINGS_API_KEY:
         return await fetch_etrackings(barcode, carrier)
     return (await fetch_tracking_batch([barcode]))[0]
 
@@ -629,13 +651,13 @@ async def get_products():
 async def check_first_order(phone: str):
     """เช็คว่าลูกค้าเบอร์นี้มีสิทธิ์ส่วนลด 50% (สั่งครั้งแรกในระบบ) ไหม"""
     sb = get_supabase()
-    # เช็คจาก customers table
+    # เช็คจาก customers table ก่อน
     cust = sb.table("customers").select("first_order_used").eq("phone", phone).execute()
     if cust.data:
         used = cust.data[0].get("first_order_used", False)
         return {"eligible": not used, "discount_pct": 50 if not used else 0}
-    # ไม่มีใน customers → เช็คจาก orders ว่าเคยสั่งไหม
-    orders = sb.table("orders").select("order_id").eq("phone", phone).limit(1).execute()
+    # ไม่มีใน customers → เช็ค orders ว่าเคยสั่งผ่านเว็บไหม
+    orders = sb.table("orders").select("order_id").eq("phone", phone).eq("channel", "web").limit(1).execute()
     eligible = len(orders.data or []) == 0
     return {"eligible": eligible, "discount_pct": 50 if eligible else 0}
 
@@ -1155,7 +1177,10 @@ async def create_order(body: CreateOrderRequest):
     # mark first_order_used ถ้าใช้ส่วนลดครั้งแรก
     if body.first_order_discount:
         try:
-            sb.table("customers").update({"first_order_used": True}).eq("phone", body.phone).execute()
+            sb.table("customers").upsert({
+                "phone":            body.phone,
+                "first_order_used": True,
+            }, on_conflict="phone").execute()
         except Exception as e:
             print(f"[first_order] mark error: {e}")
 
