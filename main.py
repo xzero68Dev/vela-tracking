@@ -1473,7 +1473,7 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
 
 
 @app.post("/admin/confirm-delivered")
-async def confirm_delivered(order_id: str, x_api_key: str = Header(default="")):
+async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str = Header(default="")):
     """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE"""
     check_admin_key(x_api_key)
     sb = get_supabase()
@@ -1504,24 +1504,24 @@ async def confirm_delivered(order_id: str, x_api_key: str = Header(default="")):
         except Exception as e:
             print(f"[confirm-delivered] shipments update error: {e}")
 
-    if phone:
-        notify   = "sms"
-        line_uid = ""
+    if phone and notify:
+        notify_ch = "sms"
+        line_uid  = ""
         try:
             cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
             if cust.data:
-                notify   = cust.data[0].get("notify_channel") or "sms"
-                line_uid = cust.data[0].get("line_user_id") or ""
+                notify_ch = cust.data[0].get("notify_channel") or "sms"
+                line_uid  = cust.data[0].get("line_user_id") or ""
         except:
             pass
 
         msg = "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com"
-        if notify == "line" and line_uid:
+        if notify_ch == "line" and line_uid:
             await send_line_notify(line_uid, msg)
         else:
             await send_sms(phone, msg, barcode=tracking, status="delivered", customer=customer)
 
-    return {"success": True, "order_id": order_id, "notified": bool(phone)}
+    return {"success": True, "order_id": order_id, "notified": bool(phone and notify)}
 
 
 @app.post("/admin/confirm-payment")
