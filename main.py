@@ -1177,10 +1177,15 @@ async def create_order(body: CreateOrderRequest):
     # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
     if body.first_order_discount:
         try:
-            sb.table("customers").upsert({
-                "phone":            body.phone,
-                "first_order_used": True,
-            }, on_conflict="phone").execute()
+            # ลอง update ก่อน ถ้าไม่มีค่อย insert
+            upd = sb.table("customers").update({"first_order_used": True}).eq("phone", body.phone).execute()
+            if not upd.data:
+                # ไม่มีใน customers เลย → insert ใหม่
+                sb.table("customers").insert({
+                    "phone":            body.phone,
+                    "first_order_used": True,
+                }).execute()
+            print(f"[first_order] marked used for {body.phone}")
         except Exception as e:
             print(f"[first_order] mark error: {e}")
 
