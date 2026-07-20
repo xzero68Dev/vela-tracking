@@ -415,30 +415,36 @@ async def run_cron():
     barcodes = [r["barcode"] for r in (rows.data or [])]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
 
-    # แยก barcode เป็น 2 กลุ่ม
-    thaipost_barcodes  = [b for b in barcodes if detect_carrier(b) == "thailand_post"]
-    etracking_barcodes = [b for b in barcodes if detect_carrier(b) != "thailand_post"]
-    print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, eTrackings: {len(etracking_barcodes)}")
+    # แยก barcode เป็น 3 กลุ่ม
+    thaipost_barcodes = [b for b in barcodes if detect_carrier(b) == "thailand_post"]
+    kex_barcodes      = [b for b in barcodes if detect_carrier(b) == "kex-express"]
+    other_barcodes    = [b for b in barcodes if detect_carrier(b) not in ("thailand_post", "kex-express")]
+    etracking_barcodes = other_barcodes
+    print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, KEX: {len(kex_barcodes)}, eTrackings: {len(etracking_barcodes)}")
 
-    # เช็ค Kerry/Flash/J&T เฉพาะหลัง 13:00 น. (ประหยัด credit — ส่วนใหญ่ออกส่งบ่ายโมงขึ้นไป)
-    thai_hour = (datetime.utcnow().hour + 7) % 24  # UTC+7
+    # เช็ค Kerry/Flash/J&T เฉพาะหลัง 13:00 น.
+    thai_hour = (datetime.utcnow().hour + 7) % 24
     if thai_hour < 13:
-        print(f"[cron] ข้าม eTrackings — เวลา {thai_hour}:xx น. ยังไม่ถึงบ่ายโมง")
+        print(f"[cron] ข้าม eTrackings/KEX — เวลา {thai_hour}:xx น. ยังไม่ถึงบ่ายโมง")
+        kex_barcodes       = []
         etracking_barcodes = []
 
-    # เช็ค Kerry เฉพาะเลขที่ไม่เกิน 7 วัน (ประหยัด credit)
-    if etracking_barcodes:
+    # เช็คเฉพาะเลขที่ไม่เกิน 7 วัน
+    if kex_barcodes or etracking_barcodes:
         cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat()
         try:
+            all_third_party = kex_barcodes + etracking_barcodes
             new_rows = sb.table("shipments") \
                 .select("barcode") \
-                .in_("barcode", etracking_barcodes) \
+                .in_("barcode", all_third_party) \
                 .gte("created_at", cutoff_7d) \
                 .execute()
-            etracking_barcodes = [r["barcode"] for r in (new_rows.data or [])]
-            print(f"[cron] eTrackings หลังกรอง 7 วัน: {len(etracking_barcodes)} รายการ")
+            filtered = {r["barcode"] for r in (new_rows.data or [])}
+            kex_barcodes       = [b for b in kex_barcodes if b in filtered]
+            etracking_barcodes = [b for b in etracking_barcodes if b in filtered]
+            print(f"[cron] หลังกรอง 7 วัน: KEX {len(kex_barcodes)}, eTrackings {len(etracking_barcodes)} รายการ")
         except Exception as e:
-            print(f"[cron] eTrackings filter error: {e}")
+            print(f"[cron] filter error: {e}")
 
     # ดึง status เก่าทั้งหมดก่อน
     old_rows = sb.table("shipments").select("barcode,status").in_("barcode", barcodes).execute()
@@ -446,7 +452,22 @@ async def run_cron():
 
     all_results = []
 
-    # เช็ค Kerry/Flash/J&T ผ่าน eTrackings
+    # เช็ค KEX ผ่าน Fly.io scraper
+    for b in kex_barcodes:
+        try:
+            res = await fetch_tracking(b)
+            all_results.append({
+                "barcode":      b,
+                "status":       res.get("status", "unknown"),
+                "status_th":    res.get("status_th", ""),
+                "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[-1].get("datetime", "")},
+                "events":       res.get("events", []),
+            })
+            print(f"[cron] KEX {b} → {res.get('status')}")
+        except Exception as e:
+            print(f"[cron] KEX error {b}: {e}")
+
+    # เช็ค Flash/J&T ผ่าน eTrackings
     for b in etracking_barcodes:
         try:
             res = await fetch_etrackings(b, detect_carrier(b))
@@ -566,7 +587,7 @@ async def run_cron():
                             await send_line_notify(ADMIN_LINE_USER_ID, admin_msg)
                             print(f"[ADMIN] แจ้ง admin → {barcode} {status}")
 
-        if i + batch_size < len(thaipost_barcodes):
+        if thaipost_barcodes and i + batch_size < len(thaipost_barcodes):
             await asyncio.sleep(1)
 
     print("[cron] เสร็จแล้ว")
