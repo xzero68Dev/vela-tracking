@@ -379,10 +379,8 @@ async def fetch_tracking(barcode: str) -> dict:
                         if data.get("status") not in ("unknown", "error", None):
                             return data
             except Exception as e:
-                print(f"[KEX Scraper] Railway error {barcode}: {e}")
-        # fallback eTrackings
-        if ETRACKINGS_API_KEY:
-            return await fetch_etrackings(barcode, carrier)
+                print(f"[KEX Scraper] error {barcode}: {e}")
+        # ไม่มี fallback — ถ้า scraper ไม่ได้ผล return unknown
         return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
     elif carrier != "thailand_post" and ETRACKINGS_API_KEY:
         return await fetch_etrackings(barcode, carrier)
