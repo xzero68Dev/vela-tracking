@@ -453,7 +453,7 @@ async def run_cron():
     # เช็ค KEX ผ่าน Fly.io scraper — ส่งทุกเลขพร้อมกันในครั้งเดียว
     if kex_barcodes and KEX_SCRAPER_URL:
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=300) as client:  # 5 นาที สำหรับ bulk KEX
                 r = await client.post(
                     f"{KEX_SCRAPER_URL}/track/bulk",
                     headers={"x-api-key": KEX_SCRAPER_KEY},
