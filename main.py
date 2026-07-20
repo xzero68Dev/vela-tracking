@@ -450,18 +450,22 @@ async def run_cron():
 
     all_results = []
 
-    # เช็ค KEX ผ่าน Fly.io scraper — ส่งทุกเลขพร้อมกันในครั้งเดียว
-    if kex_barcodes and KEX_SCRAPER_URL:
+    # เช็ค KEX ผ่าน Fly.io scraper — แบ่งทีละ 5 เลข ป้องกัน timeout
+    batch_size = 5
+    for i in range(0, len(kex_barcodes), batch_size):
+        batch = kex_barcodes[i:i+batch_size]
+        if not KEX_SCRAPER_URL:
+            break
         try:
-            async with httpx.AsyncClient(timeout=300) as client:  # 5 นาที สำหรับ bulk KEX
+            async with httpx.AsyncClient(timeout=200) as client:
                 r = await client.post(
                     f"{KEX_SCRAPER_URL}/track/bulk",
                     headers={"x-api-key": KEX_SCRAPER_KEY},
-                    json={"barcodes": kex_barcodes},
+                    json={"barcodes": batch},
                 )
                 if r.status_code == 200:
                     bulk_data = r.json().get("results", {})
-                    for b in kex_barcodes:
+                    for b in batch:
                         res = bulk_data.get(b, {"status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []})
                         all_results.append({
                             "barcode":      b,
@@ -474,7 +478,7 @@ async def run_cron():
                 else:
                     print(f"[KEX Scraper] bulk error: HTTP {r.status_code}")
         except Exception as e:
-            print(f"[KEX Scraper] bulk error: {e}")
+            print(f"[KEX Scraper] bulk error batch {i}: {e}")
 
     # เช็ค Flash/J&T ผ่าน eTrackings
     for b in etracking_barcodes:
