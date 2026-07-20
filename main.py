@@ -450,20 +450,31 @@ async def run_cron():
 
     all_results = []
 
-    # เช็ค KEX ผ่าน Fly.io scraper
-    for b in kex_barcodes:
+    # เช็ค KEX ผ่าน Fly.io scraper — ส่งทุกเลขพร้อมกันในครั้งเดียว
+    if kex_barcodes and KEX_SCRAPER_URL:
         try:
-            res = await fetch_tracking(b)
-            all_results.append({
-                "barcode":      b,
-                "status":       res.get("status", "unknown"),
-                "status_th":    res.get("status_th", ""),
-                "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[-1].get("datetime", "")},
-                "events":       res.get("events", []),
-            })
-            print(f"[cron] KEX {b} → {res.get('status')}")
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(
+                    f"{KEX_SCRAPER_URL}/track/bulk",
+                    headers={"x-api-key": KEX_SCRAPER_KEY},
+                    json={"barcodes": kex_barcodes},
+                )
+                if r.status_code == 200:
+                    bulk_data = r.json().get("results", {})
+                    for b in kex_barcodes:
+                        res = bulk_data.get(b, {"status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []})
+                        all_results.append({
+                            "barcode":      b,
+                            "status":       res.get("status", "unknown"),
+                            "status_th":    res.get("status_th", ""),
+                            "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[-1].get("datetime", "")},
+                            "events":       res.get("events", []),
+                        })
+                        print(f"[cron] KEX {b} → {res.get('status')}")
+                else:
+                    print(f"[KEX Scraper] bulk error: HTTP {r.status_code}")
         except Exception as e:
-            print(f"[cron] KEX error {b}: {e}")
+            print(f"[KEX Scraper] bulk error: {e}")
 
     # เช็ค Flash/J&T ผ่าน eTrackings
     for b in etracking_barcodes:
