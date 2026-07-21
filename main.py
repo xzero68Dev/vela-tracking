@@ -1616,7 +1616,8 @@ async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str =
 
         msg = "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com"
         if notify_ch == "line" and line_uid:
-            await send_line_notify(line_uid, msg)
+            # ส่ง barcode/status/customer/phone ไปด้วย เพื่อให้ send_line_notify เขียน log ลง sms_logs (เหมือนฝั่ง SMS)
+            await send_line_notify(line_uid, msg, barcode=tracking, status="delivered", customer=customer, phone=phone)
         else:
             await send_sms(phone, msg, barcode=tracking, status="delivered", customer=customer)
 
