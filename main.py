@@ -681,19 +681,37 @@ async def get_products():
     return {"products": products}
 
 
-@app.get("/products/check-first-order")
-async def check_first_order(phone: str):
-    """เช็คว่าลูกค้าเบอร์นี้มีสิทธิ์ส่วนลด 50% (สั่งครั้งแรกในระบบ) ไหม"""
-    sb = get_supabase()
-    # เช็คจาก customers table ก่อน
+# ── โปรลูกค้าใหม่: ลด 50% ของบิล เพดาน ฿130 (ออเดอร์แรกในระบบเว็บ ผูกกับเบอร์) ──
+# config ผ่าน env — ปิด/เปิดโปรได้โดยไม่ต้องแก้โค้ด
+def _promo_first_order_enabled() -> bool:
+    return os.getenv("PROMO_FIRST_ORDER_50", "1").strip().lower() in ("1", "true", "yes", "on")
+
+FIRST_ORDER_PCT = float(os.getenv("FIRST_ORDER_DISCOUNT_PCT", "50")) / 100.0   # 0.5
+FIRST_ORDER_CAP = float(os.getenv("FIRST_ORDER_DISCOUNT_CAP", "130"))          # เพดานบาท
+
+def _is_first_order_eligible(sb, phone: str) -> bool:
+    """เบอร์นี้ยังไม่เคยมีออเดอร์ในระบบเว็บ = มีสิทธิ์ (ออเดอร์ Shopee ไม่นับ)"""
     cust = sb.table("customers").select("first_order_used").eq("phone", phone).execute()
     if cust.data:
-        used = cust.data[0].get("first_order_used", False)
-        return {"eligible": not used, "discount_pct": 50 if not used else 0}
-    # ไม่มีใน customers → เช็ค orders ว่าเคยสั่งผ่านเว็บไหม
+        return not cust.data[0].get("first_order_used", False)
     orders = sb.table("orders").select("order_id").eq("phone", phone).eq("channel", "web").limit(1).execute()
-    eligible = len(orders.data or []) == 0
-    return {"eligible": eligible, "discount_pct": 50 if eligible else 0}
+    return len(orders.data or []) == 0
+
+def _first_order_discount(subtotal: float) -> int:
+    """ยอดส่วนลดจริง (บาท) = min(subtotal*50%, เพดาน) — สูตรเดียวกับฝั่ง frontend (promo.ts)"""
+    if subtotal <= 0:
+        return 0
+    return int(min(round(subtotal * FIRST_ORDER_PCT), FIRST_ORDER_CAP))
+
+
+@app.get("/products/check-first-order")
+async def check_first_order(phone: str):
+    """เช็คว่าลูกค้าเบอร์นี้มีสิทธิ์ส่วนลด 50% (สั่งครั้งแรกในระบบเว็บ) ไหม"""
+    sb = get_supabase()
+    if not _promo_first_order_enabled():
+        return {"eligible": False, "discount_pct": 0}
+    eligible = _is_first_order_eligible(sb, phone)
+    return {"eligible": eligible, "discount_pct": int(FIRST_ORDER_PCT * 100) if eligible else 0}
 
 
 @app.post("/admin/products/{product_id}")
@@ -1129,7 +1147,8 @@ class CreateOrderRequest(BaseModel):
     total:                float
     channel:              str = "web"
     status:               str = "รอชำระเงิน"
-    first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก
+    first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก (backend คำนวณจริงเอง)
+    subtotal:             Optional[float] = None  # ยอดก่อนหักส่วนลด (อ้างอิง — backend คำนวณจาก items เอง)
     # UTM tracking — มาจากไหน (โฆษณา/แคมเปญ) ส่งมาจากหน้าเว็บตอน checkout
     utm_source:           Optional[str] = None
     utm_medium:           Optional[str] = None
@@ -1199,6 +1218,18 @@ async def create_order(body: CreateOrderRequest):
     # sku: ใช้ชื่อสินค้า (แสดงให้ลูกค้า/admin อ่านง่าย)
     sku_str = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
 
+    # ── คำนวณส่วนลดลูกค้าใหม่เป็น "ตัวจริง" ที่ฝั่ง server ──
+    # ให้ส่วนลดเมื่อ: (1) หน้าเว็บขอมา (แสดงยอดลดให้ลูกค้าเห็นแล้ว) + (2) promo เปิด + (3) เบอร์มีสิทธิ์จริง
+    # เงื่อนไข (1) กันไม่ให้ยอดที่ชาร์จต่างจากที่ลูกค้าเห็นบนหน้า checkout | (3) กันการแก้ค่าเพื่อขอสิทธิ์ซ้ำ
+    subtotal   = sum(i.price * i.qty for i in body.items)
+    eligible   = (
+        bool(body.first_order_discount)
+        and _promo_first_order_enabled()
+        and _is_first_order_eligible(sb, body.phone)
+    )
+    discount   = _first_order_discount(subtotal) if eligible else 0
+    total_paid = subtotal - discount   # ยอดที่ลูกค้าจ่ายจริง (Pixel Purchase ใช้ค่านี้)
+
     order_row = {
         "order_id":     body.order_id,
         "order_date":   datetime.utcnow().strftime("%Y-%m-%d"),
@@ -1212,9 +1243,13 @@ async def create_order(body: CreateOrderRequest):
         "qty":          sum(i.qty for i in body.items),
         "channel":      body.channel,
         "status":       body.status,
-        "total":        body.total,
-        "first_order_discount": body.first_order_discount,
+        "total":        total_paid,
+        "first_order_discount": discount > 0,
     }
+    # เก็บยอดที่ลดจริง — ใส่เฉพาะเมื่อมีส่วนลด เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
+    # (ต้องรัน migrations/2026-07-21_add_discount_amount.sql ก่อนเปิดโปร)
+    if discount > 0:
+        order_row["discount_amount"] = discount
 
     # UTM tracking — ใส่เฉพาะ field ที่มีค่า เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
     # (ต้องรัน SQL เพิ่มคอลัมน์ใน orders ก่อน ดู migrations/2026-07-21_add_utm.sql)
@@ -1234,7 +1269,7 @@ async def create_order(body: CreateOrderRequest):
     sb.table("orders").insert(order_row).execute()
 
     # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
-    if body.first_order_discount:
+    if discount > 0:
         try:
             # ลอง update ก่อน ถ้าไม่มีค่อย insert
             upd = sb.table("customers").update({"first_order_used": True}).eq("phone", body.phone).execute()
@@ -1253,7 +1288,7 @@ async def create_order(body: CreateOrderRequest):
         "order_id":   body.order_id,
         "order_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "customer":   body.customer,
-        "revenue":    body.total,
+        "revenue":    total_paid,
     }, on_conflict="order_id").execute()
 
     # แจ้ง admin ตอนมีออเดอร์ใหม่จากเว็บ
@@ -1262,11 +1297,11 @@ async def create_order(body: CreateOrderRequest):
         ADMIN_LINE_USER_ID,
         f"🛒 ออเดอร์ใหม่! {body.customer} ({body.phone})\n"
         f"สินค้า: {sku_summary}\n"
-        f"ยอด: ฿{body.total:,.0f}\n"
+        f"ยอด: ฿{total_paid:,.0f}" + (f" (ลดลูกค้าใหม่ -฿{discount:,.0f})" if discount > 0 else "") + "\n"
         f"Order ID: {body.order_id}"
     )
 
-    return {"success": True, "order_id": body.order_id}
+    return {"success": True, "order_id": body.order_id, "total": total_paid, "discount": discount}
 
 
 class SlipNotifyRequest(BaseModel):
