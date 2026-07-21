@@ -420,12 +420,12 @@ async def run_cron():
     etracking_barcodes = other_barcodes
     print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, KEX: {len(kex_barcodes)}, eTrackings: {len(etracking_barcodes)}")
 
-    # เช็ค Kerry/Flash/J&T เฉพาะหลัง 13:00 น.
+    # เช็ค eTrackings เฉพาะหลัง 13:00 น. (ประหยัด credit)
     thai_hour = (datetime.utcnow().hour + 7) % 24
     if thai_hour < 13:
-        print(f"[cron] ข้าม eTrackings/KEX — เวลา {thai_hour}:xx น. ยังไม่ถึงบ่ายโมง")
-        kex_barcodes       = []
+        print(f"[cron] ข้าม eTrackings — เวลา {thai_hour}:xx น. ยังไม่ถึงบ่ายโมง")
         etracking_barcodes = []
+    # KEX ใช้ scraper ฟรี เช็คได้ตลอดเวลา
 
     # เช็คเฉพาะเลขที่ไม่เกิน 7 วัน
     if kex_barcodes or etracking_barcodes:
