@@ -1130,6 +1130,14 @@ class CreateOrderRequest(BaseModel):
     channel:              str = "web"
     status:               str = "รอชำระเงิน"
     first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก
+    # UTM tracking — มาจากไหน (โฆษณา/แคมเปญ) ส่งมาจากหน้าเว็บตอน checkout
+    utm_source:           Optional[str] = None
+    utm_medium:           Optional[str] = None
+    utm_campaign:         Optional[str] = None
+    utm_content:          Optional[str] = None
+    utm_term:             Optional[str] = None
+    referrer:             Optional[str] = None
+    landing_page:         Optional[str] = None
 
 def sku_code_to_ml(sku_code: str) -> int:
     """แปลง SKU code (เช่น ORIGINAL-200, KYOHO, ORIGINAL) เป็น ml — ใช้กับ order จากเว็บเท่านั้น"""
@@ -1191,7 +1199,7 @@ async def create_order(body: CreateOrderRequest):
     # sku: ใช้ชื่อสินค้า (แสดงให้ลูกค้า/admin อ่านง่าย)
     sku_str = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
 
-    sb.table("orders").insert({
+    order_row = {
         "order_id":     body.order_id,
         "order_date":   datetime.utcnow().strftime("%Y-%m-%d"),
         "customer":     body.customer,
@@ -1206,7 +1214,24 @@ async def create_order(body: CreateOrderRequest):
         "status":       body.status,
         "total":        body.total,
         "first_order_discount": body.first_order_discount,
-    }).execute()
+    }
+
+    # UTM tracking — ใส่เฉพาะ field ที่มีค่า เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
+    # (ต้องรัน SQL เพิ่มคอลัมน์ใน orders ก่อน ดู migrations/2026-07-21_add_utm.sql)
+    utm_fields = {
+        "utm_source":   body.utm_source,
+        "utm_medium":   body.utm_medium,
+        "utm_campaign": body.utm_campaign,
+        "utm_content":  body.utm_content,
+        "utm_term":     body.utm_term,
+        "referrer":     body.referrer,
+        "landing_page": body.landing_page,
+    }
+    for k, v in utm_fields.items():
+        if v:
+            order_row[k] = v
+
+    sb.table("orders").insert(order_row).execute()
 
     # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
     if body.first_order_discount:
