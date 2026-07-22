@@ -306,6 +306,21 @@ async def fetch_etrackings(barcode: str, courier: str) -> dict:
         return {"barcode": barcode, "status": "error", "status_th": "เชื่อมต่อไม่ได้"}
 
 
+def _event_sort_key(ev: dict):
+    """คีย์เรียง event ตามเวลาจริง (เก่า→ใหม่) — parse รูปแบบไปรษณีย์ไทย 'DD/MM/YYYY HH:MM:SS+TZ' (ปี พ.ศ.) และ ISO
+    ปีเป็น พ.ศ. หรือ ค.ศ. ไม่สำคัญต่อการเรียง เพราะ monotonic เหมือนกัน"""
+    dt = (ev.get("datetime") or "").strip()
+    m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?', dt)
+    if m:
+        d, mo, y, hh, mm, ss = m.groups()
+        return (int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0))
+    m2 = re.search(r'(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?', dt)
+    if m2:
+        y, mo, d, hh, mm, ss = m2.groups()
+        return (int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0))
+    return (0, 0, 0, 0, 0, 0)  # ไม่รู้เวลา → ถือว่าเก่าสุด
+
+
 async def fetch_tracking_batch(barcodes: list) -> list:
     """เรียก Thailand Post API แบบ batch สูงสุด 20 เลขต่อครั้ง"""
     token = await get_access_token()
@@ -338,8 +353,9 @@ async def fetch_tracking_batch(barcodes: list) -> list:
                 "datetime":     e.get("status_date"),
                 "location":     e.get("location"),
             })
-        # Thailand Post ส่งมาจากใหม่ไปเก่า → reverse ให้เก่าสุดอยู่ก่อน
-        events = list(reversed(events))
+        # เรียงตามเวลาจริง (เก่า→ใหม่) แทนการ reverse แบบเดาลำดับ — กันเคส API ส่งลำดับสลับ
+        # (บั๊กเดิม: บาง parcel API ส่งเก่า→ใหม่ พอ reverse กลายเป็นใหม่→เก่า ทำให้ latest ชี้ไป event รับฝาก)
+        events.sort(key=_event_sort_key)
         latest = events[-1] if events else None
         # ถ้ามี delivered ใน events ใดๆ → ใช้ delivered เสมอ
         # เพราะไปรษณีย์บางทีบันทึก "ติดต่อไม่ได้" พร้อมกับ "นำจ่ายสำเร็จ" ห่างกันแค่วินาทีเดียว
@@ -348,6 +364,8 @@ async def fetch_tracking_batch(barcodes: list) -> list:
             delivered_event = next((e for e in reversed(events) if e["status"] in DONE_STATUSES), None)
             current_status = delivered_event["status"] if delivered_event else "delivered"
             current_status_th = delivered_event["description"] if delivered_event else "จัดส่งสำเร็จ"
+            if delivered_event:
+                latest = delivered_event  # การ์ดบนโชว์ location/เวลา ของ event นำจ่ายสำเร็จ ให้ตรงกับสถานะ
         else:
             current_status, current_status_th = map_status(latest["status_code"] if latest else "")
         results.append({
