@@ -612,8 +612,9 @@ async def run_cron():
                         try:
                             cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
                             if cust.data:
-                                notify   = cust.data[0].get("notify_channel") or "sms"
                                 line_uid = cust.data[0].get("line_user_id") or ""
+                                # ลูกค้าที่ผูก LINE ไว้ → default รับแจ้งเตือนทาง LINE (เคารพค่าที่ตั้งเองไว้ก่อน)
+                                notify   = cust.data[0].get("notify_channel") or ("line" if line_uid else "sms")
                         except:
                             pass
 
@@ -1194,6 +1195,7 @@ class CreateOrderRequest(BaseModel):
     first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก (backend คำนวณจริงเอง)
     subtotal:             Optional[float] = None  # ยอดก่อนหักส่วนลด (อ้างอิง — backend คำนวณจาก items เอง)
     preferred_carrier:    Optional[str] = None  # ขนส่งที่ลูกค้าเลือก: "thailand_post" | "kex"
+    line_user_id:         Optional[str] = None  # ถ้า login LINE — ใช้ส่งแจ้งเตือนรับออเดอร์ทาง LINE
     # UTM tracking — มาจากไหน (โฆษณา/แคมเปญ) ส่งมาจากหน้าเว็บตอน checkout
     utm_source:           Optional[str] = None
     utm_medium:           Optional[str] = None
@@ -1350,6 +1352,32 @@ async def create_order(body: CreateOrderRequest):
         f"ยอด: ฿{total_paid:,.0f}" + (f" (ลดลูกค้าใหม่ -฿{discount:,.0f})" if discount > 0 else "") + "\n"
         f"Order ID: {body.order_id}"
     )
+
+    # แจ้งลูกค้าทาง LINE ว่ารับออเดอร์แล้ว (ถ้า login LINE และไม่ได้ปิดแจ้งเตือน)
+    try:
+        line_uid  = body.line_user_id or ""
+        notify_ch = None
+        if line_uid:
+            look = sb.table("customers").select("notify_channel").eq("line_user_id", line_uid).execute()
+            if look.data:
+                notify_ch = look.data[0].get("notify_channel")
+        elif body.phone:
+            look = sb.table("customers").select("line_user_id,notify_channel").eq("phone", body.phone).execute()
+            if look.data:
+                line_uid  = look.data[0].get("line_user_id") or ""
+                notify_ch = look.data[0].get("notify_channel")
+        channel = notify_ch or ("line" if line_uid else "sms")
+        if channel == "line" and line_uid:
+            cust_msg = (
+                f"VeLA Cold Brew: รับออเดอร์ #{body.order_id} แล้วค่ะ 🐰\n"
+                f"ยอดชำระ ฿{total_paid:,.0f}\n"
+                f"กรุณาโอนเงินแล้วแนบสลิปเพื่อยืนยัน เดี๋ยวจัดส่งให้ไวๆ เลยค่ะ\n"
+                f"ดูออเดอร์ / แนบสลิป: velacoldbrew.com/account"
+            )
+            await send_line_notify(line_uid, cust_msg, barcode=body.order_id, status="order_created",
+                                   customer=body.customer, phone=body.phone)
+    except Exception as e:
+        print(f"[order-notify] LINE error: {e}")
 
     return {"success": True, "order_id": body.order_id, "total": total_paid, "discount": discount}
 
@@ -1659,8 +1687,9 @@ async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str =
         try:
             cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
             if cust.data:
-                notify_ch = cust.data[0].get("notify_channel") or "sms"
                 line_uid  = cust.data[0].get("line_user_id") or ""
+                # ลูกค้าที่ผูก LINE ไว้ → default รับแจ้งเตือนทาง LINE
+                notify_ch = cust.data[0].get("notify_channel") or ("line" if line_uid else "sms")
         except:
             pass
 
@@ -1964,5 +1993,13 @@ async def line_oauth(body: LineOAuthRequest):
 
     res = sb.table("customers").select("*").eq("line_user_id", profile["userId"]).execute()
     customer = res.data[0] if res.data else None
+
+    # ลูกค้าที่ login LINE → ตั้งรับแจ้งเตือนทาง LINE (เฉพาะถ้ายังไม่เคยตั้งค่าไว้ เคารพคนที่เลือกปิด/SMS เอง)
+    if customer and not customer.get("notify_channel"):
+        try:
+            sb.table("customers").update({"notify_channel": "line"}).eq("line_user_id", profile["userId"]).execute()
+            customer["notify_channel"] = "line"
+        except Exception as e:
+            print(f"[line-oauth] set notify_channel error: {e}")
 
     return {"success": True, "customer": customer}
