@@ -1032,11 +1032,14 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         sb.table("orders").upsert(order_rows[i:i+50], on_conflict="order_id").execute()
     stats["orders"] = len(order_rows)
 
-    # ---- บันทึก point_ledger จาก Shopee order ที่ชำระแล้วเท่านั้น (ใช้ parser ที่ทดสอบกับ SKU จริงแล้ว) ----
+    # ---- point_ledger: สะสมแต้ม "เฉพาะออเดอร์ในระบบเว็บตัวเอง" เท่านั้น ----
+    # ออเดอร์ Shopee (channel != web) ไม่ให้แต้ม ตามนโยบายร้าน
     point_rows = []
     skipped_no_date = 0
     skipped_unpaid  = 0
     for row in order_rows:
+        if (row.get("channel") or "shopee") != "web":
+            continue  # ข้าม Shopee — ไม่สะสมแต้ม
         if row.get("status") != "ชำระแล้ว":
             skipped_unpaid += 1
             continue  # ให้ point เฉพาะ order ที่ชำระเงินแล้วเท่านั้น
@@ -1565,6 +1568,8 @@ async def _award_points(sb, order_id: str):
     if not res.data:
         return
     order = res.data[0]
+    if (order.get("channel") or "web") != "web":
+        return  # สะสมแต้มเฉพาะออเดอร์ในระบบเว็บตัวเอง
     # reuse logic เดิมจาก confirm_payment
     from_sku = order.get("sku", "")
     phone    = order.get("phone", "")
@@ -1615,7 +1620,8 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
 
     phone = order.get("phone")
     point_result = None
-    if phone:
+    # สะสมแต้มเฉพาะออเดอร์ในระบบเว็บตัวเอง (ไม่รวม Shopee)
+    if phone and (order.get("channel") or "web") == "web":
         ml = parse_shopee_sku_ml(order.get("sku") or "")
         order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
         try:
@@ -1802,10 +1808,10 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         "paid_at": paid_at,
     }).eq("order_id", order_id).execute()
 
-    # 2) คำนวณ point จาก sku string ที่เก็บไว้ (ใช้ parser เดียวกันทุกช่องทาง)
+    # 2) คำนวณ point จาก sku string ที่เก็บไว้ — เฉพาะออเดอร์ในระบบเว็บตัวเอง (ไม่รวม Shopee)
     phone = order.get("phone")
     point_result = None
-    if phone:
+    if phone and (order.get("channel") or "web") == "web":
         ml = parse_shopee_sku_ml(order.get("sku") or "")
         order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
         try:
@@ -1939,6 +1945,7 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
 
     rows = sb.table("point_ledger") \
         .select("phone,customer,points,order_date") \
+        .eq("channel", "web") \
         .gte("order_date", month_start) \
         .execute()
 
