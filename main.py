@@ -1329,6 +1329,40 @@ def _web_order_costs(items):
     return round(coffee, 2), round(pack_1l + pack_200, 2)
 
 
+def _costs_from_sku_string(sku_str: str):
+    """คำนวณ (coffee_cost, packaging) จาก sku string ของออเดอร์เก่า (รูปแบบ 'ชื่อสินค้า xN, ...')
+    ใช้ตอน backfill บัญชีย้อนหลัง — จับ flavor จากชื่อ + ดูขนาดจาก 'ขนาดทดลอง'/Cold Drip"""
+    coffee = 0.0
+    q1 = 0
+    q2 = 0
+    for seg in (sku_str or "").split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m = re.search(r'x\s*(\d+)', seg, re.IGNORECASE)
+        qty = int(m.group(1)) if m else 1
+        low = seg.lower()
+        flavor = next((f for f in ("original", "dark", "honey", "nutty", "fruity", "kyoho", "gesha") if f in low), None)
+        if not flavor:
+            continue
+        flavor = flavor.upper()
+        is_200 = ("ขนาดทดลอง" in seg) or flavor in ("KYOHO", "GESHA")
+        if flavor in ("KYOHO", "GESHA"):
+            cpu = COFFEE_COST_DRIP.get(flavor, 0.0)
+        elif is_200:
+            cpu = round(COFFEE_COST_1L.get(flavor, 0.0) / 8, 2)
+        else:
+            cpu = COFFEE_COST_1L.get(flavor, 0.0)
+        coffee += cpu * qty
+        if is_200:
+            q2 += qty
+        else:
+            q1 += qty
+    pack_1l = 0.0 if q1 == 0 else (11.70 if q1 == 1 else q1 * 4.5 + q1 * 3.9 + 2)
+    pack_200 = 0.0 if q2 == 0 else (6.15 if q2 == 1 else q2 * 2 + 3.9 + 2)
+    return round(coffee, 2), round(pack_1l + pack_200, 2)
+
+
 @app.post("/orders/create")
 async def create_order(body: CreateOrderRequest):
     """สร้าง order จากหน้าเว็บ — ยังไม่ให้ point ตรงนี้ ต้องรอยืนยันการชำระเงินก่อน (ดู /admin/confirm-payment)"""
@@ -1818,6 +1852,55 @@ async def sync_order_status(x_api_key: str = Header(default="")):
             sb.table("orders").update({"status": target}).eq("order_id", oid).execute()
             fixed.append({"order_id": oid, "from": cur.data[0].get("status"), "to": target})
     return {"success": True, "count": len(fixed), "fixed": fixed}
+
+
+@app.post("/admin/backfill-web-accounting")
+async def backfill_web_accounting(x_api_key: str = Header(default="")):
+    """คำนวณต้นทุน/กำไรย้อนหลังให้ออเดอร์เว็บที่ยังไม่มี (เช่น ออเดอร์ก่อนมีระบบบัญชี)
+    เฉพาะแถวที่ coffee_cost ยังว่าง/เป็น 0 — ไม่ทับของที่คำนวณไว้แล้ว"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    # ค่าส่งจริงจาก shipping
+    ship_map = {}
+    for s in (sb.table("shipping").select("order_id,shipping_cost").execute().data or []):
+        if s.get("order_id"):
+            ship_map[s["order_id"]] = s.get("shipping_cost")
+    # ออเดอร์เว็บ (WEB*)
+    orders = sb.table("orders").select("order_id,order_date,customer,sku,total").like("order_id", "WEB%").execute()
+    # accounting เดิม (ดู revenue + coffee_cost)
+    acc_map = {}
+    for a in (sb.table("accounting").select("order_id,revenue,coffee_cost").like("order_id", "WEB%").execute().data or []):
+        acc_map[a["order_id"]] = a
+    rows = []
+    for o in (orders.data or []):
+        oid = o["order_id"]
+        existing = acc_map.get(oid) or {}
+        # ข้ามถ้าคำนวณต้นทุนไว้แล้ว (coffee_cost > 0)
+        if float(existing.get("coffee_cost") or 0) > 0:
+            continue
+        revenue = existing.get("revenue")
+        if revenue is None:
+            revenue = o.get("total") or 0
+        coffee, packaging = _costs_from_sku_string(o.get("sku") or "")
+        shipping = float(ship_map.get(oid) or 0)
+        net = round(float(revenue or 0) - coffee - packaging - shipping, 2)
+        rows.append({
+            "order_id":   oid,
+            "order_date": o.get("order_date"),
+            "customer":   o.get("customer"),
+            "revenue":    revenue,
+            "shopee_net": revenue,
+            "shopee_fee": 0,
+            "shipping":   shipping,
+            "coffee_cost": coffee,
+            "packaging":  packaging,
+            "other":      0,
+            "net_profit": net,
+            "note":       "web",
+        })
+    for i in range(0, len(rows), 50):
+        sb.table("accounting").upsert(rows[i:i+50], on_conflict="order_id").execute()
+    return {"success": True, "count": len(rows)}
 
 
 @app.post("/admin/confirm-delivered")
