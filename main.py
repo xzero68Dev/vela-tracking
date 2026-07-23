@@ -606,6 +606,17 @@ async def run_cron():
         }).eq("barcode", barcode).execute()
         print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
 
+        # เชื่อมสถานะกลับไปที่ orders — พัสดุถึง/ตีกลับแล้ว → อัปเดต order ให้ตรงกัน (link statuses)
+        if is_done:
+            try:
+                sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                if sr.data:
+                    order_new_status = "ตีกลับ" if status == "returned" else "จัดส่งสำเร็จ"
+                    sb.table("orders").update({"status": order_new_status}).eq("order_id", sr.data[0]["order_id"]).execute()
+                    print(f"[cron] link → order {sr.data[0]['order_id']} = {order_new_status}")
+            except Exception as e:
+                print(f"[cron] link order status error: {e}")
+
         # แจ้งเตือนถ้าสถานะเปลี่ยน
         # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
         sms_status = status
@@ -1671,7 +1682,45 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
             "status":   "pending",
         }).execute()
 
+    # แจ้งลูกค้าทาง LINE ว่าจัดส่งแล้ว (พร้อมเลขพัสดุ + ลิงก์ติดตาม)
+    try:
+        trk = body.tracking.strip().upper()
+        o = sb.table("orders").select("customer,phone").eq("order_id", body.order_id).execute()
+        if o.data:
+            if trk and trk != "-":
+                ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
+                            f"ขนส่ง: {body.carrier} · เลขพัสดุ: {trk}\n"
+                            f"ติดตามพัสดุ: velacoldbrew.com/track/{trk}")
+            else:
+                ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
+                            f"ขนส่ง: {body.carrier}\nขอบคุณที่สั่งซื้อนะคะ 🐰")
+            await _notify_customer_line(sb, body.order_id, o.data[0].get("phone") or "", o.data[0].get("customer") or "",
+                                        ship_msg, "shipped")
+    except Exception as e:
+        print(f"[add-shipping] notify error: {e}")
+
     return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
+
+
+@app.post("/admin/sync-order-status")
+async def sync_order_status(x_api_key: str = Header(default="")):
+    """เชื่อมสถานะ orders ให้ตรงกับ shipments — พัสดุที่ส่งถึง/ตีกลับแล้ว → อัปเดต order ให้ตรง
+    ใช้ sync ข้อมูลเก่าที่ค้าง 'จัดส่งแล้ว' ทั้งที่พัสดุถึงแล้ว (รันครั้งเดียวก็ได้)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    fixed = []
+    done = sb.table("shipments").select("barcode,status").eq("is_done", True).execute()
+    for s in (done.data or []):
+        target = "ตีกลับ" if s.get("status") == "returned" else "จัดส่งสำเร็จ"
+        sr = sb.table("shipping").select("order_id").eq("tracking", s["barcode"]).execute()
+        if not sr.data:
+            continue
+        oid = sr.data[0]["order_id"]
+        cur = sb.table("orders").select("status").eq("order_id", oid).execute()
+        if cur.data and cur.data[0].get("status") not in (target,):
+            sb.table("orders").update({"status": target}).eq("order_id", oid).execute()
+            fixed.append({"order_id": oid, "from": cur.data[0].get("status"), "to": target})
+    return {"success": True, "count": len(fixed), "fixed": fixed}
 
 
 @app.post("/admin/confirm-delivered")
