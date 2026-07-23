@@ -1903,6 +1903,23 @@ async def backfill_web_accounting(x_api_key: str = Header(default="")):
     return {"success": True, "count": len(rows)}
 
 
+@app.get("/admin/web-accounting")
+async def web_accounting(x_api_key: str = Header(default="")):
+    """ข้อมูลบัญชีออเดอร์เว็บ (อ่านผ่าน service key — ไม่เปิดตารางการเงินให้ anon)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    acc = sb.table("accounting") \
+        .select("order_id,order_date,customer,revenue,shopee_fee,shipping,coffee_cost,packaging,other,net_profit") \
+        .like("order_id", "WEB%").order("order_date", desc=True).limit(3000).execute()
+    st = {}
+    for o in (sb.table("orders").select("order_id,status").like("order_id", "WEB%").limit(3000).execute().data or []):
+        st[o["order_id"]] = o.get("status")
+    rows = acc.data or []
+    for r in rows:
+        r["status"] = st.get(r["order_id"], "")
+    return {"rows": rows}
+
+
 @app.post("/admin/confirm-delivered")
 async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str = Header(default="")):
     """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE"""
