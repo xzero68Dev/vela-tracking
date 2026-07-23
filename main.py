@@ -1229,6 +1229,7 @@ class CreateOrderRequest(BaseModel):
     subtotal:             Optional[float] = None  # ยอดก่อนหักส่วนลด (อ้างอิง — backend คำนวณจาก items เอง)
     preferred_carrier:    Optional[str] = None  # ขนส่งที่ลูกค้าเลือก: "thailand_post" | "kex"
     line_user_id:         Optional[str] = None  # ถ้า login LINE — ใช้ส่งแจ้งเตือนรับออเดอร์ทาง LINE
+    account_phone:        Optional[str] = None  # เบอร์บัญชีคนที่ login (LINE/OTP) — ใช้ผูกแต้มเข้าบัญชีคนสั่ง
     # UTM tracking — มาจากไหน (โฆษณา/แคมเปญ) ส่งมาจากหน้าเว็บตอน checkout
     utm_source:           Optional[str] = None
     utm_medium:           Optional[str] = None
@@ -1339,6 +1340,9 @@ async def create_order(body: CreateOrderRequest):
     # บัญชีคนที่ login สั่ง — ใช้ผูกแต้มเข้าบัญชีคนสั่ง (ต้องรัน migrations/2026-07-22_add_line_user_id.sql ก่อน)
     if body.line_user_id:
         order_row["line_user_id"] = body.line_user_id
+    # เบอร์บัญชีคนที่ login (LINE/OTP) — สำหรับผูกแต้ม (ต้องรัน migrations/2026-07-22_add_account_phone.sql ก่อน)
+    if body.account_phone:
+        order_row["account_phone"] = body.account_phone
 
     # UTM tracking — ใส่เฉพาะ field ที่มีค่า เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
     # (ต้องรัน SQL เพิ่มคอลัมน์ใน orders ก่อน ดู migrations/2026-07-21_add_utm.sql)
@@ -1567,9 +1571,11 @@ async def _mark_first_order_used(sb, order_id: str):
         print(f"[first_order] mark error: {e}")
 
 def _loyalty_identity(sb, order: dict):
-    """คืน (phone, customer_name) สำหรับผูกแต้ม — ผูกกับ 'บัญชีคนที่ login สั่ง' (line_user_id) ถ้ามี
-    เพื่อกันเคสส่งหลายที่อยู่/เบอร์ผู้รับต่างกัน แต้มกระจาย — แต้มจะเข้าบัญชีคนสั่งเสมอ"""
-    phone = order.get("phone") or ""
+    """คืน (phone, customer_name) สำหรับผูกแต้ม — ผูกกับ 'บัญชีคนที่ login สั่ง' เสมอ
+    ลำดับความสำคัญ: LINE (line_user_id → เบอร์บัญชี) > เบอร์บัญชีที่ login (account_phone, ครอบคลุม OTP) > เบอร์ในออเดอร์ (guest)
+    เพื่อกันเคสส่งหลายที่อยู่/เบอร์ผู้รับต่างกัน แล้วแต้มกระจาย"""
+    # เบอร์บัญชีที่ login (LINE/OTP) มาก่อนเบอร์ผู้รับในออเดอร์
+    phone = order.get("account_phone") or order.get("phone") or ""
     name  = order.get("customer") or ""
     luid  = order.get("line_user_id") or ""
     if luid:
