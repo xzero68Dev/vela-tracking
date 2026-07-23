@@ -166,6 +166,25 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
 
     return success
 
+
+async def _notify_customer_line(sb, order_id: str, phone: str, customer: str, message: str, status_tag: str) -> bool:
+    """แจ้งลูกค้าทาง LINE (หา line_user_id จากเบอร์) — ส่งเมื่อผูก LINE ไว้และไม่ได้ปิดแจ้งเตือน + เขียน log"""
+    try:
+        line_uid  = ""
+        notify_ch = None
+        if phone:
+            look = sb.table("customers").select("line_user_id,notify_channel").eq("phone", phone).execute()
+            if look.data:
+                line_uid  = look.data[0].get("line_user_id") or ""
+                notify_ch = look.data[0].get("notify_channel")
+        channel = notify_ch or ("line" if line_uid else "sms")
+        if channel == "line" and line_uid:
+            await send_line_notify(line_uid, message, barcode=order_id, status=status_tag, customer=customer, phone=phone)
+            return True
+    except Exception as e:
+        print(f"[customer-notify] {status_tag} error: {e}")
+    return False
+
 # ---- Token cache ----
 _token_cache: dict = {"token": None, "expires_at": 0}
 
@@ -1447,6 +1466,12 @@ async def slip_notify(body: SlipNotifyRequest):
             print(f"[SlipOK] post-confirm error: {e}")
         await send_line_notify(ADMIN_LINE_USER_ID,
             f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}")
+        # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
+        await _notify_customer_line(sb, body.order_id, phone, customer,
+            f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} เรียบร้อยแล้วค่ะ ✅\n"
+            f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
+            f"ดูสถานะ: velacoldbrew.com/account",
+            "payment_confirmed")
         return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
     else:
         sb.table("orders").update({
@@ -1755,6 +1780,13 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         await _mark_first_order_used(sb, order_id)
     except Exception as e:
         print(f"[first_order] mark error: {e}")
+
+    # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
+    await _notify_customer_line(sb, order_id, phone or "", order.get("customer") or "",
+        f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} เรียบร้อยแล้วค่ะ ✅\n"
+        f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
+        f"ดูสถานะ: velacoldbrew.com/account",
+        "payment_confirmed")
 
     return {
         "success":  True,
