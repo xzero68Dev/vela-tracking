@@ -1336,6 +1336,10 @@ async def create_order(body: CreateOrderRequest):
     if body.preferred_carrier:
         order_row["preferred_carrier"] = body.preferred_carrier
 
+    # บัญชีคนที่ login สั่ง — ใช้ผูกแต้มเข้าบัญชีคนสั่ง (ต้องรัน migrations/2026-07-22_add_line_user_id.sql ก่อน)
+    if body.line_user_id:
+        order_row["line_user_id"] = body.line_user_id
+
     # UTM tracking — ใส่เฉพาะ field ที่มีค่า เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
     # (ต้องรัน SQL เพิ่มคอลัมน์ใน orders ก่อน ดู migrations/2026-07-21_add_utm.sql)
     utm_fields = {
@@ -1562,6 +1566,25 @@ async def _mark_first_order_used(sb, order_id: str):
     except Exception as e:
         print(f"[first_order] mark error: {e}")
 
+def _loyalty_identity(sb, order: dict):
+    """คืน (phone, customer_name) สำหรับผูกแต้ม — ผูกกับ 'บัญชีคนที่ login สั่ง' (line_user_id) ถ้ามี
+    เพื่อกันเคสส่งหลายที่อยู่/เบอร์ผู้รับต่างกัน แต้มกระจาย — แต้มจะเข้าบัญชีคนสั่งเสมอ"""
+    phone = order.get("phone") or ""
+    name  = order.get("customer") or ""
+    luid  = order.get("line_user_id") or ""
+    if luid:
+        try:
+            c = sb.table("customers").select("phone,name,display_name").eq("line_user_id", luid).execute()
+            if c.data:
+                acc_phone = c.data[0].get("phone")
+                if acc_phone:
+                    phone = acc_phone  # ใช้เบอร์บัญชีของคนสั่ง ไม่ใช่เบอร์ผู้รับ
+                name = c.data[0].get("name") or c.data[0].get("display_name") or name
+        except Exception as e:
+            print(f"[loyalty] identity error: {e}")
+    return phone, name
+
+
 async def _award_points(sb, order_id: str):
     """ให้ point จาก order — แยกออกมาเพื่อให้เรียกซ้ำได้"""
     res = sb.table("orders").select("*").eq("order_id", order_id).execute()
@@ -1572,8 +1595,7 @@ async def _award_points(sb, order_id: str):
         return  # สะสมแต้มเฉพาะออเดอร์ในระบบเว็บตัวเอง
     # reuse logic เดิมจาก confirm_payment
     from_sku = order.get("sku", "")
-    phone    = order.get("phone", "")
-    customer = order.get("customer", "")
+    phone, customer = _loyalty_identity(sb, order)  # ผูกแต้มเข้าบัญชีคนสั่ง (login)
     # คำนวณ point จาก SKU (100ml = 1 point)
     total_ml = 0
     for item in (from_sku or "").split(","):
@@ -1622,13 +1644,14 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     point_result = None
     # สะสมแต้มเฉพาะออเดอร์ในระบบเว็บตัวเอง (ไม่รวม Shopee)
     if phone and (order.get("channel") or "web") == "web":
+        pt_phone, pt_customer = _loyalty_identity(sb, order)  # ผูกแต้มเข้าบัญชีคนสั่ง (login)
         ml = parse_shopee_sku_ml(order.get("sku") or "")
         order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
         try:
             sb.table("point_ledger").upsert({
                 "order_id":   order_id,
-                "phone":      phone,
-                "customer":   order.get("customer"),
+                "phone":      pt_phone,
+                "customer":   pt_customer,
                 "channel":    order.get("channel") or "web",
                 "ml_total":   ml,
                 "points":     ml / 100,
@@ -1812,13 +1835,14 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
     phone = order.get("phone")
     point_result = None
     if phone and (order.get("channel") or "web") == "web":
+        pt_phone, pt_customer = _loyalty_identity(sb, order)  # ผูกแต้มเข้าบัญชีคนสั่ง (login)
         ml = parse_shopee_sku_ml(order.get("sku") or "")
         order_date = order.get("order_date") or datetime.utcnow().strftime("%Y-%m-%d")
         try:
             sb.table("point_ledger").upsert({
                 "order_id":   order_id,
-                "phone":      phone,
-                "customer":   order.get("customer"),
+                "phone":      pt_phone,
+                "customer":   pt_customer,
                 "channel":    order.get("channel") or "web",
                 "ml_total":   ml,
                 "points":     ml / 100,
