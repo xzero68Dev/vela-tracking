@@ -411,19 +411,45 @@ async def run_cron():
     print("[cron] เริ่มเช็คสถานะพัสดุที่ยังไม่เสร็จ...")
     sb = get_supabase()
 
-    # ลบ order เว็บที่รอชำระเกิน 48 ชั่วโมง
+    # ลบ order เว็บที่รอชำระเกินเวลา — ใช้ created_at ถ้ามี ไม่งั้น fallback ไป order_date
+    # (บั๊กเดิม: order เก่า created_at เป็น NULL ตัวกรอง .lt(created_at) เลยไม่เจอ = ไม่ลบ)
     try:
-        expire_cutoff = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        expired = sb.table("orders") \
-            .select("order_id,customer,phone") \
+        expire_hours = int(os.getenv("ORDER_EXPIRE_HOURS", "48"))
+        now      = datetime.utcnow()
+        cutoff   = now - timedelta(hours=expire_hours)
+        # fallback ด้วย order_date (มีแค่วันที่) → เผื่อ 1 วันกันลบเร็วไป
+        date_cutoff = (now - timedelta(hours=expire_hours) - timedelta(days=1)).date()
+
+        pending = sb.table("orders") \
+            .select("order_id,created_at,order_date") \
             .eq("status", "รอชำระเงิน") \
             .eq("channel", "web") \
-            .lt("created_at", expire_cutoff) \
             .execute()
-        if expired.data:
-            expired_ids = [r["order_id"] for r in expired.data]
+
+        expired_ids = []
+        for r in (pending.data or []):
+            ca = r.get("created_at")
+            od = r.get("order_date")
+            old = False
+            if ca:
+                try:
+                    cadt = datetime.fromisoformat(str(ca).replace("Z", "+00:00")).replace(tzinfo=None)
+                    old = cadt < cutoff
+                except Exception:
+                    old = False
+            elif od:  # ไม่มี created_at → ใช้ order_date
+                try:
+                    old = datetime.strptime(str(od)[:10], "%Y-%m-%d").date() <= date_cutoff
+                except Exception:
+                    old = False
+            if old:
+                expired_ids.append(r["order_id"])
+
+        if expired_ids:
             sb.table("orders").delete().in_("order_id", expired_ids).execute()
-            print(f"[cron] ลบ order หมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
+            print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
+        else:
+            print(f"[cron] ไม่มี order ค้างชำระหมดเวลา (รอชำระ web ทั้งหมด {len(pending.data or [])} รายการ)")
     except Exception as e:
         print(f"[cron] expire error: {e}")
 
@@ -1167,6 +1193,7 @@ class CreateOrderRequest(BaseModel):
     status:               str = "รอชำระเงิน"
     first_order_discount: bool = False  # ส่วนลด 50% ครั้งแรก (backend คำนวณจริงเอง)
     subtotal:             Optional[float] = None  # ยอดก่อนหักส่วนลด (อ้างอิง — backend คำนวณจาก items เอง)
+    preferred_carrier:    Optional[str] = None  # ขนส่งที่ลูกค้าเลือก: "thailand_post" | "kex"
     # UTM tracking — มาจากไหน (โฆษณา/แคมเปญ) ส่งมาจากหน้าเว็บตอน checkout
     utm_source:           Optional[str] = None
     utm_medium:           Optional[str] = None
@@ -1251,6 +1278,7 @@ async def create_order(body: CreateOrderRequest):
     order_row = {
         "order_id":     body.order_id,
         "order_date":   datetime.utcnow().strftime("%Y-%m-%d"),
+        "created_at":   datetime.utcnow().isoformat(),  # ตั้งเวลาสร้างชัดเจน เพื่อให้ cron ลบ order ค้างชำระได้ตรงเวลา
         "customer":     body.customer,
         "phone":        body.phone.zfill(10) if body.phone.isdigit() and len(body.phone) < 10 else body.phone,
         "full_address": body.full_address,
@@ -1268,6 +1296,10 @@ async def create_order(body: CreateOrderRequest):
     # (ต้องรัน migrations/2026-07-21_add_discount_amount.sql ก่อนเปิดโปร)
     if discount > 0:
         order_row["discount_amount"] = discount
+
+    # ขนส่งที่ลูกค้าเลือก — ใส่เฉพาะเมื่อมีค่า (ต้องรัน migrations/2026-07-22_add_preferred_carrier.sql ก่อน)
+    if body.preferred_carrier:
+        order_row["preferred_carrier"] = body.preferred_carrier
 
     # UTM tracking — ใส่เฉพาะ field ที่มีค่า เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
     # (ต้องรัน SQL เพิ่มคอลัมน์ใน orders ก่อน ดู migrations/2026-07-21_add_utm.sql)
