@@ -466,6 +466,11 @@ async def run_cron():
 
         if expired_ids:
             sb.table("orders").delete().in_("order_id", expired_ids).execute()
+            # ลบแถวบัญชีของ order ที่ค้างชำระด้วย ไม่ให้รายรับค้างในบัญชี
+            try:
+                sb.table("accounting").delete().in_("order_id", expired_ids).execute()
+            except Exception as e:
+                print(f"[cron] ลบ accounting ค้างชำระ error: {e}")
             print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
         else:
             print(f"[cron] ไม่มี order ค้างชำระหมดเวลา (รอชำระ web ทั้งหมด {len(pending.data or [])} รายการ)")
@@ -1291,6 +1296,39 @@ def parse_shopee_sku_ml(sku_str: str) -> int:
     return total_ml
 
 
+# ---- ต้นทุน/บัญชี ออเดอร์เว็บ ----
+COFFEE_COST_1L   = {"ORIGINAL": 89.0, "DARK": 75.60, "HONEY": 97.0, "FRUITY": 109.0, "NUTTY": 122.40}
+COFFEE_COST_DRIP = {"GESHA": 61.20, "KYOHO": 61.20}  # cold drip 200ml
+
+def _coffee_cost_per_unit(sku: str) -> float:
+    s = (sku or "").upper().strip()
+    if s in COFFEE_COST_1L:
+        return COFFEE_COST_1L[s]
+    if s in COFFEE_COST_DRIP:
+        return COFFEE_COST_DRIP[s]
+    if s.endswith("-200"):  # ขนาดทดลอง 200ml = ต้นทุนเมล็ด 1L / 8
+        return round(COFFEE_COST_1L.get(s.replace("-200", ""), 0.0) / 8, 2)
+    return 0.0
+
+def _web_order_costs(items):
+    """คืน (coffee_cost, packaging) จาก items ของออเดอร์เว็บ ตามสูตรต้นทุน+แพ็กเกจของร้าน"""
+    coffee = 0.0
+    qty_1l = 0
+    qty_200 = 0
+    for it in items:
+        sku = (it.sku or "").upper().strip()
+        coffee += _coffee_cost_per_unit(sku) * it.qty
+        if sku.endswith("-200") or sku in ("KYOHO", "GESHA"):
+            qty_200 += it.qty
+        else:
+            qty_1l += it.qty
+    # packaging 1L: 1ชิ้น=11.70 | 2+ชิ้น=(qty×4.5)+(qty×3.9)+2
+    pack_1l = 0.0 if qty_1l == 0 else (11.70 if qty_1l == 1 else qty_1l * 4.5 + qty_1l * 3.9 + 2)
+    # packaging 200ml: 1ชิ้น=6.15 | 2+ชิ้น=(qty×2)+3.9+2
+    pack_200 = 0.0 if qty_200 == 0 else (6.15 if qty_200 == 1 else qty_200 * 2 + 3.9 + 2)
+    return round(coffee, 2), round(pack_1l + pack_200, 2)
+
+
 @app.post("/orders/create")
 async def create_order(body: CreateOrderRequest):
     """สร้าง order จากหน้าเว็บ — ยังไม่ให้ point ตรงนี้ ต้องรอยืนยันการชำระเงินก่อน (ดู /admin/confirm-payment)"""
@@ -1376,12 +1414,21 @@ async def create_order(body: CreateOrderRequest):
         except Exception as e:
             print(f"[first_order] mark error: {e}")
 
-    # บันทึก revenue ลง accounting ด้วย เพื่อให้นับรวมใน leaderboard/ranking
+    # บันทึกบัญชีออเดอร์เว็บ — รายรับ + ต้นทุน + กำไร (ค่าส่งอัปเดตตอน add-shipping)
+    coffee_cost, packaging = _web_order_costs(body.items)
     sb.table("accounting").upsert({
         "order_id":   body.order_id,
         "order_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "customer":   body.customer,
         "revenue":    total_paid,
+        "shopee_net": total_paid,   # เว็บไม่มี fee → net = revenue
+        "shopee_fee": 0,
+        "shipping":   0,            # เว็บส่งฟรีลูกค้า; ต้นทุนส่งจริงอัปเดตตอนใส่เลขพัสดุ
+        "coffee_cost": coffee_cost,
+        "packaging":  packaging,
+        "other":      0,
+        "net_profit": round(total_paid - coffee_cost - packaging, 2),
+        "note":       "web",
     }, on_conflict="order_id").execute()
 
     # แจ้ง admin ตอนมีออเดอร์ใหม่จากเว็บ
@@ -1708,6 +1755,21 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
         "status":    "จัดส่งแล้ว",
         "ship_date": ship_date,
     }).eq("order_id", body.order_id).execute()
+
+    # อัปเดตค่าส่งจริง + กำไรสุทธิ ในบัญชี (เฉพาะออเดอร์เว็บที่มีแถวบัญชีอยู่แล้ว)
+    if body.shipping_cost is not None:
+        try:
+            acc = sb.table("accounting").select("revenue,coffee_cost,packaging,other") \
+                .eq("order_id", body.order_id).execute()
+            if acc.data:
+                a = acc.data[0]
+                ship = float(body.shipping_cost or 0)
+                net = round(float(a.get("revenue") or 0) - float(a.get("coffee_cost") or 0)
+                            - float(a.get("packaging") or 0) - ship - float(a.get("other") or 0), 2)
+                sb.table("accounting").update({"shipping": ship, "net_profit": net}) \
+                    .eq("order_id", body.order_id).execute()
+        except Exception as e:
+            print(f"[add-shipping] accounting update error: {e}")
 
     # เพิ่มลง shipments (tracking system) ถ้ายังไม่มี
     existing = sb.table("shipments").select("barcode").eq("barcode", body.tracking.strip().upper()).execute()
