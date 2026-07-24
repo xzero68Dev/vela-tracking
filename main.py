@@ -1433,6 +1433,24 @@ async def create_order(body: CreateOrderRequest):
 
     sb.table("orders").insert(order_row).execute()
 
+    # เก็บลูกค้าลงตาราง customers อัตโนมัติ — เฉพาะเบอร์ที่ยังไม่มี (ไม่ทับข้อมูลเดิมของคน login)
+    try:
+        cust_phone = (body.phone or "").replace("-", "").replace(" ", "").strip()
+        if cust_phone:
+            exist = sb.table("customers").select("phone").eq("phone", cust_phone).limit(1).execute()
+            if not exist.data:
+                sb.table("customers").insert({
+                    "phone":        cust_phone,
+                    "name":         body.customer,
+                    "display_name": body.customer,
+                    "address":      body.full_address,
+                    "province":     body.province,
+                    "zip":          body.zip,
+                }).execute()
+                print(f"[customer] auto-capture guest {body.customer} ({cust_phone})")
+    except Exception as e:
+        print(f"[customer] auto-capture error: {e}")
+
     # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
     if discount > 0:
         try:
