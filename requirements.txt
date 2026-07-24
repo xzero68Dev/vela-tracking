@@ -10,3 +10,4 @@ openpyxl==3.1.5
 python-multipart==0.0.12
 promptpay
 qrcode[pil]
+anthropic

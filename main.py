@@ -787,6 +787,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# DooSlip — LINE slip bot (รวมจาก service dooslip เดิม) mount ที่ /dooslip
+# webhook @dooslip ให้ชี้มาที่ https://vela-tracking.onrender.com/dooslip/webhook
+try:
+    from dooslip_router import router as dooslip_router
+    app.include_router(dooslip_router, prefix="/dooslip")
+except Exception as e:
+    print(f"[dooslip] ไม่โหลด router: {e}")
+
 
 # ---- Models ----
 class AddShipmentsRequest(BaseModel):
