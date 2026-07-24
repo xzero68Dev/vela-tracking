@@ -97,8 +97,8 @@ async def send_line_notify(line_user_id: str, message: str, barcode: str = "", s
         return False
 
 
-async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = ""):
-    """ส่ง SMS ผ่าน Thaibulksms พร้อม log"""
+async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = "", force: bool = False):
+    """ส่ง SMS ผ่าน Thaibulksms พร้อม log (force=True ข้าม dedup ให้ส่งซ้ำได้)"""
     print(f"[SMS] key={SMS_API_KEY[:6]}... secret={SMS_API_SECRET[:6]}...")
     if not SMS_API_KEY or not SMS_API_SECRET:
         print(f"[SMS] ยังไม่ได้ตั้ง SMS key")
@@ -107,8 +107,8 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
         print(f"[SMS] เบอร์โทรไม่ถูกต้อง: {phone}")
         return False
 
-    # เช็คว่าเคยส่ง status นี้ไปแล้วหรือยัง (เฉพาะกรณีมี barcode)
-    if barcode and status:
+    # เช็คว่าเคยส่ง status นี้ไปแล้วหรือยัง (เฉพาะกรณีมี barcode และไม่ force)
+    if barcode and status and not force:
         try:
             sb = get_supabase()
             existing = sb.table("sms_logs").select("id").eq("barcode", barcode).eq("status", status).execute()
@@ -1720,6 +1720,34 @@ async def slip_notify(body: SlipNotifyRequest):
             return {"success": True, "verified": False, "reason": slip_error or "manual_check"}
     finally:
         _slip_inflight.discard(body.order_id)
+
+
+class PaymentSmsRequest(BaseModel):
+    order_id: str
+    message: Optional[str] = None
+
+@app.post("/admin/send-payment-sms")
+async def send_payment_sms(body: PaymentSmsRequest, x_api_key: str = Header(default="")):
+    """ส่ง SMS แจ้งลูกค้าให้ชำระเงิน (แอดมินกดจากหน้า Orders) — ส่งซ้ำได้"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    res = sb.table("orders").select("customer,phone,total,status").eq("order_id", body.order_id).execute()
+    order = res.data[0] if res.data else None
+    if not order:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
+    phone = (order.get("phone") or "").strip()
+    if not phone or phone == "-" or len(phone) < 9:
+        raise HTTPException(status_code=400, detail="ออเดอร์นี้ไม่มีเบอร์โทรที่ส่ง SMS ได้")
+    customer = order.get("customer") or "ลูกค้า"
+    total = int(float(order.get("total") or 0))
+    msg = body.message or (
+        f"VeLA Cold Brew: กรุณาชำระออเดอร์ #{body.order_id} ยอด {total} บาท "
+        f"ที่ velacoldbrew.com เมนูบัญชีของฉัน (เข้าสู่ระบบด้วยเบอร์นี้) ขอบคุณค่ะ"
+    )
+    ok = await send_sms(phone, msg, barcode=body.order_id, status="payment_reminder", customer=customer, force=True)
+    if not ok:
+        raise HTTPException(status_code=502, detail="ส่ง SMS ไม่สำเร็จ (เช็คเครดิต/คีย์ SMS)")
+    return {"success": True, "phone": phone}
 
 
 @app.get("/orders/qr/{order_id}")
