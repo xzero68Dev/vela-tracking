@@ -770,12 +770,16 @@ FIRST_ORDER_PCT = float(os.getenv("FIRST_ORDER_DISCOUNT_PCT", "50")) / 100.0   #
 FIRST_ORDER_CAP = float(os.getenv("FIRST_ORDER_DISCOUNT_CAP", "130"))          # เพดานบาท
 
 def _is_first_order_eligible(sb, phone: str) -> bool:
-    """เบอร์นี้ยังไม่เคยมีออเดอร์ในระบบเว็บ = มีสิทธิ์ (ออเดอร์ Shopee ไม่นับ)"""
+    """มีสิทธิ์ = (1) ยังไม่เคยกดใช้ส่วนลด และ (2) ยังไม่เคยมีออเดอร์ในระบบเว็บ (Shopee ไม่นับ)
+    ต้องเช็คทั้งสองอย่างเสมอ — กัน guest/คนเคยสั่งแล้วมารับสิทธิ์ซ้ำ"""
+    phone = (phone or "").strip()
+    if not phone:
+        return False
     cust = sb.table("customers").select("first_order_used").eq("phone", phone).execute()
-    if cust.data:
-        return not cust.data[0].get("first_order_used", False)
+    if cust.data and cust.data[0].get("first_order_used"):
+        return False  # เคยใช้สิทธิ์ไปแล้ว
     orders = sb.table("orders").select("order_id").eq("phone", phone).eq("channel", "web").limit(1).execute()
-    return len(orders.data or []) == 0
+    return len(orders.data or []) == 0  # ต้องไม่เคยมีออเดอร์เว็บมาก่อน
 
 def _first_order_discount(subtotal: float) -> int:
     """ยอดส่วนลดจริง (บาท) = min(subtotal*50%, เพดาน) — สูตรเดียวกับฝั่ง frontend (promo.ts)"""
@@ -1375,10 +1379,23 @@ async def create_order(body: CreateOrderRequest):
     # ให้ส่วนลดเมื่อ: (1) หน้าเว็บขอมา (แสดงยอดลดให้ลูกค้าเห็นแล้ว) + (2) promo เปิด + (3) เบอร์มีสิทธิ์จริง
     # เงื่อนไข (1) กันไม่ให้ยอดที่ชาร์จต่างจากที่ลูกค้าเห็นบนหน้า checkout | (3) กันการแก้ค่าเพื่อขอสิทธิ์ซ้ำ
     subtotal   = sum(i.price * i.qty for i in body.items)
+    # เบอร์บัญชีของคนสั่ง (login) — ใช้ตัดสินสิทธิ์ ไม่ใช่เบอร์ผู้รับ (กันเปลี่ยนเบอร์ผู้รับเพื่อขอสิทธิ์ซ้ำ)
+    elig_phone = (body.account_phone or "").strip()
+    if body.line_user_id:
+        try:
+            _c = sb.table("customers").select("phone").eq("line_user_id", body.line_user_id).execute()
+            if _c.data and _c.data[0].get("phone"):
+                elig_phone = _c.data[0]["phone"]
+        except Exception:
+            pass
+    if not elig_phone:
+        elig_phone = (body.phone or "").strip()
+    has_account = bool(body.line_user_id or body.account_phone)  # ต้อง login เท่านั้น (guest ไม่ได้ส่วนลด)
     eligible   = (
         bool(body.first_order_discount)
+        and has_account
         and _promo_first_order_enabled()
-        and _is_first_order_eligible(sb, body.phone)
+        and _is_first_order_eligible(sb, elig_phone)
     )
     discount   = _first_order_discount(subtotal) if eligible else 0
     total_paid = subtotal - discount   # ยอดที่ลูกค้าจ่ายจริง (Pixel Purchase ใช้ค่านี้)
@@ -1451,18 +1468,16 @@ async def create_order(body: CreateOrderRequest):
     except Exception as e:
         print(f"[customer] auto-capture error: {e}")
 
-    # mark first_order_used ทันทีที่สร้าง order เพื่อป้องกันใช้ส่วนลด 50% ซ้ำ
+    # mark first_order_used ที่ "เบอร์บัญชี" (elig_phone) เพื่อกันใช้ส่วนลด 50% ซ้ำ
     if discount > 0:
         try:
-            # ลอง update ก่อน ถ้าไม่มีค่อย insert
-            upd = sb.table("customers").update({"first_order_used": True}).eq("phone", body.phone).execute()
+            upd = sb.table("customers").update({"first_order_used": True}).eq("phone", elig_phone).execute()
             if not upd.data:
-                # ไม่มีใน customers เลย → insert ใหม่
                 sb.table("customers").insert({
-                    "phone":            body.phone,
+                    "phone":            elig_phone,
                     "first_order_used": True,
                 }).execute()
-            print(f"[first_order] marked used for {body.phone}")
+            print(f"[first_order] marked used for {elig_phone}")
         except Exception as e:
             print(f"[first_order] mark error: {e}")
 
