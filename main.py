@@ -497,12 +497,17 @@ async def run_cron():
                 expired_ids.append(r["order_id"])
 
         if expired_ids:
-            sb.table("orders").delete().in_("order_id", expired_ids).execute()
-            # ลบแถวบัญชีของ order ที่ค้างชำระด้วย ไม่ให้รายรับค้างในบัญชี
+            # ลบลูก (accounting) ก่อนพ่อ (orders) — ไม่งั้น FK accounting_order_id_fkey บล็อก
             try:
                 sb.table("accounting").delete().in_("order_id", expired_ids).execute()
             except Exception as e:
                 print(f"[cron] ลบ accounting ค้างชำระ error: {e}")
+            # เผื่อมี shipping ค้าง (ปกติ order ค้างชำระยังไม่มี) ลบก่อนกัน FK อื่น
+            try:
+                sb.table("shipping").delete().in_("order_id", expired_ids).execute()
+            except Exception as e:
+                print(f"[cron] ลบ shipping ค้างชำระ error: {e}")
+            sb.table("orders").delete().in_("order_id", expired_ids).execute()
             print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
         else:
             print(f"[cron] ไม่มี order ค้างชำระหมดเวลา (รอชำระ web ทั้งหมด {len(pending.data or [])} รายการ)")
