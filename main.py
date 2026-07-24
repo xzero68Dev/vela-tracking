@@ -431,8 +431,23 @@ async def fetch_tracking(barcode: str) -> dict:
                 print(f"[KEX Scraper] error {barcode}: {e}")
         # ไม่มี fallback — ถ้า scraper ไม่ได้ผล return unknown
         return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
-    elif carrier == "flash-express" and not ETRACKINGS_API_KEY:
-        # Flash (Shopee-managed) — ยังไม่ได้ต่อ tracking API → คืน placeholder ไม่ให้ระบบพัง
+    elif carrier == "flash-express":
+        # Flash (Shopee-managed) — ใช้ scraper เดียวกับ KEX (headless เปิดหน้า Flash ผ่าน 5 Second Shield)
+        if KEX_SCRAPER_URL:
+            try:
+                async with httpx.AsyncClient(timeout=75) as client:
+                    r = await client.get(
+                        f"{KEX_SCRAPER_URL}/track-flash/{barcode}",
+                        headers={"x-api-key": KEX_SCRAPER_KEY},
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        # รับผลถ้าไม่ใช่ error/unknown (pending = ยังไม่เข้าระบบ ก็คืนได้)
+                        if data.get("status") not in ("error", "unknown", None):
+                            return data
+            except Exception as e:
+                print(f"[Flash Scraper] error {barcode}: {e}")
+        # scraper ล่ม/ยังไม่ได้ตั้ง → placeholder ไม่ให้ระบบพัง
         return {"barcode": barcode, "status": "shopee_managed",
                 "status_th": "จัดส่งโดย Flash Express (Shopee) — ติดตามในแอป Shopee",
                 "events": []}
@@ -498,12 +513,13 @@ async def run_cron():
     barcodes = [r["barcode"] for r in (rows.data or [])]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
 
-    # แยก barcode เป็น 3 กลุ่ม
+    # แยก barcode ตามขนส่ง
     thaipost_barcodes = [b for b in barcodes if detect_carrier(b) == "thailand_post"]
     kex_barcodes      = [b for b in barcodes if detect_carrier(b) == "kex-express"]
-    other_barcodes    = [b for b in barcodes if detect_carrier(b) not in ("thailand_post", "kex-express")]
+    flash_barcodes    = [b for b in barcodes if detect_carrier(b) == "flash-express"]
+    other_barcodes    = [b for b in barcodes if detect_carrier(b) not in ("thailand_post", "kex-express", "flash-express")]
     etracking_barcodes = other_barcodes
-    print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, KEX: {len(kex_barcodes)}, eTrackings: {len(etracking_barcodes)}")
+    print(f"[cron] ไปรษณีย์ไทย: {len(thaipost_barcodes)}, KEX: {len(kex_barcodes)}, Flash: {len(flash_barcodes)}, eTrackings: {len(etracking_barcodes)}")
 
     # เช็ค eTrackings เฉพาะหลัง 13:00 น. (ประหยัด credit)
     thai_hour = (datetime.utcnow().hour + 7) % 24
@@ -512,11 +528,11 @@ async def run_cron():
         etracking_barcodes = []
     # KEX ใช้ scraper ฟรี เช็คได้ตลอดเวลา
 
-    # เช็คเฉพาะเลขที่ไม่เกิน 7 วัน
-    if kex_barcodes or etracking_barcodes:
+    # เช็คเฉพาะเลขที่ไม่เกิน 7 วัน (KEX + Flash ใช้ scraper ฟรี, eTrackings เสีย credit)
+    if kex_barcodes or flash_barcodes or etracking_barcodes:
         cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat()
         try:
-            all_third_party = kex_barcodes + etracking_barcodes
+            all_third_party = kex_barcodes + flash_barcodes + etracking_barcodes
             new_rows = sb.table("shipments") \
                 .select("barcode") \
                 .in_("barcode", all_third_party) \
@@ -524,8 +540,9 @@ async def run_cron():
                 .execute()
             filtered = {r["barcode"] for r in (new_rows.data or [])}
             kex_barcodes       = [b for b in kex_barcodes if b in filtered]
+            flash_barcodes     = [b for b in flash_barcodes if b in filtered]
             etracking_barcodes = [b for b in etracking_barcodes if b in filtered]
-            print(f"[cron] หลังกรอง 7 วัน: KEX {len(kex_barcodes)}, eTrackings {len(etracking_barcodes)} รายการ")
+            print(f"[cron] หลังกรอง 7 วัน: KEX {len(kex_barcodes)}, Flash {len(flash_barcodes)}, eTrackings {len(etracking_barcodes)} รายการ")
         except Exception as e:
             print(f"[cron] filter error: {e}")
 
@@ -565,7 +582,36 @@ async def run_cron():
         except Exception as e:
             print(f"[KEX Scraper] bulk error batch {i}: {e}")
 
-    # เช็ค Flash/J&T ผ่าน eTrackings
+    # เช็ค Flash ผ่าน scraper เดียวกัน (headless เปิดหน้า Flash ผ่าน 5 Second Shield) — ฟรี เช็คได้ตลอด
+    for i in range(0, len(flash_barcodes), batch_size):
+        batch = flash_barcodes[i:i+batch_size]
+        if not KEX_SCRAPER_URL:
+            break
+        try:
+            async with httpx.AsyncClient(timeout=200) as client:
+                r = await client.post(
+                    f"{KEX_SCRAPER_URL}/track-flash/bulk",
+                    headers={"x-api-key": KEX_SCRAPER_KEY},
+                    json={"pnos": batch},
+                )
+                if r.status_code == 200:
+                    bulk_data = r.json().get("results", {})
+                    for b in batch:
+                        res = bulk_data.get(b, {"status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []})
+                        all_results.append({
+                            "barcode":      b,
+                            "status":       res.get("status", "unknown"),
+                            "status_th":    res.get("status_th", ""),
+                            "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[-1].get("datetime", "")},
+                            "events":       res.get("events", []),
+                        })
+                        print(f"[cron] Flash {b} → {res.get('status')}")
+                else:
+                    print(f"[Flash Scraper] bulk error: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[Flash Scraper] bulk error batch {i}: {e}")
+
+    # เช็ค J&T/อื่นๆ ผ่าน eTrackings
     for b in etracking_barcodes:
         try:
             res = await fetch_etrackings(b, detect_carrier(b))
