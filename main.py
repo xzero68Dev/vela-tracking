@@ -261,13 +261,25 @@ async def get_access_token() -> str:
 
 
 def detect_carrier(barcode: str) -> str:
-    """ตรวจสอบขนส่งจาก format เลข tracking"""
-    b = barcode.upper()
-    if re.match(r'^(TH|SCPK|SXF)', b):   return "kex-express"
+    """ตรวจสอบ 'ผู้ให้บริการ tracking' (สำหรับ route API เช็คสถานะ) จาก format เลข tracking"""
+    b = (barcode or "").upper()
+    # Flash Express (Shopee-managed) ใช้เลข THxxxxxxxxxxC — KEX ใช้ SXF อย่างเดียวแล้ว
+    if re.match(r'^TH', b):                 return "flash-express"
+    if re.match(r'^(SXF|SCPK)', b):        return "kex-express"
     if re.match(r'^(FLE|FEX)', b):         return "flash-express"
     if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt-express"
     if re.match(r'^SCG', b):               return "scg-express"
     return "thailand_post"
+
+
+def business_carrier(tracking: str, chosen: str = "") -> str:
+    """แปลงเลข tracking → 'ชื่อขนส่งจริง' สำหรับเก็บ/แสดง (Flash Express / KEX Express / POST SABUY / Seller Own Fleet)"""
+    t = (tracking or "").upper().strip()
+    if t.startswith("TH"):    return "Flash Express"   # Shopee-managed THxxxxC
+    if t.startswith("SXF"):   return "KEX Express"
+    if t.startswith("JM"):    return "POST SABUY"
+    if t in ("", "-"):        return chosen or "Seller Own Fleet"
+    return chosen or "POST SABUY"
 
 
 async def fetch_etrackings(barcode: str, courier: str) -> dict:
@@ -419,6 +431,11 @@ async def fetch_tracking(barcode: str) -> dict:
                 print(f"[KEX Scraper] error {barcode}: {e}")
         # ไม่มี fallback — ถ้า scraper ไม่ได้ผล return unknown
         return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
+    elif carrier == "flash-express" and not ETRACKINGS_API_KEY:
+        # Flash (Shopee-managed) — ยังไม่ได้ต่อ tracking API → คืน placeholder ไม่ให้ระบบพัง
+        return {"barcode": barcode, "status": "shopee_managed",
+                "status_th": "จัดส่งโดย Flash Express (Shopee) — ติดตามในแอป Shopee",
+                "events": []}
     elif carrier != "thailand_post" and ETRACKINGS_API_KEY:
         return await fetch_etrackings(barcode, carrier)
     return (await fetch_tracking_batch([barcode]))[0]
@@ -1090,10 +1107,15 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         if not order_id_raw or order_id_raw.upper() == "TOTAL" or order_id_raw == "nan":
             continue
         carrier_raw = str(r.get("Carrier") or "").strip()
-        if "POST" in carrier_raw.upper() or "SABUY" in carrier_raw.upper():
+        cu = carrier_raw.upper()
+        if "FLASH" in cu:
+            carrier = "Flash Express"
+        elif "POST" in cu or "SABUY" in cu:
             carrier = "POST SABUY"
-        elif "KEX" in carrier_raw.upper():
-            carrier = "KEX"
+        elif "KEX" in cu or "KERRY" in cu:
+            carrier = "KEX Express"
+        elif "OWN" in cu or "SELLER" in cu:
+            carrier = "Seller Own Fleet"
         else:
             carrier = carrier_raw
 
@@ -1110,11 +1132,10 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
             "shipping_cost": float(str(cost).replace(",","")) if pd.notna(cost) and str(cost).strip() not in ["", "-", "N/A"] else None,
         })
 
-        # เก็บ tracking ที่ต้องให้ cron เช็ค (POST SABUY และ KEX)
-        if tracking and str(tracking).strip():
-            c_upper = carrier.upper()
-            if "POST" in c_upper or "SABUY" in c_upper or "KEX" in c_upper or "KERRY" in c_upper:
-                tracking_to_add.append(str(tracking).strip().upper())
+        # เก็บ tracking ที่ต้องให้ cron เช็ค — ทุกขนส่งที่มีเลขจริง (Flash TH / KEX SXF / POST JM)
+        # ยกเว้น Seller Own Fleet (tracking = "-")
+        if tracking and str(tracking).strip() and str(tracking).strip() != "-":
+            tracking_to_add.append(str(tracking).strip().upper())
 
     # กรองเฉพาะ row ที่มี order_id จริงๆ
     shipping_rows = [r for r in shipping_rows if r.get("order_id") and r["order_id"].strip()]
@@ -1806,13 +1827,16 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
     sb = get_supabase()
 
     ship_date = body.ship_date or datetime.utcnow().strftime("%Y-%m-%d")
+    trk = body.tracking.strip().upper()
+    # ชื่อขนส่งจริง — อิงจากเลข tracking เป็นหลัก (TH=Flash, SXF=KEX, JM=POST SABUY) แล้วค่อย fallback ที่ admin เลือก
+    carrier = business_carrier(trk, body.carrier)
 
     # บันทึกลง shipping table
     sb.table("shipping").upsert({
         "order_id":      body.order_id,
         "ship_date":     ship_date,
-        "carrier":       body.carrier,
-        "tracking":      body.tracking.strip().upper(),
+        "carrier":       carrier,
+        "tracking":      trk,
         "weight_g":      body.weight_g,
         "shipping_cost": body.shipping_cost,
     }, on_conflict="tracking").execute()
@@ -1848,16 +1872,15 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
 
     # แจ้งลูกค้าทาง LINE ว่าจัดส่งแล้ว (พร้อมเลขพัสดุ + ลิงก์ติดตาม)
     try:
-        trk = body.tracking.strip().upper()
         o = sb.table("orders").select("customer,phone").eq("order_id", body.order_id).execute()
         if o.data:
             if trk and trk != "-":
                 ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
-                            f"ขนส่ง: {body.carrier} · เลขพัสดุ: {trk}\n"
+                            f"ขนส่ง: {carrier} · เลขพัสดุ: {trk}\n"
                             f"ติดตามพัสดุ: velacoldbrew.com/track/{trk}")
             else:
                 ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
-                            f"ขนส่ง: {body.carrier}\nขอบคุณที่สั่งซื้อนะคะ 🐰")
+                            f"ขนส่ง: {carrier}\nขอบคุณที่สั่งซื้อนะคะ 🐰")
             await _notify_customer_line(sb, body.order_id, o.data[0].get("phone") or "", o.data[0].get("customer") or "",
                                         ship_msg, "shipped")
     except Exception as e:
