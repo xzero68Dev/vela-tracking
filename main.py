@@ -1663,25 +1663,30 @@ async def slip_notify(body: SlipNotifyRequest):
         if SLIPOK_API_KEY:
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
+                    # ไม่ส่ง amount ตายตัว → กัน 1013 จากยอดลด 50%/ปัดเศษไม่ตรงเป๊ะ
+                    # SlipOK ยังเช็คให้ว่าเป็นสลิปจริง + เข้าบัญชีร้าน (1014) + ไม่ซ้ำ (1010)
                     r = await client.post(
                         SLIPOK_API_URL,
                         headers={"x-authorization": SLIPOK_API_KEY},
-                        data={"url": body.slip_url, "log": "true", "amount": str(int(total)) if total > 0 else ""},
+                        data={"url": body.slip_url, "log": "true"},
                     )
                     rdata = r.json()
                     if rdata.get("success"):
                         slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
                         slip_ref      = rdata.get("data", {}).get("transRef", "")
-                        slip_verified = True
+                        slip_verified = True   # สลิปจริง + เข้าบัญชีร้าน + ไม่ซ้ำ → ยืนยันเลย (เตือน admin ถ้ายอดต่าง)
                     else:
                         err_code = rdata.get("code", 0)
-                        if err_code == 1013:   slip_error = "ยอดในสลิปไม่ตรงกับยอด order"
-                        elif err_code == 1014: slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีร้าน"
+                        if err_code == 1014:   slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีร้าน"
                         elif err_code == 1010: slip_error = "สลิปซ้ำ (อาจอัปโหลดซ้ำ) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
                         else:                  slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
+                    print(f"[SlipOK] {body.order_id} → {'✓ verified' if slip_verified else '✗ manual'} "
+                          f"slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'} err={slip_error or '-'}")
             except Exception as e:
                 slip_error = f"SlipOK error: {e}"
-                print(f"[SlipOK] error: {e}")
+                print(f"[SlipOK] {body.order_id} error: {e}")
+        else:
+            print(f"[SlipOK] {body.order_id} skip (ไม่มี SLIPOK_API_KEY) → manual")
 
         if slip_verified:
             sb.table("orders").update({
@@ -1696,8 +1701,11 @@ async def slip_notify(body: SlipNotifyRequest):
                 await _mark_first_order_used(sb, body.order_id)
             except Exception as e:
                 print(f"[SlipOK] post-confirm error: {e}")
+            warn = ""
+            if slip_amount and total and abs(slip_amount - total) > 2:
+                warn = f"\n⚠️ ยอดสลิป ฿{slip_amount:,.0f} ≠ ยอด order ฿{total:,.0f} — โปรดตรวจ"
             await send_line_notify(ADMIN_LINE_USER_ID,
-                f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}")
+                f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}{warn}")
             # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
             await _notify_customer_line(sb, body.order_id, phone, customer,
                 f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} เรียบร้อยแล้วค่ะ ✅\n"
