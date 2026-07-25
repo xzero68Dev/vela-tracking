@@ -202,6 +202,39 @@ async def _notify_customer_line(sb, order_id: str, phone: str, customer: str, me
         print(f"[customer-notify] {status_tag} error: {e}")
     return False
 
+
+async def _notify_customer(sb, order_id: str, phone: str, customer: str,
+                           line_message: str, sms_message: str, status_tag: str) -> str:
+    """แจ้งลูกค้าแบบมี fallback:
+    - มี line_user_id และไม่ได้ปิดแจ้งเตือน → ส่ง LINE
+    - ไม่มี LINE (ลูกค้า login ด้วยเบอร์/OTP) → ส่ง SMS แทน (force=True กันโดน dedup)
+    - ปิดแจ้งเตือนไว้ชัดเจน → ไม่ส่ง
+    คืนช่องที่ส่งจริง: 'line' / 'sms' / 'off' / '' (ส่งไม่ได้)
+    """
+    line_uid  = ""
+    notify_ch = None
+    try:
+        if phone:
+            look = sb.table("customers").select("line_user_id,notify_channel").eq("phone", phone).execute()
+            if look.data:
+                line_uid  = look.data[0].get("line_user_id") or ""
+                notify_ch = look.data[0].get("notify_channel")
+        channel = _resolve_notify_channel(notify_ch, line_uid)
+        if channel == "off":
+            print(f"[customer-notify] {status_tag} ข้าม {customer} → ปิดแจ้งเตือน")
+            return "off"
+        if channel == "line" and line_uid:
+            await send_line_notify(line_uid, line_message, barcode=order_id, status=status_tag, customer=customer, phone=phone)
+            return "line"
+        # fallback → SMS
+        ph = (phone or "").strip()
+        if ph and ph != "-" and len(ph) >= 9:
+            ok = await send_sms(ph, sms_message, barcode=order_id, status=status_tag, customer=customer, force=True)
+            return "sms" if ok else ""
+    except Exception as e:
+        print(f"[customer-notify] {status_tag} error: {e}")
+    return ""
+
 # ---- Token cache ----
 _token_cache: dict = {"token": None, "expires_at": 0}
 
@@ -1676,6 +1709,7 @@ async def slip_notify(body: SlipNotifyRequest):
         slip_amount   = None
         slip_ref      = None
         slip_error    = None
+        slip_soft     = None   # ปัญหาชั่วคราว (เช่น ธนาคารต้องรอ) — ไม่ตีเป็น rejected ให้ลองใหม่ได้
 
         if SLIPOK_API_KEY:
             try:
@@ -1694,8 +1728,13 @@ async def slip_notify(body: SlipNotifyRequest):
                         slip_verified = True   # สลิปจริง + เข้าบัญชีร้าน + ไม่ซ้ำ → ยืนยันเลย (เตือน admin ถ้ายอดต่าง)
                     else:
                         err_code = rdata.get("code", 0)
-                        if err_code == 1014:   slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีร้าน"
-                        elif err_code == 1010: slip_error = "สลิปซ้ำ (อาจอัปโหลดซ้ำ) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
+                        # โค้ด SlipOK จริง: 1012=สลิปซ้ำ, 1013=ยอดไม่ตรง, 1014=บัญชีผู้รับไม่ตรงบัญชีหลักร้าน,
+                        # 1010=สลิปธนาคารนี้ต้องรอตรวจสอบสักครู่ (ไม่ใช่ error ถาวร — ให้ลูกค้าลองใหม่)
+                        if err_code == 1014:   slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีหลักของร้าน"
+                        elif err_code == 1012: slip_error = "สลิปซ้ำ (เคยส่งเข้ามาแล้ว) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
+                        elif err_code == 1010:
+                            slip_error = None   # ไม่ตีเป็น rejected
+                            slip_soft  = "ธนาคารนี้ต้องรอตรวจสอบสักครู่ กรุณาลองแนบสลิปใหม่อีกครั้งใน 1-2 นาที"
                         else:                  slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
                     print(f"[SlipOK] {body.order_id} → {'✓ verified' if slip_verified else '✗ manual'} "
                           f"slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'} err={slip_error or '-'}")
@@ -1724,10 +1763,11 @@ async def slip_notify(body: SlipNotifyRequest):
             await send_line_notify(ADMIN_LINE_USER_ID,
                 f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}{warn}")
             # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
-            await _notify_customer_line(sb, body.order_id, phone, customer,
+            await _notify_customer(sb, body.order_id, phone, customer,
                 f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} เรียบร้อยแล้วค่ะ ✅\n"
                 f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
                 f"ดูสถานะ: velacoldbrew.com/account",
+                f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} แล้วค่ะ กำลังแพ็คและจัดส่ง เดี๋ยวแจ้งเลขพัสดุอีกทีนะคะ ดูสถานะ velacoldbrew.com/account",
                 "payment_confirmed")
             return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
         else:
@@ -1735,6 +1775,9 @@ async def slip_notify(body: SlipNotifyRequest):
                 "slip_url":    body.slip_url,
                 "slip_status": "rejected" if slip_error else "pending",
             }).eq("order_id", body.order_id).execute()
+            # 1010 (ธนาคารต้องรอ) → บอกลูกค้าให้ลองใหม่ ไม่ต้องรบกวน admin
+            if slip_soft and not slip_error:
+                return {"success": True, "verified": False, "retry": True, "reason": slip_soft}
             msg = (f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" +
                    (f" ({phone})" if phone else "") +
                    f"\nOrder: {body.order_id}" +
@@ -2000,7 +2043,7 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
             "status":   "pending",
         }).execute()
 
-    # แจ้งลูกค้าทาง LINE ว่าจัดส่งแล้ว (พร้อมเลขพัสดุ + ลิงก์ติดตาม)
+    # แจ้งลูกค้าว่าจัดส่งแล้ว (พร้อมเลขพัสดุ + ลิงก์ติดตาม) — LINE ถ้าผูกไว้ ไม่งั้น SMS
     try:
         o = sb.table("orders").select("customer,phone").eq("order_id", body.order_id).execute()
         if o.data:
@@ -2008,11 +2051,15 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
                 ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
                             f"ขนส่ง: {carrier} · เลขพัสดุ: {trk}\n"
                             f"ติดตามพัสดุ: velacoldbrew.com/track/{trk}")
+                sms_ship = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ ขนส่ง {carrier} "
+                            f"เลขพัสดุ {trk} ติดตาม velacoldbrew.com/track/{trk}")
             else:
                 ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
                             f"ขนส่ง: {carrier}\nขอบคุณที่สั่งซื้อนะคะ 🐰")
-            await _notify_customer_line(sb, body.order_id, o.data[0].get("phone") or "", o.data[0].get("customer") or "",
-                                        ship_msg, "shipped")
+                sms_ship = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ ขนส่ง {carrier} "
+                            f"ขอบคุณที่สั่งซื้อนะคะ")
+            await _notify_customer(sb, body.order_id, o.data[0].get("phone") or "", o.data[0].get("customer") or "",
+                                   ship_msg, sms_ship, "shipped")
     except Exception as e:
         print(f"[add-shipping] notify error: {e}")
 
@@ -2217,10 +2264,11 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         print(f"[first_order] mark error: {e}")
 
     # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
-    await _notify_customer_line(sb, order_id, phone or "", order.get("customer") or "",
+    await _notify_customer(sb, order_id, phone or "", order.get("customer") or "",
         f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} เรียบร้อยแล้วค่ะ ✅\n"
         f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
         f"ดูสถานะ: velacoldbrew.com/account",
+        f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} แล้วค่ะ กำลังแพ็คและจัดส่ง เดี๋ยวแจ้งเลขพัสดุอีกทีนะคะ ดูสถานะ velacoldbrew.com/account",
         "payment_confirmed")
 
     return {
