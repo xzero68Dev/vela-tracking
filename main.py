@@ -914,18 +914,16 @@ def _first_order_discount(subtotal: float) -> int:
     return int(min(round(subtotal * FIRST_ORDER_PCT), FIRST_ORDER_CAP))
 
 
-# ── ส่วนลดลูกค้า VIP (ตั้ง % ต่อคนในหน้าจัดการลูกค้า) ──
-VIP_DISCOUNT_CAP = FIRST_ORDER_CAP   # เพดานเท่าโปรลูกค้าใหม่ (฿130)
-
+# ── ส่วนลดลูกค้า VIP (ตั้ง % ต่อคนในหน้าจัดการลูกค้า) — ไม่มีเพดาน ──
 def _vip_discount(subtotal: float, pct) -> int:
-    """ยอดส่วนลด VIP (บาท) = min(subtotal * pct%, เพดาน) — สูตรเดียวกับ frontend (promo.ts)"""
+    """ยอดส่วนลด VIP (บาท) = subtotal * pct% เต็ม (ไม่มีเพดาน) — สูตรเดียวกับ frontend (promo.ts)"""
     try:
         pct = int(pct or 0)
     except (TypeError, ValueError):
         pct = 0
     if subtotal <= 0 or pct <= 0:
         return 0
-    return int(min(round(subtotal * pct / 100.0), VIP_DISCOUNT_CAP))
+    return int(round(subtotal * pct / 100.0))
 
 def _get_vip_pct(sb, phone: str = "", line_user_id: str = "") -> int:
     """ดึง vip_discount_pct ของลูกค้า — หาจาก line_user_id ก่อน แล้วค่อยเบอร์ (คนสั่ง/login)"""
