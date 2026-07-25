@@ -167,6 +167,23 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
     return success
 
 
+# ช่องที่ลูกค้าเลือก "ปิด" แจ้งเตือนไว้ชัดเจน — เท่านั้นที่จะไม่ส่ง LINE
+_NOTIFY_OPT_OUT = {"off", "none", "disabled", "mute", "muted"}
+
+def _resolve_notify_channel(notify_ch, line_uid) -> str:
+    """เลือกช่องแจ้งเตือน:
+    - ถ้ามี line_user_id → ใช้ LINE เสมอ (notify_channel='sms' ที่ติดมาจาก default เดิม
+      ไม่ถือว่าเป็นการเลือกปิด LINE — ลูกค้าที่ login LINE ต้องได้แจ้งเตือนทาง LINE)
+    - ยกเว้นลูกค้าตั้งค่าปิดแจ้งเตือนไว้ชัดเจน (off/none/...) → คืน 'off'
+    - ไม่มี line_user_id → 'sms'
+    """
+    ch = (notify_ch or "").strip().lower()
+    if ch in _NOTIFY_OPT_OUT:
+        return "off"
+    if line_uid:
+        return "line"
+    return "sms"
+
 async def _notify_customer_line(sb, order_id: str, phone: str, customer: str, message: str, status_tag: str) -> bool:
     """แจ้งลูกค้าทาง LINE (หา line_user_id จากเบอร์) — ส่งเมื่อผูก LINE ไว้และไม่ได้ปิดแจ้งเตือน + เขียน log"""
     try:
@@ -177,7 +194,7 @@ async def _notify_customer_line(sb, order_id: str, phone: str, customer: str, me
             if look.data:
                 line_uid  = look.data[0].get("line_user_id") or ""
                 notify_ch = look.data[0].get("notify_channel")
-        channel = notify_ch or ("line" if line_uid else "sms")
+        channel = _resolve_notify_channel(notify_ch, line_uid)
         if channel == "line" and line_uid:
             await send_line_notify(line_uid, message, barcode=order_id, status=status_tag, customer=customer, phone=phone)
             return True
@@ -716,14 +733,14 @@ async def run_cron():
                             cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
                             if cust.data:
                                 line_uid = cust.data[0].get("line_user_id") or ""
-                                # ลูกค้าที่ผูก LINE ไว้ → default รับแจ้งเตือนทาง LINE (เคารพค่าที่ตั้งเองไว้ก่อน)
-                                notify   = cust.data[0].get("notify_channel") or ("line" if line_uid else "sms")
+                                # ลูกค้าที่ผูก LINE ไว้ → รับแจ้งเตือนทาง LINE เสมอ (เว้นตั้งค่าปิดชัดเจน)
+                                notify   = _resolve_notify_channel(cust.data[0].get("notify_channel"), line_uid)
                         except:
                             pass
 
                         final_msg = msg.replace("{barcode}", barcode)
 
-                        if notify == "none":
+                        if notify == "off":
                             print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
                         elif notify == "line" and line_uid:
                             # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
@@ -1601,7 +1618,7 @@ async def create_order(body: CreateOrderRequest):
             if look.data:
                 line_uid  = look.data[0].get("line_user_id") or ""
                 notify_ch = look.data[0].get("notify_channel")
-        channel = notify_ch or ("line" if line_uid else "sms")
+        channel = _resolve_notify_channel(notify_ch, line_uid)
         if channel == "line" and line_uid:
             cust_msg = (
                 f"VeLA Cold Brew: รับออเดอร์ #{body.order_id} แล้วค่ะ 🐰\n"
@@ -2128,13 +2145,15 @@ async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str =
             cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
             if cust.data:
                 line_uid  = cust.data[0].get("line_user_id") or ""
-                # ลูกค้าที่ผูก LINE ไว้ → default รับแจ้งเตือนทาง LINE
-                notify_ch = cust.data[0].get("notify_channel") or ("line" if line_uid else "sms")
+                # ลูกค้าที่ผูก LINE ไว้ → รับแจ้งเตือนทาง LINE เสมอ (เว้นตั้งค่าปิดชัดเจน)
+                notify_ch = _resolve_notify_channel(cust.data[0].get("notify_channel"), line_uid)
         except:
             pass
 
         msg = "VeLA Cold Brew: พัสดุของคุณถึงแล้ว ✓ ขอบคุณที่สั่งซื้อนะคะ 🐰 สั่งซื้อและรับสิทธิพิเศษสมาชิกได้ที่: velacoldbrew.com"
-        if notify_ch == "line" and line_uid:
+        if notify_ch == "off":
+            print(f"[confirm-delivered] ข้าม {customer} → ปิดแจ้งเตือน")
+        elif notify_ch == "line" and line_uid:
             # ส่ง barcode/status/customer/phone ไปด้วย เพื่อให้ send_line_notify เขียน log ลง sms_logs (เหมือนฝั่ง SMS)
             await send_line_notify(line_uid, msg, barcode=tracking, status="delivered", customer=customer, phone=phone)
         else:
@@ -2443,12 +2462,15 @@ async def line_oauth(body: LineOAuthRequest):
     res = sb.table("customers").select("*").eq("line_user_id", profile["userId"]).execute()
     customer = res.data[0] if res.data else None
 
-    # ลูกค้าที่ login LINE → ตั้งรับแจ้งเตือนทาง LINE (เฉพาะถ้ายังไม่เคยตั้งค่าไว้ เคารพคนที่เลือกปิด/SMS เอง)
-    if customer and not customer.get("notify_channel"):
-        try:
-            sb.table("customers").update({"notify_channel": "line"}).eq("line_user_id", profile["userId"]).execute()
-            customer["notify_channel"] = "line"
-        except Exception as e:
-            print(f"[line-oauth] set notify_channel error: {e}")
+    # ลูกค้าที่ login LINE → ตั้งรับแจ้งเตือนทาง LINE
+    # อัปเกรดค่าเดิม (รวม 'sms' ที่ติดมาจาก default) ให้เป็น 'line' เว้นแต่ตั้งค่าปิดไว้ชัดเจน
+    if customer:
+        cur_ch = (customer.get("notify_channel") or "").strip().lower()
+        if cur_ch not in _NOTIFY_OPT_OUT and cur_ch != "line":
+            try:
+                sb.table("customers").update({"notify_channel": "line"}).eq("line_user_id", profile["userId"]).execute()
+                customer["notify_channel"] = "line"
+            except Exception as e:
+                print(f"[line-oauth] set notify_channel error: {e}")
 
     return {"success": True, "customer": customer}
