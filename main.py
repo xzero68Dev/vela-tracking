@@ -914,14 +914,48 @@ def _first_order_discount(subtotal: float) -> int:
     return int(min(round(subtotal * FIRST_ORDER_PCT), FIRST_ORDER_CAP))
 
 
+# ── ส่วนลดลูกค้า VIP (ตั้ง % ต่อคนในหน้าจัดการลูกค้า) ──
+VIP_DISCOUNT_CAP = FIRST_ORDER_CAP   # เพดานเท่าโปรลูกค้าใหม่ (฿130)
+
+def _vip_discount(subtotal: float, pct) -> int:
+    """ยอดส่วนลด VIP (บาท) = min(subtotal * pct%, เพดาน) — สูตรเดียวกับ frontend (promo.ts)"""
+    try:
+        pct = int(pct or 0)
+    except (TypeError, ValueError):
+        pct = 0
+    if subtotal <= 0 or pct <= 0:
+        return 0
+    return int(min(round(subtotal * pct / 100.0), VIP_DISCOUNT_CAP))
+
+def _get_vip_pct(sb, phone: str = "", line_user_id: str = "") -> int:
+    """ดึง vip_discount_pct ของลูกค้า — หาจาก line_user_id ก่อน แล้วค่อยเบอร์ (คนสั่ง/login)"""
+    try:
+        if line_user_id:
+            c = sb.table("customers").select("vip_discount_pct").eq("line_user_id", line_user_id).execute()
+            if c.data and c.data[0].get("vip_discount_pct"):
+                return int(c.data[0]["vip_discount_pct"])
+        phone = (phone or "").strip()
+        if phone:
+            c = sb.table("customers").select("vip_discount_pct").eq("phone", phone).execute()
+            if c.data and c.data[0].get("vip_discount_pct"):
+                return int(c.data[0]["vip_discount_pct"])
+    except Exception as e:
+        print(f"[vip] get pct error: {e}")
+    return 0
+
+
 @app.get("/products/check-first-order")
 async def check_first_order(phone: str):
-    """เช็คว่าลูกค้าเบอร์นี้มีสิทธิ์ส่วนลด 50% (สั่งครั้งแรกในระบบเว็บ) ไหม"""
+    """เช็คสิทธิ์ส่วนลดของลูกค้าเบอร์นี้: โปรลูกค้าใหม่ 50% (ครั้งแรก) + ส่วนลด VIP (ถ้ามี)"""
     sb = get_supabase()
-    if not _promo_first_order_enabled():
-        return {"eligible": False, "discount_pct": 0}
-    eligible = _is_first_order_eligible(sb, phone)
-    return {"eligible": eligible, "discount_pct": int(FIRST_ORDER_PCT * 100) if eligible else 0}
+    vip_pct  = _get_vip_pct(sb, phone)
+    eligible = _is_first_order_eligible(sb, phone) if _promo_first_order_enabled() else False
+    return {
+        "eligible":         eligible,
+        "discount_pct":     int(FIRST_ORDER_PCT * 100) if eligible else 0,
+        "vip_discount_pct": vip_pct,
+        "cap":              int(FIRST_ORDER_CAP),
+    }
 
 
 @app.post("/admin/products/{product_id}")
@@ -935,6 +969,52 @@ async def update_product(product_id: int, body: dict, x_api_key: str = Header(de
         raise HTTPException(status_code=400, detail="no valid fields")
     sb.table("products").update(update_data).eq("id", product_id).execute()
     return {"success": True}
+
+
+# ── จัดการลูกค้า (Admin) ──────────────────────────────────────────
+@app.get("/admin/customers")
+async def list_customers(q: str = "", limit: int = 200, x_api_key: str = Header(default="")):
+    """รายชื่อลูกค้า + ค้นหา (เบอร์/ชื่อ) สำหรับหน้าจัดการลูกค้า"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    sel = "id,phone,name,display_name,line_user_id,notify_channel,vip_discount_pct,first_order_used,created_at"
+    query = sb.table("customers").select(sel)
+    q = (q or "").strip()
+    if q:
+        safe = q.replace(",", " ").replace("(", "").replace(")", "").replace("*", "")
+        query = query.or_(f"phone.ilike.*{safe}*,name.ilike.*{safe}*,display_name.ilike.*{safe}*")
+    res = query.order("created_at", desc=True).limit(min(int(limit or 200), 500)).execute()
+    rows = res.data or []
+    for r in rows:
+        r["has_line"] = bool(r.get("line_user_id"))
+        r.pop("line_user_id", None)   # ไม่ต้องส่ง id ดิบออกไปหน้าเว็บ
+        r["vip_discount_pct"] = int(r.get("vip_discount_pct") or 0)
+    return {"customers": rows, "count": len(rows)}
+
+
+class VipUpdateRequest(BaseModel):
+    id:               Optional[int] = None
+    phone:            Optional[str] = None
+    vip_discount_pct: int = 0
+
+@app.post("/admin/customers/vip")
+async def set_customer_vip(body: VipUpdateRequest, x_api_key: str = Header(default="")):
+    """ตั้ง/แก้ % ส่วนลด VIP ของลูกค้าหนึ่งคน (0-100, 0 = ยกเลิก VIP)"""
+    check_admin_key(x_api_key)
+    pct = int(body.vip_discount_pct or 0)
+    if pct < 0 or pct > 100:
+        raise HTTPException(status_code=400, detail="vip_discount_pct ต้องอยู่ระหว่าง 0-100")
+    sb = get_supabase()
+    if body.id is not None:
+        col, val = "id", body.id
+    elif body.phone:
+        col, val = "phone", body.phone.strip()
+    else:
+        raise HTTPException(status_code=400, detail="ต้องระบุ id หรือ phone")
+    res = sb.table("customers").update({"vip_discount_pct": pct}).eq(col, val).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="ไม่พบลูกค้า")
+    return {"success": True, "vip_discount_pct": pct}
 
 
 @app.get("/track/{barcode}")
@@ -1527,8 +1607,14 @@ async def create_order(body: CreateOrderRequest):
         and _promo_first_order_enabled()
         and _is_first_order_eligible(sb, elig_phone)
     )
-    discount   = _first_order_discount(subtotal) if eligible else 0
-    total_paid = subtotal - discount   # ยอดที่ลูกค้าจ่ายจริง (Pixel Purchase ใช้ค่านี้)
+    fo_disc  = _first_order_discount(subtotal) if eligible else 0
+    # ส่วนลด VIP — อัตโนมัติสำหรับลูกค้าที่ตั้ง % ไว้ (ต้อง login/มีบัญชีเท่านั้น)
+    vip_pct  = _get_vip_pct(sb, elig_phone, body.line_user_id or "") if has_account else 0
+    vip_disc = _vip_discount(subtotal, vip_pct)
+    # เลือกอันที่ลดเยอะกว่า (ไม่ซ้อน) — ตามที่ตกลง
+    discount    = max(fo_disc, vip_disc)
+    used_first  = fo_disc > 0 and fo_disc >= vip_disc   # โปรลูกค้าใหม่เป็นตัวที่ถูกใช้จริง
+    total_paid  = subtotal - discount   # ยอดที่ลูกค้าจ่ายจริง (Pixel Purchase ใช้ค่านี้)
 
     order_row = {
         "order_id":     body.order_id,
@@ -1545,7 +1631,7 @@ async def create_order(body: CreateOrderRequest):
         "channel":      body.channel,
         "status":       body.status,
         "total":        total_paid,
-        "first_order_discount": discount > 0,
+        "first_order_discount": used_first,   # True เฉพาะเมื่อโปรลูกค้าใหม่เป็นตัวที่ถูกใช้ (VIP ล้วนไม่กินสิทธิ์ครั้งแรก)
     }
     # เก็บยอดที่ลดจริง — ใส่เฉพาะเมื่อมีส่วนลด เพื่อไม่ให้ order ปกติพังถ้ายังไม่ได้ ALTER TABLE
     # (ต้องรัน migrations/2026-07-21_add_discount_amount.sql ก่อนเปิดโปร)
@@ -1634,7 +1720,7 @@ async def create_order(body: CreateOrderRequest):
         ADMIN_LINE_USER_ID,
         f"🛒 ออเดอร์ใหม่! {body.customer} ({body.phone})\n"
         f"สินค้า: {sku_summary}\n"
-        f"ยอด: ฿{total_paid:,.0f}" + (f" (ลดลูกค้าใหม่ -฿{discount:,.0f})" if discount > 0 else "") + "\n"
+        f"ยอด: ฿{total_paid:,.0f}" + (f" ({'ลดลูกค้าใหม่' if used_first else f'VIP {vip_pct}%'} -฿{discount:,.0f})" if discount > 0 else "") + "\n"
         f"Order ID: {body.order_id}"
     )
 
