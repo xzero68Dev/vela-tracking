@@ -1598,16 +1598,17 @@ async def create_order(body: CreateOrderRequest):
             pass
     if not elig_phone:
         elig_phone = (body.phone or "").strip()
-    has_account = bool(body.line_user_id or body.account_phone)  # ต้อง login เท่านั้น (guest ไม่ได้ส่วนลด)
+    # นโยบายใหม่ (27/07): guest ได้ส่วนลดด้วย — ผูกกับ "เบอร์ที่กรอกตอน checkout" ไม่บังคับ login
+    # กันใช้สิทธิ์ซ้ำด้วย _is_first_order_eligible(เบอร์) เหมือนเดิม (เช็ค first_order_used + ไม่เคยมีออเดอร์เว็บ)
     eligible   = (
         bool(body.first_order_discount)
-        and has_account
+        and bool(elig_phone)                       # ขอแค่มีเบอร์ (login หรือ guest ก็ได้)
         and _promo_first_order_enabled()
         and _is_first_order_eligible(sb, elig_phone)
     )
     fo_disc  = _first_order_discount(subtotal) if eligible else 0
-    # ส่วนลด VIP — อัตโนมัติสำหรับลูกค้าที่ตั้ง % ไว้ (ต้อง login/มีบัญชีเท่านั้น)
-    vip_pct  = _get_vip_pct(sb, elig_phone, body.line_user_id or "") if has_account else 0
+    # ส่วนลด VIP — อัตโนมัติถ้าเบอร์นี้เป็นลูกค้า VIP (ผูก line_user_id หรือเบอร์)
+    vip_pct  = _get_vip_pct(sb, elig_phone, body.line_user_id or "")
     vip_disc = _vip_discount(subtotal, vip_pct)
     # เลือกอันที่ลดเยอะกว่า (ไม่ซ้อน) — ตามที่ตกลง
     discount    = max(fo_disc, vip_disc)
@@ -1855,9 +1856,11 @@ async def slip_notify(body: SlipNotifyRequest):
                 "payment_confirmed")
             return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
         else:
+            # ISSUE 2 (27/07): ไม่ใช้คำว่า "rejected" อีก — สื่อว่าลูกค้าโกง ทั้งที่ส่วนใหญ่จ่ายจริง
+            # ตรวจไม่ผ่าน/SlipOK ล่ม/quota → "pending_review" (รอ admin ตรวจ) ไม่ใช่ปฏิเสธ
             sb.table("orders").update({
                 "slip_url":    body.slip_url,
-                "slip_status": "rejected" if slip_error else "pending",
+                "slip_status": "pending_review" if slip_error else "pending",
             }).eq("order_id", body.order_id).execute()
             # 1010 (ธนาคารต้องรอ) → บอกลูกค้าให้ลองใหม่ ไม่ต้องรบกวน admin
             if slip_soft and not slip_error:
