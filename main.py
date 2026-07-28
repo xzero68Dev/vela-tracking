@@ -2153,6 +2153,79 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
     return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
 
 
+class FixTrackingRequest(BaseModel):
+    order_id: str
+    tracking: str                       # เลขพัสดุใหม่ (ที่ถูก)
+    carrier:  Optional[str] = None      # ถ้าไม่ส่ง ใช้ business_carrier เดาจากเลข
+    notify:   bool = True               # ยิงแจ้งเตือนเลขใหม่ให้ลูกค้า
+
+@app.post("/admin/fix-tracking")
+async def fix_tracking(body: FixTrackingRequest, x_api_key: str = Header(default="")):
+    """แก้เลขพัสดุที่กรอกผิดของ order — อัปเดต shipping + shipments ให้ตรง แล้วยิงแจ้งเตือนเลขใหม่ให้ลูกค้า"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    new_trk = body.tracking.strip().upper()
+    if not new_trk or new_trk == "-":
+        raise HTTPException(status_code=400, detail="ต้องระบุเลขพัสดุใหม่")
+    carrier = business_carrier(new_trk, body.carrier or "POST SABUY")
+
+    o = sb.table("orders").select("customer,phone,ship_date").eq("order_id", body.order_id).execute()
+    if not o.data:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ order_id: {body.order_id}")
+    order = o.data[0]
+
+    # หา shipping row เดิมของ order นี้ (เพื่อรู้เลขเก่าไปแก้ shipments)
+    sh = sb.table("shipping").select("tracking").eq("order_id", body.order_id).execute()
+    old_trk = (sh.data[0].get("tracking") if sh.data else "") or ""
+    old_trk_up = old_trk.strip().upper()
+
+    if new_trk == old_trk_up:
+        # เลขเดิมถูกอยู่แล้ว — แค่ยิงแจ้งเตือนซ้ำถ้าต้องการ
+        pass
+
+    # 1) shipping — อัปเดตเลข + carrier (อิง order_id เป็นหลัก)
+    if sh.data:
+        sb.table("shipping").update({"tracking": new_trk, "carrier": carrier}).eq("order_id", body.order_id).execute()
+    else:
+        sb.table("shipping").upsert({
+            "order_id":  body.order_id,
+            "ship_date": order.get("ship_date") or datetime.utcnow().strftime("%Y-%m-%d"),
+            "carrier":   carrier,
+            "tracking":  new_trk,
+        }, on_conflict="tracking").execute()
+
+    # 2) shipments (ระบบติดตาม) — ย้ายเลขเก่า→ใหม่ + reset สถานะให้ cron เช็คเลขใหม่ใหม่
+    moved = False
+    if old_trk_up and old_trk_up != "-" and old_trk_up != new_trk:
+        try:
+            r = sb.table("shipments").update({
+                "barcode": new_trk, "status": "pending", "status_th": "รอข้อมูล",
+                "is_done": False, "latest_location": None,
+            }).eq("barcode", old_trk_up).execute()
+            moved = bool(r.data)
+        except Exception as e:
+            print(f"[fix-tracking] shipments move error: {e}")
+    if not moved:
+        exists = sb.table("shipments").select("barcode").eq("barcode", new_trk).execute()
+        if not exists.data:
+            sb.table("shipments").insert({"barcode": new_trk, "status": "pending"}).execute()
+
+    # 3) แจ้งเตือนเลขใหม่ให้ลูกค้า (LINE ถ้าผูก ไม่งั้น SMS)
+    notified = None
+    if body.notify:
+        ship_msg = (f"VeLA Cold Brew: อัปเดตเลขพัสดุออเดอร์ #{body.order_id} นะคะ 🚚\n"
+                    f"ขนส่ง: {carrier} · เลขพัสดุ: {new_trk}\n"
+                    f"ติดตามพัสดุ: velacoldbrew.com/track/{new_trk}")
+        sms_ship = (f"VeLA Cold Brew: อัปเดตเลขพัสดุออเดอร์ #{body.order_id} ขนส่ง {carrier} "
+                    f"เลขพัสดุ {new_trk} ติดตาม velacoldbrew.com/track/{new_trk}")
+        notified = await _notify_customer(sb, body.order_id, order.get("phone") or "", order.get("customer") or "",
+                                          ship_msg, sms_ship, "shipped")
+
+    return {"success": True, "order_id": body.order_id,
+            "old_tracking": old_trk_up or None, "new_tracking": new_trk,
+            "carrier": carrier, "notified_via": notified}
+
+
 @app.post("/admin/sync-order-status")
 async def sync_order_status(x_api_key: str = Header(default="")):
     """เชื่อมสถานะ orders ให้ตรงกับ shipments — พัสดุที่ส่งถึง/ตีกลับแล้ว → อัปเดต order ให้ตรง
