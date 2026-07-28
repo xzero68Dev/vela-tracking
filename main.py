@@ -57,44 +57,59 @@ ADMIN_LINE_USER_ID = os.getenv("ADMIN_LINE_USER_ID", "U28d1b5573f79da2f3ff3f52cc
 ALERT_STATUSES = {"returned", "problem"}
 
 async def send_line_notify(line_user_id: str, message: str, barcode: str = "", status: str = "", customer: str = "", phone: str = ""):
-    """ส่งข้อความผ่าน LINE OA"""
+    """ส่งข้อความผ่าน LINE OA — retry ถ้าเจอ error ชั่วคราว (5xx/timeout) สูงสุด 3 ครั้ง"""
     token = os.getenv("LINE_CHANNEL_TOKEN", "")
     if not token:
         print("[LINE] ยังไม่ได้ตั้ง LINE_CHANNEL_TOKEN")
         return False
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"to": line_user_id, "messages": [{"type": "text", "text": message}]}
-            )
-            success = resp.status_code == 200
-            if success:
-                print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ")
-            else:
-                print(f"[LINE] ✗ {resp.text}")
 
-            # log ลง sms_logs
-            if barcode and status:
-                try:
-                    sb = get_supabase()
-                    sb.table("sms_logs").insert({
-                        "barcode":      barcode,
-                        "phone":        phone,
-                        "customer":     customer,
-                        "status":       status,
-                        "message":      message,
-                        "success":      success,
-                        "notify_via":   "line",
-                        "delivery_status": "sent" if success else "failed",
-                    }).execute()
-                except Exception as log_err:
-                    print(f"[LINE] log error: {log_err}")
-            return success
-    except Exception as e:
-        print(f"[LINE] ERROR: {e}")
-        return False
+    MAX_ATTEMPTS = 3
+    success = False
+    last_detail = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.post(
+                    "https://api.line.me/v2/bot/message/push",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"to": line_user_id, "messages": [{"type": "text", "text": message}]}
+                )
+            if resp.status_code == 200:
+                success = True
+                print(f"[LINE] ✓ ส่งหา {line_user_id[:8]}... สำเร็จ" + (f" (ครั้งที่ {attempt})" if attempt > 1 else ""))
+                break
+            last_detail = f"{resp.status_code} {resp.text}"
+            # 4xx = error ถาวร (token/รูปแบบผิด) ไม่ต้อง retry | 5xx = LINE ล่มชั่วคราว → ลองใหม่
+            if resp.status_code < 500:
+                print(f"[LINE] ✗ {last_detail} (client error — ไม่ retry)")
+                break
+            print(f"[LINE] ✗ {last_detail} (ครั้งที่ {attempt}/{MAX_ATTEMPTS})")
+        except Exception as e:
+            last_detail = str(e)
+            print(f"[LINE] ERROR ครั้งที่ {attempt}/{MAX_ATTEMPTS}: {e}")
+        if attempt < MAX_ATTEMPTS:
+            await asyncio.sleep(attempt)   # backoff 1s, 2s
+
+    if not success and last_detail:
+        print(f"[LINE] ✗ ยอมแพ้หลังลอง {MAX_ATTEMPTS} ครั้ง: {last_detail}")
+
+    # log ลง sms_logs (ครั้งเดียวหลังจบ retry)
+    if barcode and status:
+        try:
+            sb = get_supabase()
+            sb.table("sms_logs").insert({
+                "barcode":      barcode,
+                "phone":        phone,
+                "customer":     customer,
+                "status":       status,
+                "message":      message,
+                "success":      success,
+                "notify_via":   "line",
+                "delivery_status": "sent" if success else "failed",
+            }).execute()
+        except Exception as log_err:
+            print(f"[LINE] log error: {log_err}")
+    return success
 
 
 async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = "", force: bool = False):
