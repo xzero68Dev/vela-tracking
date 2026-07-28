@@ -2218,8 +2218,9 @@ async def fix_tracking(body: FixTrackingRequest, x_api_key: str = Header(default
                     f"ติดตามพัสดุ: velacoldbrew.com/track/{new_trk}")
         sms_ship = (f"VeLA Cold Brew: อัปเดตเลขพัสดุออเดอร์ #{body.order_id} ขนส่ง {carrier} "
                     f"เลขพัสดุ {new_trk} ติดตาม velacoldbrew.com/track/{new_trk}")
+        # ใช้ status_tag แยกจาก "shipped" — กันชน unique (barcode,status) ใน sms_logs ตอน resend
         notified = await _notify_customer(sb, body.order_id, order.get("phone") or "", order.get("customer") or "",
-                                          ship_msg, sms_ship, "shipped")
+                                          ship_msg, sms_ship, "tracking_updated")
 
     return {"success": True, "order_id": body.order_id,
             "old_tracking": old_trk_up or None, "new_tracking": new_trk,
