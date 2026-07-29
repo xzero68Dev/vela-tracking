@@ -2145,26 +2145,10 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
             "status":   "pending",
         }).execute()
 
-    # แจ้งลูกค้าว่าจัดส่งแล้ว (พร้อมเลขพัสดุ + ลิงก์ติดตาม) — LINE ถ้าผูกไว้ ไม่งั้น SMS
-    try:
-        o = sb.table("orders").select("customer,phone").eq("order_id", body.order_id).execute()
-        if o.data:
-            if trk and trk != "-":
-                ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
-                            f"ขนส่ง: {carrier} · เลขพัสดุ: {trk}\n"
-                            f"ติดตามพัสดุ: velacoldbrew.com/track/{trk}")
-                sms_ship = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ ขนส่ง {carrier} "
-                            f"เลขพัสดุ {trk} ติดตาม velacoldbrew.com/track/{trk}")
-            else:
-                ship_msg = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ 🚚\n"
-                            f"ขนส่ง: {carrier}\nขอบคุณที่สั่งซื้อนะคะ 🐰")
-                sms_ship = (f"VeLA Cold Brew: ออเดอร์ #{body.order_id} จัดส่งแล้วค่ะ ขนส่ง {carrier} "
-                            f"ขอบคุณที่สั่งซื้อนะคะ")
-            await _notify_customer(sb, body.order_id, o.data[0].get("phone") or "", o.data[0].get("customer") or "",
-                                   ship_msg, sms_ship, "shipped")
-    except Exception as e:
-        print(f"[add-shipping] notify error: {e}")
-
+    # หมายเหตุ (28/07): ไม่ยิงแจ้ง "จัดส่งแล้ว" ตรงนี้อีกต่อไป
+    # เพราะตอนคีเลขเข้า ShipSmile ของยังไม่ออกจริง → ลูกค้าจะได้ SMS เร็วไป
+    # ระบบจะแจ้ง "ร้านได้จัดกาแฟของคุณแล้ว 📦 + ลิงก์ติดตาม" อัตโนมัติจาก cron
+    # ตอนขนส่ง scan รับพัสดุจริง (pending → in_transit → template 'accepted')
     return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
 
 
