@@ -1623,8 +1623,21 @@ async def create_order(body: CreateOrderRequest):
     )
     fo_disc  = _first_order_discount(subtotal) if eligible else 0
     # ส่วนลด VIP — อัตโนมัติถ้าเบอร์นี้เป็นลูกค้า VIP (ผูก line_user_id หรือเบอร์)
+    # คิดจาก "ราคาตั้ง" (original) ไม่ใช่ราคาที่ลด 30% แล้ว — VIP% แทนที่ส่วนลด 30% ปกติ (ไม่ลดซ้ำ)
     vip_pct  = _get_vip_pct(sb, elig_phone, body.line_user_id or "")
-    vip_disc = _vip_discount(subtotal, vip_pct)
+    vip_disc = 0
+    if vip_pct > 0:
+        orig_price = {}
+        try:
+            _p = sb.table("products").select("sku,price").execute()
+            for p in (_p.data or []):
+                orig_price[(p.get("sku") or "").upper()] = float(p.get("price") or 0)
+        except Exception as e:
+            print(f"[vip] load original prices error: {e}")
+        # ยอดราคาตั้งรวม (fallback = ราคาที่ส่งมาถ้าไม่เจอ sku)
+        orig_subtotal = sum(orig_price.get((i.sku or "").upper(), i.price) * i.qty for i in body.items)
+        vip_total = int(round(orig_subtotal * (1 - vip_pct / 100.0)))
+        vip_disc  = max(0, int(round(subtotal)) - vip_total)   # ส่วนลดเทียบกับราคาปกติหน้าเว็บ
     # เลือกอันที่ลดเยอะกว่า (ไม่ซ้อน) — ตามที่ตกลง
     discount    = max(fo_disc, vip_disc)
     used_first  = fo_disc > 0 and fo_disc >= vip_disc   # โปรลูกค้าใหม่เป็นตัวที่ถูกใช้จริง
@@ -2009,23 +2022,15 @@ async def _award_points(sb, order_id: str):
     order = res.data[0]
     if (order.get("channel") or "web") != "web":
         return  # สะสมแต้มเฉพาะออเดอร์ในระบบเว็บตัวเอง
-    # reuse logic เดิมจาก confirm_payment
     from_sku = order.get("sku", "")
     phone, customer = _loyalty_identity(sb, order)  # ผูกแต้มเข้าบัญชีคนสั่ง (login)
-    # คำนวณ point จาก SKU (100ml = 1 point)
-    total_ml = 0
-    for item in (from_sku or "").split(","):
-        item = item.strip()
-        if "1000" in item or "1L" in item.upper():
-            try:
-                qty = int(item.split("x")[-1].strip()) if "x" in item else 1
-                total_ml += 1000 * qty
-            except:
-                total_ml += 1000
+    # คำนวณ point จาก SKU (100ml = 1 point) — ใช้ parser ตัวเดียวกับ confirm-payment
+    # (เดิมเช็คแค่ '1L'/'1000' ในชื่อ ทำให้ sku เว็บ 'Dark x1' นับเป็น 0 → ไม่ได้แต้ม)
+    total_ml = parse_shopee_sku_ml(from_sku)
     points = total_ml / 100
     if points > 0 and phone:
         try:
-            sb.table("point_ledger").insert({
+            sb.table("point_ledger").upsert({
                 "order_id":   order_id,
                 "phone":      phone,
                 "customer":   customer,
@@ -2033,10 +2038,29 @@ async def _award_points(sb, order_id: str):
                 "ml_total":   total_ml,
                 "points":     points,
                 "order_date": order.get("order_date", datetime.utcnow().strftime("%Y-%m-%d")),
-            }).execute()
+            }, on_conflict="order_id").execute()
         except Exception as e:
             print(f"[point_ledger] {order_id}: {e}")
 
+
+@app.post("/admin/backfill-points")
+async def backfill_points(x_api_key: str = Header(default="")):
+    """คำนวณแต้มย้อนหลังให้ออเดอร์เว็บที่ชำระแล้วทุกใบ (idempotent — รันซ้ำได้ ไม่ซ้ำแต้ม)
+    แก้เคสที่ auto-verify แล้วไม่ได้แต้มเพราะบั๊ก _award_points เดิม"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    PAID = ["ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"]
+    res = sb.table("orders").select("order_id").eq("channel", "web").in_("status", PAID).execute()
+    order_ids = [r["order_id"] for r in (res.data or [])]
+    processed = 0
+    for oid in order_ids:
+        try:
+            await _award_points(sb, oid)
+            processed += 1
+        except Exception as e:
+            print(f"[backfill-points] {oid}: {e}")
+    print(f"[backfill-points] เช็ค {len(order_ids)} ออเดอร์เว็บที่ชำระแล้ว")
+    return {"success": True, "checked": len(order_ids), "processed": processed}
 
 
 async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
