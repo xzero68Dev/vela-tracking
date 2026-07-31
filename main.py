@@ -2502,7 +2502,13 @@ async def request_otp(body: OTPRequestBody):
     if not success:
         raise HTTPException(status_code=500, detail="ส่ง OTP ไม่สำเร็จ")
 
-    return {"success": True, "message": "ส่ง OTP แล้ว"}
+    # บอก frontend ว่าเบอร์นี้เป็นสมาชิกใหม่ไหม (ใหม่ = บังคับกรอกชื่อ)
+    try:
+        _ex = get_supabase().table("customers").select("phone").eq("phone", phone).execute()
+        is_new = not bool(_ex.data)
+    except Exception:
+        is_new = False
+    return {"success": True, "message": "ส่ง OTP แล้ว", "is_new": is_new}
 
 
 @app.post("/auth/verify-otp")
@@ -2530,11 +2536,25 @@ async def verify_otp(body: OTPVerifyBody):
     customer = res.data[0] if res.data else None
 
     if not customer:
-        # สร้างใหม่
-        name = body.name or f"ลูกค้า VeLA"
+        # สมาชิกใหม่ — บังคับกรอกชื่อ + เช็คชื่อซ้ำ
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="กรุณากรอกชื่อสำหรับสมัครสมาชิก")
+        if len(name) < 2:
+            raise HTTPException(status_code=400, detail="ชื่อสั้นเกินไป กรุณากรอกชื่ออย่างน้อย 2 ตัวอักษร")
+        # เช็คชื่อซ้ำ — ไม่ให้ตรงกับสมาชิกคนอื่น (ชื่อบน leaderboard ต้องไม่ซ้ำ)
+        try:
+            dup = sb.table("customers").select("phone").ilike("display_name", name).execute()
+            if dup.data:
+                raise HTTPException(status_code=409, detail=f'ชื่อ "{name}" มีคนใช้แล้ว กรุณาใช้ชื่ออื่นนะคะ')
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[verify-otp] dup-name check error: {e}")
         ins = sb.table("customers").insert({
             "phone":        phone,
             "display_name": name,
+            "name":         name,
         }).execute()
         customer = ins.data[0] if ins.data else {"phone": phone, "display_name": name}
 
