@@ -1030,16 +1030,44 @@ async def set_customer_vip(body: VipUpdateRequest, x_api_key: str = Header(defau
     return {"success": True, "vip_discount_pct": pct}
 
 
+def _barcodes_in_system(sb, barcodes):
+    """คืน set ของเลขพัสดุที่ 'มีจริงในระบบร้าน' (shipments.barcode หรือ shipping.tracking)
+    คืน None ถ้า query DB error → ให้ caller fail-open (ไม่บล็อกลูกค้าจริงตอน DB สะอึก)"""
+    if not barcodes:
+        return set()
+    found = set()
+    try:
+        r1 = sb.table("shipments").select("barcode").in_("barcode", barcodes).execute()
+        for row in (r1.data or []):
+            if row.get("barcode"):
+                found.add(row["barcode"].upper())
+        r2 = sb.table("shipping").select("tracking").in_("tracking", barcodes).execute()
+        for row in (r2.data or []):
+            if row.get("tracking"):
+                found.add(row["tracking"].upper())
+    except Exception as e:
+        print(f"[track] เช็ค DB error: {e}")
+        return None
+    return found
+
+
 @app.get("/track/{barcode}")
 async def track_single(barcode: str):
-    """เช็คสถานะพัสดุ 1 ชิ้น (real-time)"""
-    return await fetch_tracking(barcode.upper().strip())
+    """เช็คสถานะพัสดุ 1 ชิ้น (real-time) — เฉพาะเลขที่มีในระบบร้าน (กันเช็คเลขคนอื่น/มั่ว)"""
+    bc = barcode.upper().strip()
+    if not bc:
+        raise HTTPException(status_code=400, detail="กรุณาระบุเลขพัสดุ")
+    sb = get_supabase()
+    found = _barcodes_in_system(sb, [bc])
+    if found is not None and bc not in found:
+        return {"barcode": bc, "status": "not_found", "status_th": "ไม่พบเลขพัสดุในระบบร้าน"}
+    return await fetch_tracking(bc)
 
 
 @app.post("/track/bulk")
 async def track_bulk(body: BulkRequest):
     """เช็คสถานะพัสดุหลายชิ้นพร้อมกัน (real-time, สูงสุด 20)
-    ตรวจสอบก่อนว่าเลข tracking อยู่ในระบบร้านไหม เพื่อป้องกันการเช็คเลขของคนอื่น
+    เช็คทุกเลขว่าอยู่ในระบบร้านจริงก่อนเสมอ — กันคนใช้เราเป็นตัวเช็คพัสดุฟรี/เลขมั่ว
     """
     barcodes = [b.upper().strip() for b in body.barcodes if b.strip()]
     if not barcodes:
@@ -1047,33 +1075,10 @@ async def track_bulk(body: BulkRequest):
     if len(barcodes) > 20:
         raise HTTPException(status_code=400, detail="ส่งได้สูงสุด 20 เลขต่อครั้ง")
 
-    # เช็คก่อนว่าเลขเหล่านี้อยู่ในระบบร้านไหม (shipments หรือ shipping table)
+    # เช็คทุกเลข (รวม Flash/Kerry/ไปรษณีย์) ว่าอยู่ในระบบร้านไหม
     sb = get_supabase()
-    barcodes_str = ",".join(f'"{b}"' for b in barcodes)
-
-    # ยกเว้น Kerry/Flash/J&T/SCG จาก validation — เรียก eTrackings ได้เลยไม่ต้องอยู่ใน DB
-    def is_third_party(b: str) -> bool:
-        return bool(re.match(r'^(TH|SCPK|SXF|FLE|FEX|TDE|JPT|JTTH|SCG)', b, re.I))
-
-    third_party = [b for b in barcodes if is_third_party(b)]
-    need_check  = [b for b in barcodes if not is_third_party(b)]
-
-    valid_barcodes = set(third_party)  # third-party ผ่านได้เลย
-    try:
-        if need_check:
-            # เช็คจาก shipments table (cron tracking)
-            res1 = sb.table("shipments").select("barcode").in_("barcode", need_check).execute()
-            for row in (res1.data or []):
-                valid_barcodes.add(row["barcode"].upper())
-
-            # เช็คจาก shipping table (เลข tracking จาก admin)
-            res2 = sb.table("shipping").select("tracking").in_("tracking", need_check).execute()
-            for row in (res2.data or []):
-                if row.get("tracking"):
-                    valid_barcodes.add(row["tracking"].upper())
-    except Exception as e:
-        print(f"[track/bulk] เช็ค DB error: {e}")
-        valid_barcodes = set(barcodes)
+    found = _barcodes_in_system(sb, barcodes)
+    valid_barcodes = set(barcodes) if found is None else found  # DB error → fail-open
 
     output = []
     valid_to_fetch = []
