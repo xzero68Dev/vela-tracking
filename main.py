@@ -521,6 +521,29 @@ async def fetch_tracking(barcode: str) -> dict:
     return (await fetch_tracking_batch([barcode]))[0]
 
 
+async def _send_unpaid_reminder(sb, order: dict, stage: int, expire_hours: int):
+    """แจ้งเตือนออเดอร์ค้างชำระแบบบันได (stage 1=~3ชม, 2=~24ชม, 3=~72ชม) + ลิงก์กลับไปจ่าย"""
+    oid      = order.get("order_id")
+    phone    = (order.get("account_phone") or order.get("phone") or "").strip()
+    customer = order.get("customer") or "ลูกค้า"
+    total    = float(order.get("total") or 0)
+    link     = f"velacoldbrew.com/order-complete?order_id={oid}"
+    if stage == 1:
+        line_msg = (f"VeLA Cold Brew: ออเดอร์ #{oid} (฿{total:,.0f}) + ส่วนลดของคุณจองไว้ให้แล้วค่ะ 🐰\n"
+                    f"ชำระได้เลยที่ 👉 {link}")
+        sms_msg  = f"VeLA Cold Brew: ออเดอร์ #{oid} ฿{total:,.0f} + ส่วนลดจองไว้ให้แล้ว ชำระที่ {link}"
+    elif stage == 2:
+        line_msg = (f"VeLA Cold Brew: ออเดอร์ #{oid} ยังรอชำระอยู่นะคะ 💛\n"
+                    f"สิทธิ์ส่วนลดจะหมดอายุเร็วๆ นี้ ชำระเลยที่ 👉 {link}")
+        sms_msg  = f"VeLA Cold Brew: ออเดอร์ #{oid} ยังรอชำระ สิทธิ์ส่วนลดใกล้หมด ชำระที่ {link}"
+    else:  # stage 3
+        left = max(1, expire_hours - 72)
+        line_msg = (f"VeLA Cold Brew: ออเดอร์ #{oid} อีกประมาณ {left} ชม. จะถูกยกเลิกอัตโนมัติค่ะ 🙏\n"
+                    f"รีบชำระที่ 👉 {link} นะคะ")
+        sms_msg  = f"VeLA Cold Brew: ออเดอร์ #{oid} อีก ~{left} ชม.จะถูกยกเลิก รีบชำระที่ {link}"
+    await _notify_customer(sb, oid, phone, customer, line_msg, sms_msg, f"payment_reminder_{stage}")
+
+
 async def run_cron():
     """เช็คเฉพาะพัสดุที่ is_done = false ทุก 3 ชั่วโมง เฉพาะช่วง 10:00-18:00"""
 
@@ -530,36 +553,60 @@ async def run_cron():
     # ลบ order เว็บที่รอชำระเกินเวลา — ใช้ created_at ถ้ามี ไม่งั้น fallback ไป order_date
     # (บั๊กเดิม: order เก่า created_at เป็น NULL ตัวกรอง .lt(created_at) เลยไม่เจอ = ไม่ลบ)
     try:
-        expire_hours = int(os.getenv("ORDER_EXPIRE_HOURS", "48"))
+        expire_hours = int(os.getenv("ORDER_EXPIRE_HOURS", "96"))   # 4 วัน (ปรับผ่าน env, เทศกาลยืดได้)
         now      = datetime.utcnow()
-        cutoff   = now - timedelta(hours=expire_hours)
-        # fallback ด้วย order_date (มีแค่วันที่) → เผื่อ 1 วันกันลบเร็วไป
         date_cutoff = (now - timedelta(hours=expire_hours) - timedelta(days=1)).date()
+        thai_hour = (now + timedelta(hours=7)).hour
+        can_remind = 9 <= thai_hour <= 20   # ส่งแจ้งเตือนเฉพาะกลางวัน (กันรบกวนตอนดึก)
 
         pending = sb.table("orders") \
-            .select("order_id,created_at,order_date") \
+            .select("order_id,created_at,order_date,phone,customer,total,first_order_discount,reminder_stage,account_phone,line_user_id") \
             .eq("status", "รอชำระเงิน") \
             .eq("channel", "web") \
             .execute()
 
         expired_ids = []
+        expired_phones = set()   # เบอร์ที่ต้องคืนสิทธิ์ลูกค้าใหม่ 50%
         for r in (pending.data or []):
-            ca = r.get("created_at")
-            od = r.get("order_date")
-            old = False
+            ca = r.get("created_at"); od = r.get("order_date")
+            age_hours = None
             if ca:
                 try:
                     cadt = datetime.fromisoformat(str(ca).replace("Z", "+00:00")).replace(tzinfo=None)
-                    old = cadt < cutoff
+                    age_hours = (now - cadt).total_seconds() / 3600.0
                 except Exception:
-                    old = False
-            elif od:  # ไม่มี created_at → ใช้ order_date
+                    age_hours = None
+
+            # หมดเวลา → เก็บไว้ลบ
+            old = age_hours >= expire_hours if age_hours is not None else False
+            if old is False and age_hours is None and od:
                 try:
                     old = datetime.strptime(str(od)[:10], "%Y-%m-%d").date() <= date_cutoff
                 except Exception:
                     old = False
             if old:
                 expired_ids.append(r["order_id"])
+                if r.get("first_order_discount"):
+                    ph = (r.get("account_phone") or r.get("phone") or "").strip()
+                    if ph:
+                        expired_phones.add(ph)
+                continue
+
+            # ยังไม่หมดเวลา → แจ้งเตือนแบบบันได (3 → 24 → 72 ชม.) เฉพาะกลางวัน
+            if age_hours is None or not can_remind:
+                continue
+            stage = int(r.get("reminder_stage") or 0)
+            target = stage
+            if   age_hours >= 72 and stage < 3: target = 3
+            elif age_hours >= 24 and stage < 2: target = 2
+            elif age_hours >= 3  and stage < 1: target = 1
+            if target != stage:
+                try:
+                    await _send_unpaid_reminder(sb, r, target, expire_hours)
+                    sb.table("orders").update({"reminder_stage": target}).eq("order_id", r["order_id"]).execute()
+                    print(f"[cron] แจ้งเตือนค้างชำระ #{r['order_id']} ระดับ {target} (อายุ {age_hours:.0f} ชม.)")
+                except Exception as e:
+                    print(f"[cron] reminder error {r['order_id']}: {e}")
 
         if expired_ids:
             # ลบลูก (accounting) ก่อนพ่อ (orders) — ไม่งั้น FK accounting_order_id_fkey บล็อก
@@ -567,13 +614,20 @@ async def run_cron():
                 sb.table("accounting").delete().in_("order_id", expired_ids).execute()
             except Exception as e:
                 print(f"[cron] ลบ accounting ค้างชำระ error: {e}")
-            # เผื่อมี shipping ค้าง (ปกติ order ค้างชำระยังไม่มี) ลบก่อนกัน FK อื่น
             try:
                 sb.table("shipping").delete().in_("order_id", expired_ids).execute()
             except Exception as e:
                 print(f"[cron] ลบ shipping ค้างชำระ error: {e}")
             sb.table("orders").delete().in_("order_id", expired_ids).execute()
             print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
+            # คืนสิทธิ์ลูกค้าใหม่ 50% ให้เบอร์ที่ออเดอร์ถูกลบ — กลับมาสั่งใหม่ยังได้ส่วนลดเหมือนเดิม
+            # (ปลอดภัย: _is_first_order_eligible ยังเช็ค 'ไม่เคยมีออเดอร์เว็บ' อีกชั้น กันคนเคยจ่ายจริง)
+            for ph in expired_phones:
+                try:
+                    sb.table("customers").update({"first_order_used": False}).eq("phone", ph).execute()
+                    print(f"[cron] คืนสิทธิ์ลูกค้าใหม่ 50% → ...{ph[-4:]}")
+                except Exception as e:
+                    print(f"[cron] คืนสิทธิ์ error {ph}: {e}")
         else:
             print(f"[cron] ไม่มี order ค้างชำระหมดเวลา (รอชำระ web ทั้งหมด {len(pending.data or [])} รายการ)")
     except Exception as e:
