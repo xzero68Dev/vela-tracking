@@ -1304,12 +1304,62 @@ class TestSMSRequest(BaseModel):
     message: str = "VeLA Cold Brew: ทดสอบระบบ SMS ✓"
 
 # ---- Admin Auth ----
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+import hmac, hashlib, base64
+
+ADMIN_API_KEY  = os.getenv("ADMIN_API_KEY", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+# secret สำหรับเซ็น session token — ใช้ ADMIN_SECRET ถ้ามี ไม่งั้น fallback เป็น ADMIN_API_KEY
+_ADMIN_SECRET  = (os.getenv("ADMIN_SECRET") or ADMIN_API_KEY or "").encode()
+ADMIN_TOKEN_TTL = int(os.getenv("ADMIN_TOKEN_TTL", str(8 * 3600)))  # อายุ token (วินาที)
+
+def _make_admin_token(exp: int) -> str:
+    """สร้าง signed session token: v1.<exp>.<hmac>  (stateless ไม่ต้องเก็บ DB)"""
+    msg = f"v1.{exp}".encode()
+    sig = hmac.new(_ADMIN_SECRET, msg, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"v1.{exp}.{sig_b64}"
+
+def _verify_admin_token(tok: str) -> bool:
+    """ตรวจ session token: รูปแบบถูก + ยังไม่หมดอายุ + ลายเซ็นตรง"""
+    if not tok or not _ADMIN_SECRET:
+        return False
+    parts = tok.split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return False
+    try:
+        exp = int(parts[1])
+    except ValueError:
+        return False
+    if exp < int(time.time()):
+        return False
+    expected = _make_admin_token(exp)
+    return hmac.compare_digest(tok, expected)
 
 def check_admin_key(request_key: str):
-    """ตรวจสอบ admin API key — fail-closed: ถ้ายังไม่ตั้ง ADMIN_API_KEY = ปฏิเสธทุก request"""
-    if not ADMIN_API_KEY or request_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    """ตรวจ admin credential — รับได้ทั้ง signed session token (จากหน้าเว็บ)
+    หรือ static ADMIN_API_KEY (server-to-server). fail-closed."""
+    if request_key and _verify_admin_token(request_key):
+        return
+    if ADMIN_API_KEY and hmac.compare_digest(request_key or "", ADMIN_API_KEY):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+class AdminLoginBody(BaseModel):
+    password: str
+
+@app.post("/admin/login")
+def admin_login(body: AdminLoginBody):
+    """ล็อกอิน admin — ตรวจรหัสผ่านฝั่ง server แล้วออก session token (ไม่ส่ง key จริงไป browser)"""
+    if not ADMIN_PASSWORD:
+        # ยังไม่ตั้งรหัส — กันไม่ให้ล็อกอินได้เลย (fail-closed)
+        raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า ADMIN_PASSWORD บนเซิร์ฟเวอร์")
+    if not _ADMIN_SECRET:
+        raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า ADMIN_SECRET/ADMIN_API_KEY บนเซิร์ฟเวอร์")
+    if not hmac.compare_digest(body.password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="รหัสผ่านไม่ถูกต้อง")
+    exp = int(time.time()) + ADMIN_TOKEN_TTL
+    return {"token": _make_admin_token(exp), "expires_at": exp}
 
 
 class TestLineRequest(BaseModel):
