@@ -907,7 +907,7 @@ app.add_middleware(
         "https://vela-web-sigma.vercel.app",
         "http://localhost:3000",
     ],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -1023,6 +1023,84 @@ async def check_first_order(phone: str):
         "vip_discount_pct": vip_pct,
         "cap":              int(FIRST_ORDER_CAP),
     }
+
+
+# ── ที่อยู่จัดส่งของลูกค้า (ผ่าน backend + service key — ปิด anon เข้า addresses ตรงได้) ──
+class AddressBody(BaseModel):
+    phone:        str
+    name:         Optional[str] = None
+    full_address: Optional[str] = None
+    subdistrict:  Optional[str] = None
+    district:     Optional[str] = None
+    province:     Optional[str] = None
+    zip:          Optional[str] = None
+    is_default:   bool = False
+    customer_id:  Optional[int] = None
+
+class AddressUpdateBody(BaseModel):
+    phone:        str            # ใช้ scope การ unset default + ยืนยันความเป็นเจ้าของ
+    name:         Optional[str] = None
+    full_address: Optional[str] = None
+    subdistrict:  Optional[str] = None
+    district:     Optional[str] = None
+    province:     Optional[str] = None
+    zip:          Optional[str] = None
+    is_default:   Optional[bool] = None
+
+@app.get("/addresses")
+async def list_addresses(phone: str):
+    ph = (phone or "").strip()
+    if not ph:
+        return {"addresses": []}
+    sb = get_supabase()
+    res = sb.table("addresses").select("*").eq("phone", ph) \
+        .order("is_default", desc=True).order("id", desc=True).execute()
+    return {"addresses": res.data or []}
+
+@app.post("/addresses")
+async def add_address(body: AddressBody):
+    ph = (body.phone or "").strip()
+    if len(ph) < 9:
+        raise HTTPException(status_code=400, detail="เบอร์โทรไม่ถูกต้อง")
+    sb = get_supabase()
+    cnt = sb.table("addresses").select("id").eq("phone", ph).execute()
+    if len(cnt.data or []) >= 3:
+        raise HTTPException(status_code=400, detail="เก็บที่อยู่ได้สูงสุด 3 รายการ")
+    if body.is_default:
+        sb.table("addresses").update({"is_default": False}).eq("phone", ph).execute()
+    row = {k: v for k, v in {
+        "phone": ph, "name": body.name, "full_address": body.full_address,
+        "subdistrict": body.subdistrict, "district": body.district,
+        "province": body.province, "zip": body.zip,
+        "is_default": body.is_default, "customer_id": body.customer_id,
+    }.items() if v is not None}
+    ins = sb.table("addresses").insert(row).execute()
+    return {"success": True, "address": ins.data[0] if ins.data else None}
+
+@app.patch("/addresses/{addr_id}")
+async def update_address(addr_id: int, body: AddressUpdateBody):
+    ph = (body.phone or "").strip()
+    sb = get_supabase()
+    # ยืนยันว่าที่อยู่นี้เป็นของเบอร์นี้จริง (กันแก้ของคนอื่นด้วยการเดา id)
+    own = sb.table("addresses").select("id").eq("id", addr_id).eq("phone", ph).execute()
+    if not own.data:
+        raise HTTPException(status_code=404, detail="ไม่พบที่อยู่")
+    if body.is_default:
+        sb.table("addresses").update({"is_default": False}).eq("phone", ph).execute()
+    upd = {k: v for k, v in body.model_dump().items() if k != "phone" and v is not None}
+    if upd:
+        sb.table("addresses").update(upd).eq("id", addr_id).execute()
+    return {"success": True}
+
+@app.delete("/addresses/{addr_id}")
+async def delete_address(addr_id: int, phone: str):
+    ph = (phone or "").strip()
+    sb = get_supabase()
+    own = sb.table("addresses").select("id").eq("id", addr_id).eq("phone", ph).execute()
+    if not own.data:
+        raise HTTPException(status_code=404, detail="ไม่พบที่อยู่")
+    sb.table("addresses").delete().eq("id", addr_id).execute()
+    return {"success": True}
 
 
 @app.post("/admin/products/{product_id}")
