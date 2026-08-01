@@ -1103,6 +1103,162 @@ async def delete_address(addr_id: int, phone: str):
     return {"success": True}
 
 
+# ============================================================
+#  Customer self-service reads / profile
+#  แทนการที่หน้าเว็บยิง Supabase ตรงด้วย anon key (public) — ย้ายมาทำฝั่ง server
+#  ด้วย service key และ scope ตาม phone / line_user_id
+#  หมายเหตุความปลอดภัย: ยังไม่มี verified session token ต่อผู้ใช้
+#  → ปิดช่อง "ดัมพ์ทั้งตาราง" ของ anon key ได้ แต่การ lookup ด้วยเบอร์/line id
+#    ที่รู้อยู่แล้วยังทำได้ เฟสถัดไปต้องผูก LINE ID-token / OTP session token
+# ============================================================
+
+_MY_ORDER_FIELDS = ("order_id,order_date,ship_date,customer,phone,sku,qty,total,status,"
+                    "province,zip,full_address,note,channel,slip_url,slip_status,paid_at,created_at")
+
+def _join_tracking(sb, orders):
+    """เติมเลขพัสดุ/ขนส่งจากตาราง shipping ให้ลิสต์ออเดอร์ (in-place)"""
+    oids = [o["order_id"] for o in orders if o.get("order_id")]
+    tmap = {}
+    if oids:
+        try:
+            sh = sb.table("shipping").select("order_id,tracking,carrier").in_("order_id", oids).execute()
+            for row in (sh.data or []):
+                if row.get("order_id") and row["order_id"] not in tmap:
+                    tmap[row["order_id"]] = {"tracking": row.get("tracking"), "carrier": row.get("carrier")}
+        except Exception as e:
+            print(f"[orders] shipping join error: {e}")
+    for o in orders:
+        t = tmap.get(o.get("order_id")) or {}
+        o["tracking"] = t.get("tracking")
+        o["carrier"]  = t.get("carrier")
+    return orders
+
+@app.get("/my/orders")
+async def my_orders(phone: str, limit: int = 20):
+    """ออเดอร์ของเบอร์นี้ (+ เลขพัสดุ) — หน้า account / ประวัติหลัง login"""
+    ph = (phone or "").strip()
+    if not ph:
+        raise HTTPException(status_code=400, detail="ต้องระบุ phone")
+    sb = get_supabase()
+    res = (sb.table("orders").select(_MY_ORDER_FIELDS)
+           .eq("phone", ph).order("order_date", desc=True)
+           .limit(min(int(limit or 20), 50)).execute())
+    orders = res.data or []
+    _join_tracking(sb, orders)
+    return {"orders": orders, "count": len(orders)}
+
+@app.get("/my/order/{order_id}")
+async def my_order(order_id: str):
+    """ออเดอร์เดียวตาม order_id — หน้า order-complete / สถานะหลังสั่ง"""
+    oid = (order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
+    sb = get_supabase()
+    res = sb.table("orders").select(_MY_ORDER_FIELDS).eq("order_id", oid).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
+    return {"order": res.data[0]}
+
+_CUSTOMER_PUBLIC_FIELDS = ("id,line_user_id,display_name,picture_url,phone,name,"
+                           "address,province,zip,notify_channel")
+
+@app.get("/customers/by-line/{line_user_id}")
+async def customer_by_line(line_user_id: str):
+    """ดึงข้อมูลลูกค้าด้วย LINE user id (แทน fetchCustomer เดิม)"""
+    lid = (line_user_id or "").strip()
+    if not lid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
+    sb = get_supabase()
+    res = sb.table("customers").select(_CUSTOMER_PUBLIC_FIELDS).eq("line_user_id", lid).limit(1).execute()
+    return {"customer": (res.data[0] if res.data else None)}
+
+@app.get("/customers/check-name")
+async def customer_check_name(name: str, line_user_id: str = ""):
+    """เช็คชื่อซ้ำ (ยกเว้นตัวเอง) — ตอนแก้โปรไฟล์"""
+    nm = (name or "").strip()
+    if not nm:
+        return {"taken": False}
+    sb = get_supabase()
+    rows = sb.table("customers").select("id,line_user_id").ilike("name", nm).execute().data or []
+    lid = (line_user_id or "").strip()
+    return {"taken": any((r.get("line_user_id") or "") != lid for r in rows)}
+
+class CustomerProfileBody(BaseModel):
+    line_user_id:   str
+    display_name:   Optional[str] = None
+    picture_url:    Optional[str] = None
+    phone:          Optional[str] = None
+    name:           Optional[str] = None
+    address:        Optional[str] = None
+    province:       Optional[str] = None
+    zip:            Optional[str] = None
+    notify_channel: Optional[str] = None
+
+@app.post("/customers/profile")
+async def upsert_customer_profile(body: CustomerProfileBody):
+    """สร้าง/อัปเดตโปรไฟล์ลูกค้าด้วย LINE user id (แทน upsertCustomer เดิม)
+    เช็คชื่อซ้ำก่อนตั้ง name — ทำงานด้วย service key ฝั่ง server"""
+    lid = (body.line_user_id or "").strip()
+    if not lid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
+    sb = get_supabase()
+    nm = (body.name or "").strip()
+    if nm:
+        rows = sb.table("customers").select("id,line_user_id").ilike("name", nm).execute().data or []
+        if any((r.get("line_user_id") or "") != lid for r in rows):
+            raise HTTPException(status_code=409, detail="ชื่อนี้มีคนใช้แล้ว กรุณาตั้งชื่ออื่นครับ")
+    data = {"line_user_id": lid, "updated_at": datetime.utcnow().isoformat()}
+    for k in ("display_name", "picture_url", "phone", "name", "address", "province", "zip", "notify_channel"):
+        v = getattr(body, k)
+        if v is not None:
+            data[k] = v
+    res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
+    return {"customer": (res.data[0] if res.data else None)}
+
+
+# ============================================================
+#  Admin reads (ผ่าน admin token) — แทนการยิง Supabase ตรงในหน้า admin
+# ============================================================
+
+_ADMIN_ORDER_FIELDS = ("order_id,order_date,ship_date,customer,phone,province,zip,full_address,"
+                       "sku,qty,channel,status,slip_url,paid_at,note,total,preferred_carrier")
+
+@app.get("/admin/orders-list")
+async def admin_orders_list(sort: str = "created_at", limit: int = 1000,
+                            ids: str = "", x_api_key: str = Header(default="")):
+    """รายการออเดอร์ทั้งหมด (+ เลขพัสดุ) สำหรับหน้า admin/orders และหน้าพิมพ์ฉลาก
+    - ถ้าส่ง ids=a,b,c → คืนเฉพาะออเดอร์เหล่านั้น"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    sort_col = sort if sort in ("created_at", "order_date") else "created_at"
+    query = sb.table("orders").select(_ADMIN_ORDER_FIELDS)
+    id_list = [i.strip() for i in (ids or "").split(",") if i.strip()]
+    if id_list:
+        query = query.in_("order_id", id_list)
+    res = query.order(sort_col, desc=True).limit(min(int(limit or 1000), 2000)).execute()
+    orders = res.data or []
+    _join_tracking(sb, orders)
+    return {"orders": orders, "count": len(orders)}
+
+@app.get("/admin/order-by-tracking")
+async def admin_order_by_tracking(tracking: str, x_api_key: str = Header(default="")):
+    """หาลูกค้า/ออเดอร์จากเลขพัสดุ — โมดัลในหน้า admin สถานะพัสดุ"""
+    check_admin_key(x_api_key)
+    tk = (tracking or "").strip()
+    if not tk:
+        raise HTTPException(status_code=400, detail="ต้องระบุ tracking")
+    sb = get_supabase()
+    sh = sb.table("shipping").select("order_id").eq("tracking", tk).limit(1).execute()
+    if not sh.data:
+        return {"order": None}
+    oid = sh.data[0].get("order_id")
+    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", oid).limit(1).execute()
+    order = res.data[0] if res.data else None
+    if order:
+        order["tracking"] = tk
+    return {"order": order}
+
+
 @app.post("/admin/products/{product_id}")
 async def update_product(product_id: int, body: dict, x_api_key: str = Header(default="")):
     """Admin — อัปเดตราคา/รายละเอียดสินค้า"""
