@@ -1229,8 +1229,8 @@ class TestSMSRequest(BaseModel):
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 def check_admin_key(request_key: str):
-    """ตรวจสอบ admin API key"""
-    if ADMIN_API_KEY and request_key != ADMIN_API_KEY:
+    """ตรวจสอบ admin API key — fail-closed: ถ้ายังไม่ตั้ง ADMIN_API_KEY = ปฏิเสธทุก request"""
+    if not ADMIN_API_KEY or request_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -2527,7 +2527,8 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
 
 # ---- OTP Login ----
 import random
-OTP_STORE: dict[str, dict] = {}  # phone -> {otp, expires}
+OTP_STORE: dict[str, dict] = {}  # phone -> {otp, expires, attempts}
+OTP_REQ_LOG: dict[str, list] = {}  # phone -> [timestamps] สำหรับ rate limit (กัน SMS bomb)
 
 class OTPRequestBody(BaseModel):
     phone: str
@@ -2541,13 +2542,23 @@ class OTPVerifyBody(BaseModel):
 async def request_otp(body: OTPRequestBody):
     """ส่ง OTP ไปยังเบอร์โทร"""
     phone = body.phone.replace("-","").replace(" ","").strip()
-    if len(phone) < 9:
+    if len(phone) < 9 or not phone.isdigit():
         raise HTTPException(status_code=400, detail="เบอร์โทรไม่ถูกต้อง")
+
+    import time
+    now = time.time()
+    # rate limit ต่อเบอร์ — กัน SMS bomb: เว้นอย่างน้อย 60 วิ/ครั้ง, ไม่เกิน 5 ครั้ง/ชม.
+    log = [t for t in OTP_REQ_LOG.get(phone, []) if now - t < 3600]
+    if log and now - log[-1] < 60:
+        raise HTTPException(status_code=429, detail="ขอ OTP ถี่เกินไป รอสักครู่แล้วลองใหม่ค่ะ")
+    if len(log) >= 5:
+        raise HTTPException(status_code=429, detail="ขอ OTP เกินกำหนดต่อชั่วโมง กรุณาลองใหม่ภายหลัง")
+    log.append(now)
+    OTP_REQ_LOG[phone] = log
 
     # สร้าง OTP 6 หลัก
     otp = str(random.randint(100000, 999999))
-    import time
-    OTP_STORE[phone] = {"otp": otp, "expires": time.time() + 300}  # หมดอายุ 5 นาที
+    OTP_STORE[phone] = {"otp": otp, "expires": now + 300, "attempts": 0}  # หมดอายุ 5 นาที
 
     # ส่ง SMS
     msg = f"VeLA Cold Brew: รหัส OTP ของคุณคือ {otp} (หมดอายุใน 5 นาที)"
@@ -2578,6 +2589,11 @@ async def verify_otp(body: OTPVerifyBody):
         del OTP_STORE[phone]
         raise HTTPException(status_code=400, detail="OTP หมดอายุแล้ว กรุณาขอใหม่")
     if stored["otp"] != body.otp.strip():
+        # จำกัดจำนวนครั้งที่เดา — กัน brute-force OTP
+        stored["attempts"] = int(stored.get("attempts", 0)) + 1
+        if stored["attempts"] >= 5:
+            del OTP_STORE[phone]
+            raise HTTPException(status_code=429, detail="ใส่ OTP ผิดหลายครั้งเกินไป กรุณาขอรหัสใหม่")
         raise HTTPException(status_code=400, detail="OTP ไม่ถูกต้อง")
 
     # OTP ถูกต้อง — ลบทิ้ง
