@@ -239,9 +239,12 @@ async def _notify_customer(sb, order_id: str, phone: str, customer: str,
             print(f"[customer-notify] {status_tag} ข้าม {customer} → ปิดแจ้งเตือน")
             return "off"
         if channel == "line" and line_uid:
-            await send_line_notify(line_uid, line_message, barcode=order_id, status=status_tag, customer=customer, phone=phone)
-            return "line"
-        # fallback → SMS
+            ok_line = await send_line_notify(line_uid, line_message, barcode=order_id, status=status_tag, customer=customer, phone=phone)
+            if ok_line:
+                return "line"
+            # LINE ส่งไม่สำเร็จ (เช่น token เพิก/LINE 5xx หลัง retry) → ตกไป SMS แทน ไม่ให้ลูกค้าพลาดการแจ้ง
+            print(f"[customer-notify] {status_tag} LINE ล้มเหลว → ตก SMS ({customer})")
+        # fallback → SMS (ไม่มี LINE หรือ LINE ล้มเหลว)
         ph = (phone or "").strip()
         if ph and ph != "-" and len(ph) >= 9:
             ok = await send_sms(ph, sms_message, barcode=order_id, status=status_tag, customer=customer, force=True)
@@ -1172,16 +1175,31 @@ async def customer_by_line(line_user_id: str):
     res = sb.table("customers").select(_CUSTOMER_PUBLIC_FIELDS).eq("line_user_id", lid).limit(1).execute()
     return {"customer": (res.data[0] if res.data else None)}
 
+def _display_name_taken(sb, name: str, exclude_lid: str = "") -> bool:
+    """ชื่อนี้มีคนอื่นใช้แล้วมั้ย (case-insensitive, ยกเว้นตัวเอง)
+    ป้องกัน wildcard: แปลง %/* (และคง _) เป็น single-char wildcard เพื่อไม่ให้ ilike under-match
+    แล้วยืนยัน exact ใน python อีกชั้น กันชื่อที่มี % _ * ไปแมตช์คนอื่นมั่ว"""
+    nm = (name or "").strip()
+    if not nm:
+        return False
+    like = nm.replace("%", "_").replace("*", "_")   # ทุก wildcard → '_' (แมตช์อักขระเดียวรวมถึงตัวจริง)
+    try:
+        rows = sb.table("customers").select("name,line_user_id").ilike("name", like).execute().data or []
+    except Exception as e:
+        print(f"[name-check] error: {e}")
+        return False
+    tgt = nm.lower()
+    exclude = (exclude_lid or "").strip()
+    return any((r.get("name") or "").strip().lower() == tgt and (r.get("line_user_id") or "") != exclude
+               for r in rows)
+
 @app.get("/customers/check-name")
 async def customer_check_name(name: str, line_user_id: str = ""):
     """เช็คชื่อซ้ำ (ยกเว้นตัวเอง) — ตอนแก้โปรไฟล์"""
-    nm = (name or "").strip()
-    if not nm:
+    if not (name or "").strip():
         return {"taken": False}
     sb = get_supabase()
-    rows = sb.table("customers").select("id,line_user_id").ilike("name", nm).execute().data or []
-    lid = (line_user_id or "").strip()
-    return {"taken": any((r.get("line_user_id") or "") != lid for r in rows)}
+    return {"taken": _display_name_taken(sb, name, line_user_id)}
 
 class CustomerProfileBody(BaseModel):
     line_user_id:   str
@@ -1203,10 +1221,8 @@ async def upsert_customer_profile(body: CustomerProfileBody):
         raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
     sb = get_supabase()
     nm = (body.name or "").strip()
-    if nm:
-        rows = sb.table("customers").select("id,line_user_id").ilike("name", nm).execute().data or []
-        if any((r.get("line_user_id") or "") != lid for r in rows):
-            raise HTTPException(status_code=409, detail="ชื่อนี้มีคนใช้แล้ว กรุณาตั้งชื่ออื่นครับ")
+    if nm and _display_name_taken(sb, nm, lid):
+        raise HTTPException(status_code=409, detail="ชื่อนี้มีคนใช้แล้ว กรุณาตั้งชื่ออื่นครับ")
     data = {"line_user_id": lid, "updated_at": datetime.utcnow().isoformat()}
     for k in ("display_name", "picture_url", "phone", "name", "address", "province", "zip", "notify_channel"):
         v = getattr(body, k)
@@ -1971,16 +1987,25 @@ async def create_order(body: CreateOrderRequest):
     vip_disc = 0
     if vip_pct > 0:
         orig_price = {}
+        load_ok = True
         try:
             _p = sb.table("products").select("sku,price").execute()
             for p in (_p.data or []):
                 orig_price[(p.get("sku") or "").upper()] = float(p.get("price") or 0)
         except Exception as e:
+            load_ok = False
             print(f"[vip] load original prices error: {e}")
-        # ยอดราคาตั้งรวม (fallback = ราคาที่ส่งมาถ้าไม่เจอ sku)
-        orig_subtotal = sum(orig_price.get((i.sku or "").upper(), i.price) * i.qty for i in body.items)
-        vip_total = int(round(orig_subtotal * (1 - vip_pct / 100.0)))
-        vip_disc  = max(0, int(round(subtotal)) - vip_total)   # ส่วนลดเทียบกับราคาปกติหน้าเว็บ
+        # ต้องหา "ราคาตั้ง" ได้ครบทุกชิ้นก่อน ถึงจะคิด VIP
+        # ถ้าโหลดไม่สำเร็จ หรือมี SKU ไหนหาไม่เจอ → ข้าม VIP รอบนี้ (กันเก็บเงินขาดจากการ
+        #  fallback ไปใช้ราคาที่ลด 30% แล้วเป็นฐาน ซึ่งจะกลายเป็นลดซ้ำ)
+        all_resolved = load_ok and all((i.sku or "").upper() in orig_price for i in body.items)
+        if all_resolved:
+            orig_subtotal = sum(orig_price[(i.sku or "").upper()] * i.qty for i in body.items)
+            vip_total = int(round(orig_subtotal * (1 - vip_pct / 100.0)))
+            vip_disc  = max(0, int(round(subtotal)) - vip_total)   # ส่วนลดเทียบกับราคาปกติหน้าเว็บ
+        else:
+            vip_disc = 0
+            print(f"[vip] ข้ามส่วนลด VIP order {body.order_id} — หาราคาตั้งไม่ครบ (load_ok={load_ok})")
     # เลือกอันที่ลดเยอะกว่า (ไม่ซ้อน) — ตามที่ตกลง
     discount    = max(fo_disc, vip_disc)
     used_first  = fo_disc > 0 and fo_disc >= vip_disc   # โปรลูกค้าใหม่เป็นตัวที่ถูกใช้จริง
@@ -2055,7 +2080,9 @@ async def create_order(body: CreateOrderRequest):
         print(f"[customer] auto-capture error: {e}")
 
     # mark first_order_used ที่ "เบอร์บัญชี" (elig_phone) เพื่อกันใช้ส่วนลด 50% ซ้ำ
-    if discount > 0:
+    # เฉพาะตอนที่ "โปรลูกค้าใหม่ 50%" ถูกใช้จริง (used_first) — ออเดอร์ VIP ล้วนไม่กินสิทธิ์
+    # (กันเคส VIP สั่งแล้วไม่จ่าย → cron ลบ แต่ไม่คืนสิทธิ์ 50% ที่ไม่เคยได้ใช้)
+    if used_first:
         try:
             upd = sb.table("customers").update({"first_order_used": True}).eq("phone", elig_phone).execute()
             if not upd.data:
@@ -2199,6 +2226,14 @@ async def slip_notify(body: SlipNotifyRequest):
                 print(f"[SlipOK] {body.order_id} error: {e}")
         else:
             print(f"[SlipOK] {body.order_id} skip (ไม่มี SLIPOK_API_KEY) → manual")
+
+        # กันสลิปยอดน้อยกว่าออเดอร์ชัดเจน (เช่นโอน ฿20 ให้ออเดอร์ ฿500) — ไม่ auto-confirm
+        # เช็คเฉพาะตอน SlipOK อ่านยอดได้จริง (slip_amount>0) และน้อยกว่าเกิน ฿2 → ให้ admin ตรวจแทน
+        # (ไม่ได้ส่งยอดไป SlipOK เลยไม่กระทบ 1013 จากยอดลด/ปัดเศษ; ยอดเกินยังผ่านปกติ)
+        if slip_verified and slip_amount and total and slip_amount < total - 2:
+            slip_verified = False
+            slip_error = f"ยอดสลิป ฿{slip_amount:,.0f} น้อยกว่ายอดออเดอร์ ฿{total:,.0f} — โปรดตรวจก่อนยืนยัน"
+            print(f"[SlipOK] {body.order_id} ยอดน้อยกว่าออเดอร์ → ส่งให้ admin ตรวจ")
 
         if slip_verified:
             sb.table("orders").update({
