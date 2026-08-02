@@ -1015,10 +1015,11 @@ def _get_vip_pct(sb, phone: str = "", line_user_id: str = "") -> int:
 
 
 @app.get("/products/check-first-order")
-async def check_first_order(phone: str):
-    """เช็คสิทธิ์ส่วนลดของลูกค้าเบอร์นี้: โปรลูกค้าใหม่ 50% (ครั้งแรก) + ส่วนลด VIP (ถ้ามี)"""
+async def check_first_order(phone: str, line_user_id: str = ""):
+    """เช็คสิทธิ์ส่วนลดของลูกค้าเบอร์นี้: โปรลูกค้าใหม่ 50% (ครั้งแรก) + ส่วนลด VIP (ถ้ามี)
+    ส่ง line_user_id มาด้วยเพื่อให้ VIP ที่ผูกกับ LINE โชว์บนหน้า checkout ตรงกับตอนคิดเงินจริง"""
     sb = get_supabase()
-    vip_pct  = _get_vip_pct(sb, phone)
+    vip_pct  = _get_vip_pct(sb, phone, line_user_id)
     eligible = _is_first_order_eligible(sb, phone) if _promo_first_order_enabled() else False
     return {
         "eligible":         eligible,
