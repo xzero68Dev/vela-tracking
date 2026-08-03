@@ -331,7 +331,10 @@ async def get_access_token() -> str:
 def detect_carrier(barcode: str) -> str:
     """ตรวจสอบ 'ผู้ให้บริการ tracking' (สำหรับ route API เช็คสถานะ) จาก format เลข tracking"""
     b = (barcode or "").upper()
-    # Flash Express (Shopee-managed) ใช้เลข THxxxxxxxxxxC — KEX ใช้ SXF อย่างเดียวแล้ว
+    # เลขขึ้นต้น SPX = Shopee Xpress ชัดเจน — เข้ากลุ่ม flash-express ที่จะ "ลอง SPX ก่อน"
+    if re.match(r'^SPX', b):               return "flash-express"
+    # Flash Express (Shopee-managed) ใช้เลข THxxxxxxxxxxC — แต่ SPX ก็ใช้ TH เหมือนกัน
+    # → เข้ากลุ่ม flash-express แล้วให้ fetch_tracking/cron ลอง SPX ก่อน ถ้าไม่ใช่ค่อย Flash
     if re.match(r'^TH', b):                 return "flash-express"
     if re.match(r'^(SXF|SCPK)', b):        return "kex-express"
     if re.match(r'^(FLE|FEX)', b):         return "flash-express"
@@ -479,6 +482,83 @@ async def fetch_tracking_batch(barcodes: list) -> list:
     return results
 
 
+# ── SPX (Shopee Express) — เรียก open endpoint ของ spx.co.th ตรง (ไม่ต้อง scraper/ไม่ต้อง auth) ──
+SPX_TRACK_URL = "https://spx.co.th/shipment/order/open/order/get_order_info"
+# milestone_code ของ SPX → สถานะระบบเรา
+_SPX_MILESTONE = {
+    1: ("accepted",         "เตรียมจัดส่ง"),
+    2: ("accepted",         "รับพัสดุแล้ว"),
+    3: ("in_transit",       "อยู่ระหว่างขนส่ง"),
+    4: ("in_transit",       "อยู่ระหว่างขนส่ง"),
+    5: ("in_transit",       "อยู่ระหว่างขนส่ง"),
+    6: ("out_for_delivery", "กำลังนำจ่าย"),
+    8: ("delivered",        "จัดส่งสำเร็จ"),
+}
+
+async def fetch_spx(barcode: str) -> Optional[dict]:
+    """ดึงสถานะพัสดุ SPX (Shopee Express) จาก open endpoint ของ spx.co.th
+    คืน None ถ้าไม่ใช่พัสดุ SPX (ไม่มี records) → ให้ caller ลอง Flash ต่อ
+    (เลข TH ใช้ร่วมกันทั้ง SPX และ Flash แยกจากหัวเลขไม่ได้ จึงลอง SPX ก่อน)"""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(SPX_TRACK_URL,
+                                  params={"spx_tn": barcode, "language_code": "th"},
+                                  headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        recs = (((j.get("data") or {}).get("sls_tracking_info") or {}).get("records")) or []
+        if not recs:
+            return None
+    except Exception as e:
+        print(f"[SPX] error {barcode}: {e}")
+        return None
+
+    events = []
+    for e in recs:
+        ms = e.get("milestone_code")
+        st, th = _SPX_MILESTONE.get(ms, ("in_transit", e.get("milestone_name") or "อยู่ระหว่างขนส่ง"))
+        name = ((e.get("tracking_name") or "") + " " + (e.get("description") or ""))
+        low  = name.lower()
+        if "return" in low or "ตีกลับ" in name or "ส่งคืน" in name:
+            st, th = "returned", "ตีกลับ/ส่งคืนต้นทาง"
+        elif "fail" in low or "unsuccess" in low or "ไม่สำเร็จ" in name:
+            st, th = "problem", "นำจ่ายไม่สำเร็จ"
+        dt = ""
+        t  = e.get("actual_time")
+        if t:
+            try:
+                dt = datetime.utcfromtimestamp(int(t) + 7 * 3600).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                dt = ""
+        events.append({
+            "status_code": str(e.get("tracking_code") or ""),
+            "status":      st,
+            "description": (e.get("description") or th or "").strip(),
+            "datetime":    dt,
+            "location":    e.get("current_location") or "",
+        })
+    events.reverse()   # records[0]=ล่าสุด → เรียงเก่า→ใหม่ ให้เหมือน carrier อื่น
+    latest = events[-1] if events else None
+    if any(ev["status"] == "delivered" for ev in events):
+        delivered  = next((ev for ev in reversed(events) if ev["status"] == "delivered"), None)
+        cur_status = "delivered"
+        cur_th     = (delivered or {}).get("description") or "จัดส่งสำเร็จ"
+        if delivered:
+            latest = delivered
+    else:
+        cur_status = latest["status"] if latest else "pending"
+        cur_th     = latest["description"] if latest else "รอข้อมูล"
+    return {
+        "barcode":      barcode,
+        "status":       cur_status,
+        "status_th":    cur_th,
+        "latest_event": latest,
+        "events":       events,
+        "carrier":      "SPX Express",
+    }
+
+
 async def fetch_tracking(barcode: str) -> dict:
     """ดึงสถานะพัสดุ — route อัตโนมัติตาม carrier"""
     carrier = detect_carrier(barcode)
@@ -500,6 +580,11 @@ async def fetch_tracking(barcode: str) -> dict:
         # ไม่มี fallback — ถ้า scraper ไม่ได้ผล return unknown
         return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
     elif carrier == "flash-express":
+        # เลข TH ใช้ร่วมกันทั้ง SPX (Shopee Xpress) และ Flash → ลอง SPX ก่อน (เร็ว ไม่ต้อง scraper)
+        # ถ้าไม่ใช่ SPX (คืน None) ค่อย fallback ไป Flash scraper เดิม
+        spx = await fetch_spx(barcode)
+        if spx:
+            return spx
         # Flash (Shopee-managed) — ใช้ scraper เดียวกับ KEX (headless เปิดหน้า Flash ผ่าน 5 Second Shield)
         if KEX_SCRAPER_URL:
             try:
@@ -708,6 +793,25 @@ async def run_cron():
                     print(f"[KEX Scraper] bulk error: HTTP {r.status_code}")
         except Exception as e:
             print(f"[KEX Scraper] bulk error batch {i}: {e}")
+
+    # แยก SPX ออกจาก Flash ก่อน — เลข TH ใช้ร่วมกันทั้ง SPX (Shopee Xpress) และ Flash
+    # ลอง SPX open endpoint ทีละเลข (ฟรี เร็ว) ถ้าใช่ SPX เก็บผลเลย ที่เหลือค่อยส่ง Flash scraper
+    if flash_barcodes:
+        still_flash = []
+        for b in flash_barcodes:
+            spx = await fetch_spx(b)
+            if spx:
+                all_results.append({
+                    "barcode":      b,
+                    "status":       spx.get("status", "unknown"),
+                    "status_th":    spx.get("status_th", ""),
+                    "latest_event": spx.get("latest_event") or {},
+                    "events":       spx.get("events", []),
+                })
+                print(f"[cron] SPX {b} → {spx.get('status')}")
+            else:
+                still_flash.append(b)
+        flash_barcodes = still_flash
 
     # เช็ค Flash ผ่าน scraper เดียวกัน (headless เปิดหน้า Flash ผ่าน 5 Second Shield) — ฟรี เช็คได้ตลอด
     for i in range(0, len(flash_barcodes), batch_size):
