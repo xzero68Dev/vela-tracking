@@ -1255,14 +1255,20 @@ async def my_orders(phone: str, limit: int = 20):
     _join_tracking(sb, orders)
     return {"orders": orders, "count": len(orders)}
 
+# field ที่ปลอดภัยจะโชว์ผ่านลิงก์ order-complete (เปิดด้วย order_id อย่างเดียว ไม่มี auth)
+# → ตัด PII ออก (ชื่อ/เบอร์/ที่อยู่/สลิป) กัน IDOR: ใครเดา/ได้ลิงก์ไปก็เห็นแค่รายการ+ยอด+สถานะ
+_PUBLIC_ORDER_FIELDS = ("order_id,order_date,ship_date,sku,qty,total,status,"
+                        "channel,slip_status,paid_at,created_at")
+
 @app.get("/my/order/{order_id}")
 async def my_order(order_id: str):
-    """ออเดอร์เดียวตาม order_id — หน้า order-complete / สถานะหลังสั่ง"""
+    """ออเดอร์เดียวตาม order_id — หน้า order-complete / สถานะหลังสั่ง
+    คืนเฉพาะข้อมูลที่ไม่ใช่ PII (หน้านี้เปิดด้วย order_id อย่างเดียว ไม่มีการยืนยันตัวตน)"""
     oid = (order_id or "").strip()
     if not oid:
         raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
     sb = get_supabase()
-    res = sb.table("orders").select(_MY_ORDER_FIELDS).eq("order_id", oid).limit(1).execute()
+    res = sb.table("orders").select(_PUBLIC_ORDER_FIELDS).eq("order_id", oid).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
     return {"order": res.data[0]}
