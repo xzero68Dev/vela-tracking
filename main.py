@@ -4,7 +4,7 @@ import time
 import httpx
 import asyncio
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1622,8 +1622,20 @@ def safe_date(v):
             return None
     except:
         pass
+    # ถ้าเป็น datetime/date/Timestamp อยู่แล้ว → format ตรง ไม่ต้องเดา
+    if isinstance(v, (datetime, date, pd.Timestamp)):
+        return pd.Timestamp(v).strftime("%Y-%m-%d")
+    s = str(v).strip()
+    # รูปแบบ ISO 'YYYY-MM-DD' (อาจมีเวลาต่อท้าย) — ชัดเจน parse ตรง ห้ามใช้ dayfirst
+    # (dayfirst=True เจอ ISO จะสลับเดือน/วัน เช่น 2026-08-03 -> 2026-03-08)
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    # fallback: รูปแบบเดิม DD/MM/YYYY (ไทย) — ใช้ dayfirst=True
     try:
-        ts = pd.to_datetime(v, dayfirst=True)
+        ts = pd.to_datetime(s, dayfirst=True)
         if pd.isna(ts):
             return None
         return ts.strftime("%Y-%m-%d")
