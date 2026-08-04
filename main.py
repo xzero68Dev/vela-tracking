@@ -3179,21 +3179,12 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
     # จัดอันดับทั้งหมดก่อน (ไม่ตัด limit) เพื่อให้หา rank ของเบอร์เฉพาะได้แม้อยู่นอก top N
     full_ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)
 
-    # ชื่อบนหน้า public — โชว์ชื่อต้น + อักษรย่อนามสกุล (กันโชว์ชื่อเต็มจริง)
-    # ไม่โชว์เบอร์โทรเลย (เป็นหน้า public ใครก็เห็น)
-    def short_name(nm: str) -> str:
-        nm = (nm or "").strip()
-        if not nm:
-            return "ลูกค้า VeLA"
-        parts = nm.split()
-        if len(parts) == 1:
-            return parts[0]
-        return f"{parts[0]} {parts[-1][0]}." if parts[-1] else parts[0]
-
+    # ชื่อบนหน้า public — โชว์ชื่อที่ลูกค้าตั้งเอง (name/display_name แก้ได้ในหน้าโปรไฟล์)
+    # ไม่โชว์เบอร์โทรเลย (เป็นหน้า public ใครก็เห็น) — ลูกค้าคุมชื่อที่แสดงเองได้
     top_n = [
         {
             "rank":     i + 1,
-            "customer": short_name(r["customer"]),
+            "customer": (r["customer"] or "").strip() or "ลูกค้า VeLA",
             "points":   round(r["points"], 1),
         }
         for i, r in enumerate(full_ranked[:limit])
