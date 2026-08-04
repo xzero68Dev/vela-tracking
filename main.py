@@ -3179,19 +3179,22 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
     # จัดอันดับทั้งหมดก่อน (ไม่ตัด limit) เพื่อให้หา rank ของเบอร์เฉพาะได้แม้อยู่นอก top N
     full_ranked = sorted(totals.values(), key=lambda x: x["points"], reverse=True)
 
-    # ปิดบังเบอร์โทรบางส่วนเพื่อความเป็นส่วนตัว เช่น 091-XXX-456
-    def mask_phone(p: str) -> str:
-        p = p or ""
-        if len(p) < 7:
-            return p
-        return f"{p[:3]}-XXX-{p[-3:]}"
+    # ชื่อบนหน้า public — โชว์ชื่อต้น + อักษรย่อนามสกุล (กันโชว์ชื่อเต็มจริง)
+    # ไม่โชว์เบอร์โทรเลย (เป็นหน้า public ใครก็เห็น)
+    def short_name(nm: str) -> str:
+        nm = (nm or "").strip()
+        if not nm:
+            return "ลูกค้า VeLA"
+        parts = nm.split()
+        if len(parts) == 1:
+            return parts[0]
+        return f"{parts[0]} {parts[-1][0]}." if parts[-1] else parts[0]
 
     top_n = [
         {
-            "rank":          i + 1,
-            "customer":      r["customer"],
-            "phone_masked":  mask_phone(r["phone"]),
-            "points":        round(r["points"], 1),
+            "rank":     i + 1,
+            "customer": short_name(r["customer"]),
+            "points":   round(r["points"], 1),
         }
         for i, r in enumerate(full_ranked[:limit])
     ]
