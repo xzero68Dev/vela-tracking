@@ -114,7 +114,6 @@ async def send_line_notify(line_user_id: str, message: str, barcode: str = "", s
 
 async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = "", force: bool = False):
     """ส่ง SMS ผ่าน Thaibulksms พร้อม log (force=True ข้าม dedup ให้ส่งซ้ำได้)"""
-    print(f"[SMS] key={SMS_API_KEY[:6]}... secret={SMS_API_SECRET[:6]}...")
     if not SMS_API_KEY or not SMS_API_SECRET:
         print(f"[SMS] ยังไม่ได้ตั้ง SMS key")
         return False
