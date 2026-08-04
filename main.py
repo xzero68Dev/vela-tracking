@@ -1156,20 +1156,22 @@ class AddressUpdateBody(BaseModel):
     is_default:   Optional[bool] = None
 
 @app.get("/addresses")
-async def list_addresses(phone: str):
+async def list_addresses(phone: str, x_auth_token: str = Header(default="")):
     ph = (phone or "").strip()
     if not ph:
         return {"addresses": []}
+    _check_customer(x_auth_token, phone=ph)
     sb = get_supabase()
     res = sb.table("addresses").select("*").eq("phone", ph) \
         .order("is_default", desc=True).order("id", desc=True).execute()
     return {"addresses": res.data or []}
 
 @app.post("/addresses")
-async def add_address(body: AddressBody):
+async def add_address(body: AddressBody, x_auth_token: str = Header(default="")):
     ph = (body.phone or "").strip()
     if len(ph) < 9:
         raise HTTPException(status_code=400, detail="เบอร์โทรไม่ถูกต้อง")
+    _check_customer(x_auth_token, phone=ph)
     sb = get_supabase()
     cnt = sb.table("addresses").select("id").eq("phone", ph).execute()
     if len(cnt.data or []) >= 3:
@@ -1186,8 +1188,9 @@ async def add_address(body: AddressBody):
     return {"success": True, "address": ins.data[0] if ins.data else None}
 
 @app.patch("/addresses/{addr_id}")
-async def update_address(addr_id: int, body: AddressUpdateBody):
+async def update_address(addr_id: int, body: AddressUpdateBody, x_auth_token: str = Header(default="")):
     ph = (body.phone or "").strip()
+    _check_customer(x_auth_token, phone=ph)
     sb = get_supabase()
     # ยืนยันว่าที่อยู่นี้เป็นของเบอร์นี้จริง (กันแก้ของคนอื่นด้วยการเดา id)
     own = sb.table("addresses").select("id").eq("id", addr_id).eq("phone", ph).execute()
@@ -1201,8 +1204,9 @@ async def update_address(addr_id: int, body: AddressUpdateBody):
     return {"success": True}
 
 @app.delete("/addresses/{addr_id}")
-async def delete_address(addr_id: int, phone: str):
+async def delete_address(addr_id: int, phone: str, x_auth_token: str = Header(default="")):
     ph = (phone or "").strip()
+    _check_customer(x_auth_token, phone=ph)
     sb = get_supabase()
     own = sb.table("addresses").select("id").eq("id", addr_id).eq("phone", ph).execute()
     if not own.data:
@@ -1212,12 +1216,59 @@ async def delete_address(addr_id: int, phone: str):
 
 
 # ============================================================
+#  Customer session token — พิสูจน์ว่าคนเรียกเป็นเจ้าของ phone/line จริง
+#  ออกตอน login (OTP/LINE) แล้ว endpoint ข้อมูลส่วนตัวเช็ค token + เจ้าของต้องตรง
+#  ENFORCE_CUSTOMER_TOKEN=0 (default) = โหมด grace ยังไม่บังคับ (rollout ปลอดภัย)
+#  ตั้ง =1 บน Render เมื่อพร้อมบังคับ (ลูกค้าเก่าต้อง login ใหม่ 1 ครั้ง)
+# ============================================================
+import hmac as _hmac2, hashlib as _hashlib2, base64 as _base64_2
+_CUSTOMER_SECRET = (os.getenv("CUSTOMER_SECRET") or os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_API_KEY") or "").encode()
+CUSTOMER_TOKEN_TTL = int(os.getenv("CUSTOMER_TOKEN_TTL", str(45 * 24 * 3600)))   # 45 วัน
+ENFORCE_CUSTOMER_TOKEN = os.getenv("ENFORCE_CUSTOMER_TOKEN", "0") == "1"
+
+def _norm_phone(p: str) -> str:
+    return (p or "").replace("-", "").replace(" ", "").strip()
+
+def _make_customer_token(phone: str = "", line_user_id: str = "", exp: int = 0) -> str:
+    exp = exp or (int(time.time()) + CUSTOMER_TOKEN_TTL)
+    ph = _norm_phone(phone); lid = (line_user_id or "").strip()
+    sig = _base64_2.urlsafe_b64encode(
+        _hmac2.new(_CUSTOMER_SECRET, f"c1.{ph}.{lid}.{exp}".encode(), _hashlib2.sha256).digest()
+    ).decode().rstrip("=")
+    return f"c1.{ph}.{lid}.{exp}.{sig}"
+
+def _verify_customer_token(tok: str):
+    if not tok or not _CUSTOMER_SECRET:
+        return None
+    parts = tok.split(".")
+    if len(parts) != 5 or parts[0] != "c1":
+        return None
+    try:
+        exp = int(parts[3])
+    except ValueError:
+        return None
+    if exp < int(time.time()):
+        return None
+    if not _hmac2.compare_digest(tok, _make_customer_token(parts[1], parts[2], exp)):
+        return None
+    return {"phone": parts[1], "line_user_id": parts[2]}
+
+def _check_customer(token: str, phone: str = None, line_user_id: str = None):
+    """เช็คว่าลูกค้าที่เรียกเป็นเจ้าของข้อมูลจริง (grace mode = ไม่บังคับจนกว่าจะ ENFORCE)"""
+    if not ENFORCE_CUSTOMER_TOKEN:
+        return
+    ctx = _verify_customer_token(token)
+    if not ctx:
+        raise HTTPException(status_code=401, detail="กรุณาเข้าสู่ระบบใหม่")
+    if phone and (ctx.get("phone") or "") != _norm_phone(phone):
+        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงข้อมูลนี้")
+    if line_user_id and (ctx.get("line_user_id") or "") != line_user_id.strip():
+        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงข้อมูลนี้")
+
+
+# ============================================================
 #  Customer self-service reads / profile
-#  แทนการที่หน้าเว็บยิง Supabase ตรงด้วย anon key (public) — ย้ายมาทำฝั่ง server
-#  ด้วย service key และ scope ตาม phone / line_user_id
-#  หมายเหตุความปลอดภัย: ยังไม่มี verified session token ต่อผู้ใช้
-#  → ปิดช่อง "ดัมพ์ทั้งตาราง" ของ anon key ได้ แต่การ lookup ด้วยเบอร์/line id
-#    ที่รู้อยู่แล้วยังทำได้ เฟสถัดไปต้องผูก LINE ID-token / OTP session token
+#  ยิงผ่าน backend + service key + customer token (แทน anon key ตรง)
 # ============================================================
 
 _MY_ORDER_FIELDS = ("order_id,order_date,ship_date,customer,phone,sku,qty,total,status,"
@@ -1242,11 +1293,12 @@ def _join_tracking(sb, orders):
     return orders
 
 @app.get("/my/orders")
-async def my_orders(phone: str, limit: int = 20):
+async def my_orders(phone: str, limit: int = 20, x_auth_token: str = Header(default="")):
     """ออเดอร์ของเบอร์นี้ (+ เลขพัสดุ) — หน้า account / ประวัติหลัง login"""
     ph = (phone or "").strip()
     if not ph:
         raise HTTPException(status_code=400, detail="ต้องระบุ phone")
+    _check_customer(x_auth_token, phone=ph)
     sb = get_supabase()
     res = (sb.table("orders").select(_MY_ORDER_FIELDS)
            .eq("phone", ph).order("order_date", desc=True)
@@ -1277,11 +1329,14 @@ _CUSTOMER_PUBLIC_FIELDS = ("id,line_user_id,display_name,picture_url,phone,name,
                            "address,province,zip,notify_channel")
 
 @app.get("/customers/by-line/{line_user_id}")
-async def customer_by_line(line_user_id: str):
+async def customer_by_line(line_user_id: str, x_auth_token: str = Header(default="")):
     """ดึงข้อมูลลูกค้าด้วย LINE user id (แทน fetchCustomer เดิม)"""
     lid = (line_user_id or "").strip()
     if not lid:
         raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
+    # หมายเหตุ: ไม่บังคับ token ที่นี่ — endpoint นี้ใช้ "สร้าง session" ตอน LIFF auto-login
+    #   (ตอนนั้นยังไม่มี token) การบังคับจะทำให้ login LINE พัง (chicken-and-egg)
+    #   line_user_id เป็น id ทึบ (เดา/ไล่ไม่ได้) เหลือเป็น residual เล็กใน roadmap
     sb = get_supabase()
     res = sb.table("customers").select(_CUSTOMER_PUBLIC_FIELDS).eq("line_user_id", lid).limit(1).execute()
     return {"customer": (res.data[0] if res.data else None)}
@@ -1305,7 +1360,7 @@ def _display_name_taken(sb, name: str, exclude_lid: str = "") -> bool:
                for r in rows)
 
 @app.get("/customers/check-name")
-async def customer_check_name(name: str, line_user_id: str = ""):
+async def customer_check_name(name: str, line_user_id: str = "", x_auth_token: str = Header(default="")):
     """เช็คชื่อซ้ำ (ยกเว้นตัวเอง) — ตอนแก้โปรไฟล์"""
     if not (name or "").strip():
         return {"taken": False}
@@ -1324,12 +1379,14 @@ class CustomerProfileBody(BaseModel):
     notify_channel: Optional[str] = None
 
 @app.post("/customers/profile")
-async def upsert_customer_profile(body: CustomerProfileBody):
+async def upsert_customer_profile(body: CustomerProfileBody, x_auth_token: str = Header(default="")):
     """สร้าง/อัปเดตโปรไฟล์ลูกค้าด้วย LINE user id (แทน upsertCustomer เดิม)
-    เช็คชื่อซ้ำก่อนตั้ง name — ทำงานด้วย service key ฝั่ง server"""
+    เช็คชื่อซ้ำก่อนตั้ง name — ทำงานด้วย service key ฝั่ง server
+    คืน token ใหม่ (ผูกเบอร์ล่าสุด) ให้ frontend เก็บ — เผื่อลูกค้า LINE เพิ่งเพิ่มเบอร์"""
     lid = (body.line_user_id or "").strip()
     if not lid:
         raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
+    # ไม่บังคับ token — endpoint นี้ใช้ตอน LIFF auto-login สร้าง/อัปเดตโปรไฟล์ (ยังไม่มี token)
     sb = get_supabase()
     nm = (body.name or "").strip()
     if nm and _display_name_taken(sb, nm, lid):
@@ -1340,7 +1397,9 @@ async def upsert_customer_profile(body: CustomerProfileBody):
         if v is not None:
             data[k] = v
     res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
-    return {"customer": (res.data[0] if res.data else None)}
+    cust = res.data[0] if res.data else None
+    token = _make_customer_token(phone=(cust or {}).get("phone") or "", line_user_id=lid)
+    return {"customer": cust, "token": token}
 
 
 # ============================================================
@@ -3064,7 +3123,8 @@ async def verify_otp(body: OTPVerifyBody):
             f"🆕 สมาชิกใหม่! {name} ({phone}) สมัครผ่านเว็บ velacoldbrew.com"
         )
 
-    return {"success": True, "customer": customer}
+    token = _make_customer_token(phone=phone, line_user_id=(customer or {}).get("line_user_id") or "")
+    return {"success": True, "customer": customer, "token": token}
 
 @app.get("/leaderboard")
 async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
@@ -3230,4 +3290,5 @@ async def line_oauth(body: LineOAuthRequest):
             except Exception as e:
                 print(f"[line-oauth] set notify_channel error: {e}")
 
-    return {"success": True, "customer": customer}
+    token = _make_customer_token(phone=(customer or {}).get("phone") or "", line_user_id=profile["userId"])
+    return {"success": True, "customer": customer, "token": token}
