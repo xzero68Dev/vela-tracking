@@ -1340,8 +1340,9 @@ async def customer_by_line(line_user_id: str, x_auth_token: str = Header(default
     res = sb.table("customers").select(_CUSTOMER_PUBLIC_FIELDS).eq("line_user_id", lid).limit(1).execute()
     return {"customer": (res.data[0] if res.data else None)}
 
-def _display_name_taken(sb, name: str, exclude_lid: str = "") -> bool:
+def _display_name_taken(sb, name: str, exclude_lid: str = "", exclude_phone: str = "") -> bool:
     """ชื่อนี้มีคนอื่นใช้แล้วมั้ย (case-insensitive, ยกเว้นตัวเอง)
+    ยกเว้นตัวเองได้ทั้งด้วย line_user_id (ลูกค้า LINE) และเบอร์โทร (ลูกค้า phone-only)
     ป้องกัน wildcard: แปลง %/* (และคง _) เป็น single-char wildcard เพื่อไม่ให้ ilike under-match
     แล้วยืนยัน exact ใน python อีกชั้น กันชื่อที่มี % _ * ไปแมตช์คนอื่นมั่ว"""
     nm = (name or "").strip()
@@ -1349,25 +1350,33 @@ def _display_name_taken(sb, name: str, exclude_lid: str = "") -> bool:
         return False
     like = nm.replace("%", "_").replace("*", "_")   # ทุก wildcard → '_' (แมตช์อักขระเดียวรวมถึงตัวจริง)
     try:
-        rows = sb.table("customers").select("name,line_user_id").ilike("name", like).execute().data or []
+        rows = sb.table("customers").select("name,line_user_id,phone").ilike("name", like).execute().data or []
     except Exception as e:
         print(f"[name-check] error: {e}")
         return False
     tgt = nm.lower()
-    exclude = (exclude_lid or "").strip()
-    return any((r.get("name") or "").strip().lower() == tgt and (r.get("line_user_id") or "") != exclude
+    exclude    = (exclude_lid or "").strip()
+    exclude_ph = (exclude_phone or "").strip()
+    def _is_self(r):
+        if exclude and (r.get("line_user_id") or "").strip() == exclude:
+            return True
+        if exclude_ph and (r.get("phone") or "").strip() == exclude_ph:
+            return True
+        return False
+    return any((r.get("name") or "").strip().lower() == tgt and not _is_self(r)
                for r in rows)
 
 @app.get("/customers/check-name")
-async def customer_check_name(name: str, line_user_id: str = "", x_auth_token: str = Header(default="")):
-    """เช็คชื่อซ้ำ (ยกเว้นตัวเอง) — ตอนแก้โปรไฟล์"""
+async def customer_check_name(name: str, line_user_id: str = "", phone: str = "", x_auth_token: str = Header(default="")):
+    """เช็คชื่อซ้ำ (ยกเว้นตัวเอง) — ตอนแก้โปรไฟล์
+    ยกเว้นตัวเองได้ทั้งด้วย line_user_id หรือเบอร์ (ลูกค้า phone-only)"""
     if not (name or "").strip():
         return {"taken": False}
     sb = get_supabase()
-    return {"taken": _display_name_taken(sb, name, line_user_id)}
+    return {"taken": _display_name_taken(sb, name, line_user_id, _norm_phone(phone or ""))}
 
 class CustomerProfileBody(BaseModel):
-    line_user_id:   str
+    line_user_id:   Optional[str] = None   # optional — ลูกค้า phone-only (login ด้วย OTP) ไม่มี LINE
     display_name:   Optional[str] = None
     picture_url:    Optional[str] = None
     phone:          Optional[str] = None
@@ -1383,21 +1392,35 @@ async def upsert_customer_profile(body: CustomerProfileBody, x_auth_token: str =
     เช็คชื่อซ้ำก่อนตั้ง name — ทำงานด้วย service key ฝั่ง server
     คืน token ใหม่ (ผูกเบอร์ล่าสุด) ให้ frontend เก็บ — เผื่อลูกค้า LINE เพิ่งเพิ่มเบอร์"""
     lid = (body.line_user_id or "").strip()
+    ph  = _norm_phone(body.phone or "")
+    # ต้องระบุอย่างน้อยตัวใดตัวหนึ่งเพื่อชี้ตัวลูกค้า
+    #  - ลูกค้า LINE: มี line_user_id → path เดิม ไม่บังคับ token (ใช้ตอน LIFF auto-login ที่ยังไม่มี token)
+    #  - ลูกค้า phone-only (login ด้วย OTP ไม่มี LINE): ใช้เบอร์ชี้ตัว + ต้องพิสูจน์ token ว่าเป็นเจ้าของเบอร์
+    if not lid and not ph:
+        raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id หรือ เบอร์โทร")
     if not lid:
-        raise HTTPException(status_code=400, detail="ต้องระบุ line_user_id")
-    # ไม่บังคับ token — endpoint นี้ใช้ตอน LIFF auto-login สร้าง/อัปเดตโปรไฟล์ (ยังไม่มี token)
+        _check_customer(x_auth_token, phone=ph)   # บังคับ token เมื่อแก้ด้วยเบอร์ กันคนอื่นแก้โปรไฟล์เรา
     sb = get_supabase()
     nm = (body.name or "").strip()
-    if nm and _display_name_taken(sb, nm, lid):
+    if nm and _display_name_taken(sb, nm, exclude_lid=lid, exclude_phone=ph):
         raise HTTPException(status_code=409, detail="ชื่อนี้มีคนใช้แล้ว กรุณาตั้งชื่ออื่นครับ")
-    data = {"line_user_id": lid, "updated_at": datetime.utcnow().isoformat()}
+    data = {"updated_at": datetime.utcnow().isoformat()}
     for k in ("display_name", "picture_url", "phone", "name", "address", "province", "zip", "notify_channel"):
         v = getattr(body, k)
         if v is not None:
             data[k] = v
-    res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
+    if lid:
+        # ลูกค้า LINE — upsert ด้วย line_user_id (conflict key) เหมือนเดิม
+        data["line_user_id"] = lid
+        res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
+    else:
+        # ลูกค้า phone-only — update row ที่ตรงเบอร์ (guest auto-capture สร้าง row ไว้แล้ว)
+        # ไม่ใช้ upsert เพราะ conflict key ของตารางคือ line_user_id ซึ่งคนกลุ่มนี้เป็น null
+        res = sb.table("customers").update(data).eq("phone", ph).execute()
+        if not res.data:   # เผื่อไม่มี row เดิม → insert ใหม่
+            res = sb.table("customers").insert({**data, "phone": ph}).execute()
     cust = res.data[0] if res.data else None
-    token = _make_customer_token(phone=(cust or {}).get("phone") or "", line_user_id=lid)
+    token = _make_customer_token(phone=(cust or {}).get("phone") or ph, line_user_id=lid)
     return {"customer": cust, "token": token}
 
 
