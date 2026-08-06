@@ -337,8 +337,7 @@ def detect_carrier(barcode: str) -> str:
     if re.match(r'^TH', b):                 return "flash-express"
     if re.match(r'^(SXF|SCPK)', b):        return "kex-express"
     if re.match(r'^(FLE|FEX)', b):         return "flash-express"
-    if re.match(r'^(TDE|JPT|JTTH)', b):    return "jt-express"
-    if re.match(r'^SCG', b):               return "scg-express"
+    # eTrackings ถูกลบออกแล้ว (ไม่ใช้บริการเสียเงินนี้แล้ว) — เลข TDE/JPT/JTTH/SCG จะตกไป thailand_post
     return "thailand_post"
 
 
