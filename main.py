@@ -440,6 +440,14 @@ async def fetch_tracking_batch(barcodes: list) -> list:
     items       = response.get("items", {})
     track_count = response.get("track_count", {})
 
+    # diagnostic: โควตา track รายวัน + ได้ข้อมูลกี่เลขจาก batch นี้
+    # (ถ้าได้ 0 เลข + count ใกล้ limit = โควตาเต็ม | ถ้าบางเลขได้บางเลขไม่ได้ = พัสดุนั้นยังไม่เข้า API)
+    _got = sum(1 for b in barcodes if items.get(b))
+    _empty = [b for b in barcodes if not items.get(b)]
+    print(f"[thaipost-api] เช็ค {len(barcodes)} เลข · ได้ข้อมูล {_got} · "
+          f"track_count={track_count.get('count_number')}/{track_count.get('track_count_limit')}"
+          + (f" · ไม่มีข้อมูล: {_empty}" if _empty else ""))
+
     results = []
     for barcode in barcodes:
         events_raw = items.get(barcode, [])
