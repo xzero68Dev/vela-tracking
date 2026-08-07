@@ -1414,8 +1414,13 @@ async def upsert_customer_profile(body: CustomerProfileBody, x_auth_token: str =
     data = {"updated_at": datetime.utcnow().isoformat()}
     for k in ("display_name", "picture_url", "phone", "name", "address", "province", "zip", "notify_channel"):
         v = getattr(body, k)
-        if v is not None:
-            data[k] = v
+        if v is None:
+            continue
+        # อย่าเขียน phone="" ลง DB — จะชน unique constraint customers_phone_unique
+        # (มีหลาย row ที่ phone ว่าง; เขียน "" ซ้ำ = duplicate key → 500) ลูกค้า LINE ที่ยังไม่มีเบอร์เป็นเคสนี้
+        if k == "phone" and str(v).strip() == "":
+            continue
+        data[k] = v
     if lid:
         # ลูกค้า LINE — upsert ด้วย line_user_id (conflict key) เหมือนเดิม
         data["line_user_id"] = lid
