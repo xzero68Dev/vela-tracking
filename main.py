@@ -537,12 +537,17 @@ async def fetch_spx(barcode: str) -> Optional[dict]:
                 dt = datetime.utcfromtimestamp(int(t) + 7 * 3600).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 dt = ""
+        # SPX คืน current_location เป็น object {location_name, full_address, lng, lat, ...}
+        # ต้องแปลงเป็น string ก่อน ไม่งั้นหน้าเว็บ render object → React error #31 (crash ทั้งหน้า)
+        loc = e.get("current_location") or ""
+        if isinstance(loc, dict):
+            loc = loc.get("location_name") or loc.get("full_address") or ""
         events.append({
             "status_code": str(e.get("tracking_code") or ""),
             "status":      st,
             "description": (e.get("description") or th or "").strip(),
             "datetime":    dt,
-            "location":    e.get("current_location") or "",
+            "location":    str(loc or ""),
         })
     events.reverse()   # records[0]=ล่าสุด → เรียงเก่า→ใหม่ ให้เหมือน carrier อื่น
     latest = events[-1] if events else None
