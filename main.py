@@ -2489,8 +2489,16 @@ async def slip_notify(body: SlipNotifyRequest):
                 "slip_url":    body.slip_url,
                 "slip_status": "pending_review" if slip_error else "pending",
             }).eq("order_id", body.order_id).execute()
-            # 1010 (ธนาคารต้องรอ) → บอกลูกค้าให้ลองใหม่ ไม่ต้องรบกวน admin
+            # 1010 (ธนาคารต้องรอ) → บอกลูกค้าให้ลองใหม่ + แจ้ง admin ด้วย (กันออเดอร์หลุดถ้าลูกค้าไม่แนบซ้ำ)
             if slip_soft and not slip_error:
+                try:
+                    await send_line_notify(ADMIN_LINE_USER_ID,
+                        f"⏳ สลิปรอธนาคารตรวจ (SlipOK 1010) — ลูกค้าจ่ายแล้วแต่ auto-confirm ไม่ได้\n"
+                        f"ชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+                        f"\nOrder: {body.order_id}" + (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+                        f"\nลูกค้าได้รับข้อความให้แนบสลิปใหม่ใน 1-2 นาที — ถ้าไม่แนบซ้ำ โปรดเช็คยอดเข้าบัญชีแล้วยืนยันใน /admin/orders")
+                except Exception as e:
+                    print(f"[SlipOK] 1010 admin-notify error: {e}")
                 return {"success": True, "verified": False, "retry": True, "reason": slip_soft}
             msg = (f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" +
                    (f" ({phone})" if phone else "") +
