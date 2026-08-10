@@ -926,6 +926,18 @@ async def run_cron():
                     print(f"[cron] link → order {sr.data[0]['order_id']} = {order_new_status}")
             except Exception as e:
                 print(f"[cron] link order status error: {e}")
+        # พัสดุเริ่มเคลื่อนไหว (ขนส่ง scan รับพัสดุจริง) → ออเดอร์ที่ยัง "เตรียมจัดส่ง" เลื่อนเป็น "จัดส่งแล้ว"
+        elif status in ("accepted", "in_transit", "out_for_delivery"):
+            try:
+                sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                if sr.data:
+                    oid = sr.data[0]["order_id"]
+                    cur = sb.table("orders").select("status").eq("order_id", oid).execute()
+                    if cur.data and cur.data[0].get("status") == "เตรียมจัดส่ง":
+                        sb.table("orders").update({"status": "จัดส่งแล้ว"}).eq("order_id", oid).execute()
+                        print(f"[cron] link → order {oid} = จัดส่งแล้ว (พัสดุเคลื่อนไหว)")
+            except Exception as e:
+                print(f"[cron] link ship→order status error: {e}")
 
         # แจ้งเตือนถ้าสถานะเปลี่ยน
         # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
@@ -2395,7 +2407,7 @@ async def slip_notify(body: SlipNotifyRequest):
     phone    = order.get("phone", "")
     total    = float(order.get("total") or 0)
 
-    if order.get("status") in ("ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
+    if order.get("status") in ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
         return {"success": True, "verified": False, "reason": "already_paid"}
 
     # กันยิงซ้ำ (1): สลิปใบเดิม (URL เดิม) ที่ตรวจไปแล้ว → คืนผลเดิม ไม่เรียก SlipOK ซ้ำ
@@ -2656,7 +2668,7 @@ async def backfill_points(x_api_key: str = Header(default="")):
     แก้เคสที่ auto-verify แล้วไม่ได้แต้มเพราะบั๊ก _award_points เดิม"""
     check_admin_key(x_api_key)
     sb = get_supabase()
-    PAID = ["ชำระแล้ว", "จัดส่งแล้ว", "จัดส่งสำเร็จ"]
+    PAID = ["ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ"]
     res = sb.table("orders").select("order_id").eq("channel", "web").in_("status", PAID).execute()
     order_ids = [r["order_id"] for r in (res.data or [])]
     processed = 0
@@ -2747,9 +2759,14 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
         "shipping_cost": body.shipping_cost,
     }, on_conflict="tracking").execute()
 
-    # อัปเดตสถานะ order เป็นจัดส่งแล้ว
+    # อัปเดตสถานะ order
+    # ใส่เลขพัสดุจริง → "เตรียมจัดส่ง" (คีเลข/แปะ label แล้ว แต่ขนส่งยังไม่รับพัสดุ)
+    #   cron จะเลื่อนเป็น "จัดส่งแล้ว" อัตโนมัติเมื่อขนส่ง scan รับพัสดุจริง (accepted/in_transit)
+    # ออเดอร์ส่งเอง (ไม่มีเลข/"-") → ข้ามไป "จัดส่งแล้ว" เลย เพราะไม่มีเลขให้ cron ตามความเคลื่อนไหว
+    self_delivery = (not trk) or trk == "-"
+    new_status = "จัดส่งแล้ว" if self_delivery else "เตรียมจัดส่ง"
     sb.table("orders").update({
-        "status":    "จัดส่งแล้ว",
+        "status":    new_status,
         "ship_date": ship_date,
     }).eq("order_id", body.order_id).execute()
 
