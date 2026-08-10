@@ -1717,6 +1717,15 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 _ADMIN_SECRET  = (os.getenv("ADMIN_SECRET") or ADMIN_API_KEY or "").encode()
 ADMIN_TOKEN_TTL = int(os.getenv("ADMIN_TOKEN_TTL", str(8 * 3600)))  # อายุ token (วินาที)
 
+def _hmac_eq(a: str, b: str) -> bool:
+    """เทียบสตริงแบบ constant-time ที่ทนอักขระ non-ASCII
+    (hmac.compare_digest กับ str จะ throw TypeError ถ้ามีอักขระ >127 เช่นพิมพ์ไทยติดมา)
+    encode เป็น bytes ก่อนเทียบ → ผลลัพธ์เป็น "ไม่ตรง" แทนที่จะพัง 500"""
+    try:
+        return hmac.compare_digest((a or "").encode("utf-8"), (b or "").encode("utf-8"))
+    except Exception:
+        return False
+
 def _make_admin_token(exp: int) -> str:
     """สร้าง signed session token: v1.<exp>.<hmac>  (stateless ไม่ต้องเก็บ DB)"""
     msg = f"v1.{exp}".encode()
@@ -1738,14 +1747,14 @@ def _verify_admin_token(tok: str) -> bool:
     if exp < int(time.time()):
         return False
     expected = _make_admin_token(exp)
-    return hmac.compare_digest(tok, expected)
+    return _hmac_eq(tok, expected)
 
 def check_admin_key(request_key: str):
     """ตรวจ admin credential — รับได้ทั้ง signed session token (จากหน้าเว็บ)
     หรือ static ADMIN_API_KEY (server-to-server). fail-closed."""
     if request_key and _verify_admin_token(request_key):
         return
-    if ADMIN_API_KEY and hmac.compare_digest(request_key or "", ADMIN_API_KEY):
+    if ADMIN_API_KEY and _hmac_eq(request_key or "", ADMIN_API_KEY):
         return
     raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -1761,7 +1770,7 @@ def admin_login(body: AdminLoginBody):
         raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า ADMIN_PASSWORD บนเซิร์ฟเวอร์")
     if not _ADMIN_SECRET:
         raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า ADMIN_SECRET/ADMIN_API_KEY บนเซิร์ฟเวอร์")
-    if not hmac.compare_digest(body.password, ADMIN_PASSWORD):
+    if not _hmac_eq(body.password, ADMIN_PASSWORD):
         raise HTTPException(status_code=401, detail="รหัสผ่านไม่ถูกต้อง")
     exp = int(time.time()) + ADMIN_TOKEN_TTL
     return {"token": _make_admin_token(exp), "expires_at": exp}
