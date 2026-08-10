@@ -511,10 +511,13 @@ async def fetch_spx(barcode: str) -> Optional[dict]:
                                   params={"spx_tn": barcode, "language_code": "th"},
                                   headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
+            print(f"[SPX] {barcode} → HTTP {r.status_code} (ตกไป Flash)")
             return None
         j = r.json()
         recs = (((j.get("data") or {}).get("sls_tracking_info") or {}).get("records")) or []
         if not recs:
+            # log เหตุผลที่ไม่มี records — retcode/message ช่วยแยก "ไม่ใช่พัสดุ SPX" vs "โดน rate-limit/บล็อก"
+            print(f"[SPX] {barcode} → ไม่มี records (retcode={j.get('retcode')} msg={j.get('message') or j.get('detail')}) (ตกไป Flash)")
             return None
     except Exception as e:
         print(f"[SPX] error {barcode}: {e}")
@@ -847,7 +850,9 @@ async def run_cron():
                             "latest_event": {"location": res.get("latest_location", ""), "datetime": (res.get("events") or [{}])[-1].get("datetime", "")},
                             "events":       res.get("events", []),
                         })
-                        print(f"[cron] Flash {b} → {res.get('status')}")
+                        _fev = res.get("events") or []
+                        _in_bulk = b in bulk_data
+                        print(f"[cron] Flash {b} → {res.get('status')} · events={len(_fev)} · th={res.get('status_th')} · in_scraper_resp={_in_bulk}")
                 else:
                     print(f"[Flash Scraper] bulk error: HTTP {r.status_code}")
         except Exception as e:
