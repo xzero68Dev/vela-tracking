@@ -531,6 +531,8 @@ async def fetch_spx(barcode: str) -> Optional[dict]:
         low  = name.lower()
         if "return" in low or "ตีกลับ" in name or "ส่งคืน" in name:
             st, th = "returned", "ตีกลับ/ส่งคืนต้นทาง"
+        elif "เสียหาย" in name or "ชำรุด" in name or "คืนเงิน" in name or "damage" in low or "refund" in low:
+            st, th = "problem", (e.get("description") or "พัสดุเสียหาย/คืนเงินผู้ซื้อ")
         elif "fail" in low or "unsuccess" in low or "ไม่สำเร็จ" in name:
             st, th = "problem", "นำจ่ายไม่สำเร็จ"
         dt = ""
@@ -944,6 +946,29 @@ async def run_cron():
             except Exception as e:
                 print(f"[cron] link ship→order status error: {e}")
 
+        # แจ้ง admin ทันทีถ้าพัสดุมีปัญหา (เสียหาย/ตีกลับ/นำจ่ายไม่สำเร็จ) — ยิงเสมอ ไม่ผูกกับ template ลูกค้า
+        # (เดิมบล็อกนี้ซ้อนอยู่ใต้ has_notify ซึ่ง problem/returned = None เลยไม่เคยแจ้งจริง)
+        if status != old_status and status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
+            try:
+                _sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                _oid = _sr.data[0]["order_id"] if _sr.data else ""
+                _cname, _cphone = "", ""
+                if _oid:
+                    _or = sb.table("orders").select("customer,phone").eq("order_id", _oid).execute()
+                    if _or.data:
+                        _cname  = _or.data[0].get("customer") or ""
+                        _cphone = _or.data[0].get("phone") or ""
+                await send_line_notify(ADMIN_LINE_USER_ID,
+                    "⚠️ พัสดุมีปัญหา — โปรดแจ้งลูกค้า\n"
+                    f"ลูกค้า: {_cname}" + (f" ({_cphone})" if _cphone else "") +
+                    (f"\nOrder: {_oid}" if _oid else "") +
+                    f"\nเลขพัสดุ: {barcode}\n"
+                    f"สถานะ: {result.get('status_th') or status}\n"
+                    f"ติดตาม: velacoldbrew.com/track/{barcode}")
+                print(f"[ADMIN] แจ้ง admin (ปัญหา) → {barcode} {status}")
+            except Exception as e:
+                print(f"[ADMIN] alert error {barcode}: {e}")
+
         # แจ้งเตือนถ้าสถานะเปลี่ยน
         # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
         sms_status = status
@@ -995,12 +1020,6 @@ async def run_cron():
                                 print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
                             else:
                                 print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
-
-                        # แจ้ง admin ถ้ามีปัญหา
-                        if status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
-                            admin_msg = f"⚠ VeLA Alert: พัสดุ {barcode} ของ {customer} ({phone}) สถานะ: {status_th or status}"
-                            await send_line_notify(ADMIN_LINE_USER_ID, admin_msg)
-                            print(f"[ADMIN] แจ้ง admin → {barcode} {status}")
 
         if thaipost_barcodes and i + batch_size < len(thaipost_barcodes):
             await asyncio.sleep(1)
