@@ -875,8 +875,12 @@ async def run_cron():
                         print(f"[cron] Flash {b} → {res.get('status')} · events={len(_fev)} · th={res.get('status_th')} · in_scraper_resp={_in_bulk}")
                 else:
                     print(f"[Flash Scraper] bulk error: HTTP {r.status_code}")
+                    for b in batch:   # scraper ล่ม → คงเลขไว้เป็น pending (ไม่ทิ้ง) ให้ SPX fallback ลองต่อ + ไม่ทับข้อมูลเดิม
+                        all_results.append({"barcode": b, "status": "pending", "status_th": "รอข้อมูล", "latest_event": {}, "events": []})
         except Exception as e:
             print(f"[Flash Scraper] bulk error batch {i}: {e}")
+            for b in batch:
+                all_results.append({"barcode": b, "status": "pending", "status_th": "รอข้อมูล", "latest_event": {}, "events": []})
 
     # เช็ค J&T/อื่นๆ ผ่าน eTrackings
     for b in etracking_barcodes:
