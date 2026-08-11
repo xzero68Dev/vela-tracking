@@ -1071,15 +1071,21 @@ async def health():
 
 
 @app.get("/products")
-async def get_products():
-    """ดึงสินค้าทั้งหมด พร้อมราคาหลังลด"""
+async def get_products(show_all: bool = False):
+    """ดึงสินค้า พร้อมราคาหลังลด
+    - ปกติ (หน้าเว็บลูกค้า): เฉพาะ active=True (สินค้าหมดก็ยังส่งมาด้วย เพื่อโชว์ว่า 'หมด')
+    - show_all=1 (หน้า admin): ส่งทุกตัวรวมที่ปิดขายแล้ว เพื่อให้กดเปิดกลับได้"""
     sb = get_supabase()
-    res = sb.table("products").select("*").eq("active", True).order("sort_order").execute()
+    q = sb.table("products").select("*")
+    if not show_all:
+        q = q.eq("active", True)
+    res = q.order("sort_order").execute()
     products = []
     for p in (res.data or []):
         price      = int(p.get("price") or 0)
         disc_pct   = int(p.get("discount_pct") or 0)
         disc_price = round(price * (1 - disc_pct / 100))
+        _instock   = p.get("in_stock")
         products.append({
             **p,
             "price":          price,
@@ -1087,6 +1093,7 @@ async def get_products():
             "price_discounted": disc_price,
             "discount_pct":   disc_pct,
             "discount_amount": price - disc_price,
+            "in_stock":       True if _instock is None else bool(_instock),   # ไม่มีค่า = ถือว่ามีของ
         })
     return {"products": products}
 
@@ -1506,7 +1513,7 @@ async def update_product(product_id: int, body: dict, x_api_key: str = Header(de
     """Admin — อัปเดตราคา/รายละเอียดสินค้า"""
     check_admin_key(x_api_key)
     sb = get_supabase()
-    allowed = {"name", "description", "flavor", "roast", "process", "price", "discount_pct", "image_url", "active"}
+    allowed = {"name", "description", "flavor", "roast", "process", "price", "discount_pct", "image_url", "active", "in_stock", "sort_order"}
     update_data = {k: v for k, v in body.items() if k in allowed}
     if not update_data:
         raise HTTPException(status_code=400, detail="no valid fields")
@@ -2200,6 +2207,22 @@ def _costs_from_sku_string(sku_str: str):
 async def create_order(body: CreateOrderRequest):
     """สร้าง order จากหน้าเว็บ — ยังไม่ให้ point ตรงนี้ ต้องรอยืนยันการชำระเงินก่อน (ดู /admin/confirm-payment)"""
     sb = get_supabase()
+
+    # กันสั่งสินค้าที่ปิดขาย (active=False) หรือหมด (in_stock=False) — เผื่อ cart ค้างจากตอนยังมีของ
+    try:
+        _ps = sb.table("products").select("sku,active,in_stock").execute()
+        _pmap = {(p.get("sku") or "").upper(): p for p in (_ps.data or [])}
+        _bad = []
+        for i in body.items:
+            pr = _pmap.get((i.sku or "").upper())
+            if pr is not None and (pr.get("active") is False or pr.get("in_stock") is False):
+                _bad.append(i.name or i.sku)
+        if _bad:
+            raise HTTPException(status_code=409, detail=f"สินค้าหมดหรือปิดขาย: {', '.join(_bad)} — กรุณานำออกจากตะกร้า")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[orders/create] stock check error: {e}")
 
     # sku: ใช้ชื่อสินค้า (แสดงให้ลูกค้า/admin อ่านง่าย)
     sku_str = ", ".join([f"{i.name} x{i.qty}" for i in body.items])
