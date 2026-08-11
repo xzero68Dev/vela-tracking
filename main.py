@@ -596,12 +596,12 @@ async def fetch_tracking(barcode: str) -> dict:
         # ไม่มี fallback — ถ้า scraper ไม่ได้ผล return unknown
         return {"barcode": barcode, "status": "unknown", "status_th": "ไม่พบข้อมูล", "events": []}
     elif carrier == "flash-express":
-        # เลข TH ใช้ร่วมกันทั้ง SPX (Shopee Xpress) และ Flash → ลอง SPX ก่อน (เร็ว ไม่ต้อง scraper)
-        # ถ้าไม่ใช่ SPX (คืน None) ค่อย fallback ไป Flash scraper เดิม
+        # เลข TH ใช้ร่วมกันทั้ง SPX (Shopee Xpress) และ Flash → ลอง SPX open API ก่อน (เร็ว)
         spx = await fetch_spx(barcode)
         if spx:
             return spx
-        # Flash (Shopee-managed) — ใช้ scraper เดียวกับ KEX (headless เปิดหน้า Flash ผ่าน 5 Second Shield)
+        # Flash (Shopee-managed) — scraper เดียวกับ KEX (headless เปิดหน้า Flash ผ่าน 5 Second Shield)
+        flash_data = None
         if KEX_SCRAPER_URL:
             try:
                 async with httpx.AsyncClient(timeout=75) as client:
@@ -611,12 +611,30 @@ async def fetch_tracking(barcode: str) -> dict:
                     )
                     if r.status_code == 200:
                         data = r.json()
-                        # รับผลถ้าไม่ใช่ error/unknown (pending = ยังไม่เข้าระบบ ก็คืนได้)
-                        if data.get("status") not in ("error", "unknown", None):
+                        # Flash มี event จริง → คืนเลย (พัสดุ Flash ปกติ)
+                        if data.get("events") and data.get("status") not in ("error", "unknown", None):
                             return data
+                        flash_data = data   # pending/ไม่มี event — เก็บไว้ก่อน ลอง SPX scraper ต่อ
             except Exception as e:
                 print(f"[Flash Scraper] error {barcode}: {e}")
-        # scraper ล่ม/ยังไม่ได้ตั้ง → placeholder ไม่ให้ระบบพัง
+        # Flash ไม่มี event → อาจเป็นพัสดุ SPX 3PL (open API ไม่คืน แต่หน้าเว็บ SPX มี)
+        # ลอง SPX scraper (headless เปิด spx.co.th/track ดัก fleet_order/tracking/search)
+        if KEX_SCRAPER_URL:
+            try:
+                async with httpx.AsyncClient(timeout=90) as client:
+                    r = await client.get(
+                        f"{KEX_SCRAPER_URL}/track-spx/{barcode}",
+                        headers={"x-api-key": KEX_SCRAPER_KEY},
+                    )
+                    if r.status_code == 200:
+                        sdata = r.json()
+                        if sdata.get("events"):
+                            return sdata
+            except Exception as e:
+                print(f"[SPX Scraper] error {barcode}: {e}")
+        # ทั้ง SPX และ Flash ไม่มี event → คืนผล Flash (pending) ถ้ามี ไม่งั้น placeholder
+        if flash_data and flash_data.get("status") not in ("error", "unknown", None):
+            return flash_data
         return {"barcode": barcode, "status": "shopee_managed",
                 "status_th": "จัดส่งโดย Flash Express (Shopee) — ติดตามในแอป Shopee",
                 "events": []}
@@ -899,6 +917,36 @@ async def run_cron():
                     continue
 
         all_results.extend(results)
+
+    # SPX 3PL fallback — พัสดุ TH ที่ยังค้าง pending/ไม่มี event (open API SPX ไม่เจอ + Flash ไม่มีข้อมูล)
+    # ลองดึงจากหน้าเว็บ SPX ผ่าน scraper (headless ดัก fleet_order/tracking/search) — ครอบคลุมพัสดุ 3PL
+    if KEX_SCRAPER_URL:
+        _spx_retry = [str(r.get("barcode", "")).upper() for r in all_results
+                      if str(r.get("barcode", "")).upper().startswith("TH")
+                      and not r.get("events")
+                      and r.get("status") in ("pending", "unknown", "shopee_managed", None)]
+        if _spx_retry:
+            print(f"[cron] SPX scraper fallback: {len(_spx_retry)} เลข → {', '.join(_spx_retry)}")
+            try:
+                async with httpx.AsyncClient(timeout=240) as client:
+                    rr = await client.post(f"{KEX_SCRAPER_URL}/track-spx/bulk",
+                                           headers={"x-api-key": KEX_SCRAPER_KEY},
+                                           json={"tns": _spx_retry})
+                if rr.status_code == 200:
+                    sdata = rr.json().get("results", {})
+                    for r in all_results:
+                        b = str(r.get("barcode", "")).upper()
+                        sres = sdata.get(b)
+                        if sres and sres.get("events"):
+                            r["status"]       = sres.get("status", r.get("status"))
+                            r["status_th"]    = sres.get("status_th", r.get("status_th"))
+                            _ev = sres.get("events") or []
+                            r["latest_event"] = {"location": sres.get("latest_location", ""),
+                                                 "datetime": (_ev[-1] if _ev else {}).get("datetime", "")}
+                            r["events"]       = _ev
+                            print(f"[cron] SPX-scraper {b} → {r['status']} ({len(_ev)} events)")
+            except Exception as e:
+                print(f"[cron] SPX scraper error: {e}")
 
     # process ทุก results รวมกัน (Thailand Post + eTrackings)
     for result in all_results:
