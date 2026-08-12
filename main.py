@@ -2554,7 +2554,11 @@ async def slip_notify(body: SlipNotifyRequest):
                         elif err_code == 1010:
                             slip_error = None   # ไม่ตีเป็น rejected
                             slip_soft  = "ธนาคารนี้ต้องรอตรวจสอบสักครู่ กรุณาลองแนบสลิปใหม่อีกครั้งใน 1-2 นาที"
-                        else:                  slip_error = rdata.get("message", "ตรวจสอบสลิปไม่สำเร็จ")
+                        else:
+                            _msg = (rdata.get("message") or "").strip()
+                            slip_error = _msg or f"อ่านสลิปอัตโนมัติไม่ได้ (code={err_code}) — โปรดตรวจเอง"
+                            if not _msg:   # เคส err=- ที่ไม่มีเหตุผล → log response ดิบไว้ดูว่า SlipOK ตอบอะไรจริง
+                                print(f"[SlipOK] {body.order_id} raw={str(rdata)[:400]}")
                     print(f"[SlipOK] {body.order_id} → {'✓ verified' if slip_verified else '✗ manual'} "
                           f"slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'} err={slip_error or '-'}")
             except Exception as e:
