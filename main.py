@@ -2534,21 +2534,28 @@ async def slip_notify(body: SlipNotifyRequest):
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
                     # ไม่ส่ง amount ตายตัว → กัน 1013 จากยอดลด 50%/ปัดเศษไม่ตรงเป๊ะ
-                    # SlipOK ยังเช็คให้ว่าเป็นสลิปจริง + เข้าบัญชีร้าน (1014) + ไม่ซ้ำ (1010)
-                    r = await client.post(
-                        SLIPOK_API_URL,
-                        headers={"x-authorization": SLIPOK_API_KEY},
-                        data={"url": body.slip_url, "log": "true"},
-                    )
-                    rdata = r.json()
-                    if rdata.get("success"):
-                        slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
-                        slip_ref      = rdata.get("data", {}).get("transRef", "")
-                        slip_verified = True   # สลิปจริง + เข้าบัญชีร้าน + ไม่ซ้ำ → ยืนยันเลย (เตือน admin ถ้ายอดต่าง)
-                    else:
+                    # SlipOK ยังเช็คให้ว่าเป็นสลิปจริง + เข้าบัญชีร้าน (1014) + ไม่ซ้ำ (1012)
+                    # 1010 = ธนาคารกำลังตรวจ (ยังไม่พร้อม) → ลองซ้ำเองอัตโนมัติสูงสุด 3 ครั้ง (หน่วง 8 วิ)
+                    #        ลูกค้าไม่ต้องแนบสลิปใหม่ — ส่วนใหญ่ 1010 เคลียร์ในไม่กี่วินาที
+                    for _attempt in range(3):
+                        r = await client.post(
+                            SLIPOK_API_URL,
+                            headers={"x-authorization": SLIPOK_API_KEY},
+                            data={"url": body.slip_url, "log": "true"},
+                        )
+                        rdata = r.json()
+                        if rdata.get("success"):
+                            slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
+                            slip_ref      = rdata.get("data", {}).get("transRef", "")
+                            slip_verified = True   # สลิปจริง + เข้าบัญชีร้าน + ไม่ซ้ำ → ยืนยันเลย (เตือน admin ถ้ายอดต่าง)
+                            break
                         err_code = rdata.get("code", 0)
-                        # โค้ด SlipOK จริง: 1012=สลิปซ้ำ, 1013=ยอดไม่ตรง, 1014=บัญชีผู้รับไม่ตรงบัญชีหลักร้าน,
-                        # 1010=สลิปธนาคารนี้ต้องรอตรวจสอบสักครู่ (ไม่ใช่ error ถาวร — ให้ลูกค้าลองใหม่)
+                        if err_code == 1010 and _attempt < 2:
+                            print(f"[SlipOK] {body.order_id} 1010 (ธนาคารกำลังตรวจ) → ลองใหม่อัตโนมัติ #{_attempt+1} ใน 8 วิ")
+                            await asyncio.sleep(8)
+                            continue
+                        # error อื่น หรือ 1010 หลังลองครบแล้ว → จบการวน
+                        # โค้ด SlipOK จริง: 1012=สลิปซ้ำ, 1013=ยอดไม่ตรง, 1014=บัญชีผู้รับไม่ตรงบัญชีหลักร้าน, 1010=ธนาคารกำลังตรวจ
                         if err_code == 1014:   slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีหลักของร้าน"
                         elif err_code == 1012: slip_error = "สลิปซ้ำ (เคยส่งเข้ามาแล้ว) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
                         elif err_code == 1010:
@@ -2559,6 +2566,7 @@ async def slip_notify(body: SlipNotifyRequest):
                             slip_error = _msg or f"อ่านสลิปอัตโนมัติไม่ได้ (code={err_code}) — โปรดตรวจเอง"
                             if not _msg:   # เคส err=- ที่ไม่มีเหตุผล → log response ดิบไว้ดูว่า SlipOK ตอบอะไรจริง
                                 print(f"[SlipOK] {body.order_id} raw={str(rdata)[:400]}")
+                        break
                     print(f"[SlipOK] {body.order_id} → {'✓ verified' if slip_verified else '✗ manual'} "
                           f"slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'} err={slip_error or '-'}")
             except Exception as e:
