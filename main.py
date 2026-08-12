@@ -753,7 +753,7 @@ async def run_cron():
         print(f"[cron] expire error: {e}")
 
     rows = sb.table("shipments").select("barcode").eq("is_done", False).execute()
-    barcodes = [r["barcode"] for r in (rows.data or [])]
+    barcodes = [r["barcode"] for r in (rows.data or []) if r.get("barcode") and str(r["barcode"]).strip()]
     print(f"[cron] พบ {len(barcodes)} รายการที่ต้องเช็ค")
 
     # แยก barcode ตามขนส่ง
@@ -2888,13 +2888,12 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
         except Exception as e:
             print(f"[add-shipping] accounting update error: {e}")
 
-    # เพิ่มลง shipments (tracking system) ถ้ายังไม่มี
-    existing = sb.table("shipments").select("barcode").eq("barcode", body.tracking.strip().upper()).execute()
-    if not existing.data:
-        sb.table("shipments").insert({
-            "barcode":  body.tracking.strip().upper(),
-            "status":   "pending",
-        }).execute()
+    # เพิ่มลง shipments (ระบบติดตาม) — เฉพาะพัสดุที่มีเลข tracking จริงเท่านั้น
+    # ออเดอร์ส่งเอง (ไม่มีเลข/"-") ไม่ต้องเข้าระบบติดตาม ไม่งั้นจะค้างเป็น barcode ว่างให้ cron เช็คทุกวัน
+    if not self_delivery:
+        existing = sb.table("shipments").select("barcode").eq("barcode", trk).execute()
+        if not existing.data:
+            sb.table("shipments").insert({"barcode": trk, "status": "pending"}).execute()
 
     # หมายเหตุ (28/07): ไม่ยิงแจ้ง "จัดส่งแล้ว" ตรงนี้อีกต่อไป
     # เพราะตอนคีเลขเข้า ShipSmile ของยังไม่ออกจริง → ลูกค้าจะได้ SMS เร็วไป
