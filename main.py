@@ -2020,6 +2020,26 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
 
     # กรองเฉพาะ row ที่มี order_id จริงๆ
     shipping_rows = [r for r in shipping_rows if r.get("order_id") and r["order_id"].strip()]
+
+    # กัน FK error (23503): shipping.order_id ต้องมีอยู่จริงในตาราง orders
+    # order_id ที่ valid = ออเดอร์ที่เพิ่ง import รอบนี้ + ที่มีอยู่แล้วใน DB
+    valid_oids = {row["order_id"] for row in order_rows if row.get("order_id")}
+    ship_oids  = list({r["order_id"] for r in shipping_rows})
+    missing    = [o for o in ship_oids if o not in valid_oids]
+    for i in range(0, len(missing), 100):
+        chunk = missing[i:i+100]
+        try:
+            res = sb.table("orders").select("order_id").in_("order_id", chunk).execute()
+            for row in (res.data or []):
+                valid_oids.add(row["order_id"])
+        except Exception as e:
+            print(f"[shipping] เช็ค order_id ใน DB ไม่ได้: {e}")
+    skipped_ship  = [r["order_id"] for r in shipping_rows if r["order_id"] not in valid_oids]
+    shipping_rows = [r for r in shipping_rows if r["order_id"] in valid_oids]
+    if skipped_ship:
+        stats["shipping_skipped"] = skipped_ship
+        print(f"[shipping] ข้าม {len(skipped_ship)} แถว — order_id ไม่มีในตาราง orders: {skipped_ship}")
+
     for i in range(0, len(shipping_rows), 50):
         sb.table("shipping").upsert(shipping_rows[i:i+50], on_conflict="tracking", ignore_duplicates=True).execute()
     stats["shipping"] = len(shipping_rows)
