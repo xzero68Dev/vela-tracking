@@ -1508,8 +1508,11 @@ def _receipt_resolve_prices(sb, items):
             out.append({**it, "unit_price": price, "amount": round(price * it["qty"], 2)})
     return out, all_ok
 
-def _build_receipt_for_order(sb, order: dict, ov: "ReceiptRequest|None"):
-    """ประกอบ PDF ใบเสร็จจาก order (+ override ถ้ามี) — คืน bytes หรือ None ถ้าไม่มียอด"""
+SITE_URL = "https://velacoldbrew.com"
+
+def _receipt_context(sb, order: dict, ov: "ReceiptRequest|None"):
+    """คำนวณข้อมูลใบเสร็จ (รายการ/ยอด/ลูกค้า) → dict พร้อมสร้าง PDF · คืน None ถ้าไม่มียอด
+    dict นี้ JSON-serializable → เก็บลง receipts.data เพื่อสร้างลิงก์ถาวรได้"""
     order_id = order.get("order_id") or ""
 
     # ---- รายการสินค้า ----
@@ -1563,18 +1566,45 @@ def _build_receipt_for_order(sb, order: dict, ov: "ReceiptRequest|None"):
         "phone":    pick(ov.phone         if ov else None, order.get("phone")),
     }
 
-    return build_receipt_pdf(
-        shop=SHOP_INFO,
-        receipt_no=f"RE-{order_id}",
-        date_str=(ov.date if (ov and ov.date) else _receipt_fmt_date(order.get("order_date"))),
-        order_id=order_id,
-        channel_label=(ov.channel_label if (ov and ov.channel_label)
-                       else _receipt_channel_label(order.get("channel"))),
-        status_label="ชำระเงินแล้ว",
-        customer=cust, items=items,
-        subtotal=subtotal, discount=discount, shipping_fee=shipping_fee,
-        total=total, show_prices=show_prices,
-    )
+    return {
+        "receipt_no":    f"RE-{order_id}",
+        "date_str":      (ov.date if (ov and ov.date) else _receipt_fmt_date(order.get("order_date"))),
+        "order_id":      order_id,
+        "channel_label": (ov.channel_label if (ov and ov.channel_label)
+                          else _receipt_channel_label(order.get("channel"))),
+        "status_label":  "ชำระเงินแล้ว",
+        "customer":      cust, "items": items,
+        "subtotal":      subtotal, "discount": discount, "shipping_fee": shipping_fee,
+        "total":         total, "show_prices": show_prices,
+    }
+
+def _pdf_from_context(ctx: dict) -> bytes:
+    return build_receipt_pdf(shop=SHOP_INFO, note="", **ctx)
+
+def _build_receipt_for_order(sb, order: dict, ov: "ReceiptRequest|None"):
+    """คืน PDF bytes (หรือ None ถ้าไม่มียอด) — ทางลัดสำหรับ endpoint ที่ไม่ต้องเก็บลิงก์"""
+    ctx = _receipt_context(sb, order, ov)
+    return _pdf_from_context(ctx) if ctx else None
+
+def _save_receipt(sb, order_id: str, channel: str, ctx: dict) -> str:
+    """บันทึกใบเสร็จลงตาราง receipts → คืน token (คงเดิมถ้าออเดอร์นี้เคยออกแล้ว)"""
+    import secrets
+    token = None
+    try:
+        ex = sb.table("receipts").select("token").eq("order_id", order_id).limit(1).execute().data
+        if ex:
+            token = ex[0]["token"]
+    except Exception:
+        pass
+    if not token:
+        token = secrets.token_urlsafe(9)
+    try:
+        sb.table("receipts").upsert(
+            {"token": token, "order_id": order_id, "channel": channel or "", "data": ctx},
+            on_conflict="token").execute()
+    except Exception as e:
+        print(f"[receipt] บันทึกไม่สำเร็จ: {e}")
+    return token
 
 def _receipt_response(pdf: bytes, order_id: str) -> Response:
     return Response(content=pdf, media_type="application/pdf",
@@ -1582,7 +1612,7 @@ def _receipt_response(pdf: bytes, order_id: str) -> Response:
 
 @app.get("/admin/receipt/{order_id}")
 async def admin_receipt(order_id: str, x_api_key: str = Header(default="")):
-    """ออกใบเสร็จอัตโนมัติจากข้อมูลใน DB (ใช้ได้กับออเดอร์เว็บที่มียอด)"""
+    """พรีวิว PDF ใบเสร็จอัตโนมัติจาก DB (ไม่บันทึกลิงก์) — ออเดอร์เว็บที่มียอด"""
     check_admin_key(x_api_key)
     sb = get_supabase()
     res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", order_id.strip()).limit(1).execute()
@@ -1596,15 +1626,23 @@ async def admin_receipt(order_id: str, x_api_key: str = Header(default="")):
 
 @app.post("/admin/receipt/{order_id}")
 async def admin_receipt_custom(order_id: str, body: ReceiptRequest, x_api_key: str = Header(default="")):
-    """ออกใบเสร็จโดยระบุยอด/รายการเอง (สำหรับ Shopee หรือแก้ไขก่อนออก)"""
+    """ออกใบเสร็จ + บันทึกเพื่อสร้าง 'ลิงก์ถาวรให้ลูกค้า' — คืน JSON {token, receipt_url, pdf_url}
+    รองรับทั้งเว็บ (auto) และ Shopee (ระบุยอด/รายการเอง)"""
     check_admin_key(x_api_key)
+    oid = order_id.strip()
     sb = get_supabase()
-    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", order_id.strip()).limit(1).execute()
-    order = res.data[0] if res.data else {"order_id": order_id.strip(), "sku": "", "channel": ""}
-    pdf = _build_receipt_for_order(sb, order, body)
-    if pdf is None:
+    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", oid).limit(1).execute()
+    order = res.data[0] if res.data else {"order_id": oid, "sku": "", "channel": ""}
+    ctx = _receipt_context(sb, order, body)
+    if ctx is None:
         raise HTTPException(status_code=422, detail="กรุณาระบุยอดเงิน (total)")
-    return _receipt_response(pdf, order_id.strip())
+    _pdf_from_context(ctx)  # validate ว่าสร้าง PDF ได้
+    token = _save_receipt(sb, oid, order.get("channel") or (body.channel_label or ""), ctx)
+    return {
+        "ok": True, "token": token,
+        "receipt_url": f"{SITE_URL}/receipt/{token}",   # หน้าเว็บแบรนด์ (ส่งให้ลูกค้า)
+        "pdf_url":     f"/receipt/{token}/pdf",           # ไฟล์ PDF (frontend เติม API base)
+    }
 
 @app.get("/my/receipt/{order_id}")
 async def my_receipt(order_id: str, phone: str, x_auth_token: str = Header(default="")):
@@ -1624,6 +1662,33 @@ async def my_receipt(order_id: str, phone: str, x_auth_token: str = Header(defau
     if pdf is None:
         raise HTTPException(status_code=422, detail="ออเดอร์นี้ยังไม่มียอดชำระในระบบ")
     return _receipt_response(pdf, order_id.strip())
+
+@app.get("/receipt/{token}/pdf")
+async def public_receipt_pdf(token: str):
+    """ดาวน์โหลด PDF ใบเสร็จจาก token (public — token เป็นความลับที่เดาไม่ได้)"""
+    sb = get_supabase()
+    r = sb.table("receipts").select("data,order_id").eq("token", token.strip()).limit(1).execute().data
+    if not r:
+        raise HTTPException(status_code=404, detail="ไม่พบใบเสร็จ")
+    pdf = _pdf_from_context(r[0]["data"])
+    return _receipt_response(pdf, r[0].get("order_id") or token.strip())
+
+@app.get("/receipt/{token}")
+async def public_receipt_info(token: str):
+    """ข้อมูลย่อของใบเสร็จ (ให้หน้าเว็บแบรนด์แสดง) — ไม่รวมที่อยู่/เบอร์"""
+    sb = get_supabase()
+    r = sb.table("receipts").select("data,order_id,created_at").eq("token", token.strip()).limit(1).execute().data
+    if not r:
+        raise HTTPException(status_code=404, detail="ไม่พบใบเสร็จ")
+    d = r[0].get("data") or {}
+    return {
+        "receipt_no": d.get("receipt_no"),
+        "date_str":   d.get("date_str"),
+        "total":      d.get("total"),
+        "order_id":   r[0].get("order_id"),
+        "customer_name": (d.get("customer") or {}).get("name"),
+        "shop":       SHOP_INFO,
+    }
 
 _CUSTOMER_PUBLIC_FIELDS = ("id,line_user_id,display_name,picture_url,phone,name,"
                            "address,province,zip,notify_channel")
