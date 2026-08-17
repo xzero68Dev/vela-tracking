@@ -11,3 +11,4 @@ python-multipart==0.0.12
 promptpay
 qrcode[pil]
 anthropic
+reportlab==4.4.10

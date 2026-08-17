@@ -8,7 +8,9 @@ from datetime import datetime, timedelta, date
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
+from receipt import build_receipt_pdf
 from supabase import create_client, Client
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -1425,6 +1427,203 @@ async def my_order(order_id: str):
     if not res.data:
         raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
     return {"order": res.data[0]}
+
+# ============================================================
+#  ใบเสร็จรับเงิน (PDF) — ไม่มี VAT · รองรับ WEB (auto) + Shopee (พิมพ์ยอดเอง)
+# ============================================================
+SHOP_INFO = {
+    "name":    "VeLA Cold Brew",
+    "address": "143/32 หมู่บ้านสามกองปาร์ค หมู่5 ถ.ประชาสามัคคี ต.รัษฎา อ.เมืองภูเก็ต 83000",
+    "phone":   "0906980460",
+}
+
+class ReceiptItemIn(BaseModel):
+    name: str
+    qty: int = 1
+    unit_price: Optional[float] = None
+
+class ReceiptRequest(BaseModel):
+    customer_name: Optional[str] = None
+    address:       Optional[str] = None
+    province:      Optional[str] = None
+    zip:           Optional[str] = None
+    phone:         Optional[str] = None
+    items:         Optional[list[ReceiptItemIn]] = None
+    total:         Optional[float] = None
+    date:          Optional[str] = None          # dd/mm/yyyy (override)
+    channel_label: Optional[str] = None
+
+def _receipt_fmt_date(d) -> str:
+    """order_date (YYYY-MM-DD / datetime) → dd/mm/yyyy; ว่าง → วันนี้"""
+    try:
+        if not d:
+            return datetime.now().strftime("%d/%m/%Y")
+        s = str(d)[:10]
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return datetime.now().strftime("%d/%m/%Y")
+
+def _receipt_channel_label(ch: str) -> str:
+    c = (ch or "").strip().lower()
+    if c == "web":
+        return "เว็บไซต์ (velacoldbrew.com)"
+    if "shopee" in c or c == "":
+        return "Shopee (velacafe)"
+    return ch
+
+def _receipt_parse_items(sku_str: str):
+    """แยก 'ชื่อสินค้า x2, ชื่ออื่น x1' → [{name, qty}]"""
+    out = []
+    for part in re.split(r'[,\n]+', str(sku_str or "")):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.search(r'(?:x|X|×|\*)\s*(\d+)\s*$', part)
+        if m:
+            qty = int(m.group(1))
+            name = part[:m.start()].strip()
+        else:
+            qty, name = 1, part
+        out.append({"name": name or part, "qty": qty})
+    return out
+
+def _receipt_resolve_prices(sb, items):
+    """เติมราคา/หน่วยจากตาราง products (match ด้วยชื่อ) — คืน (items, all_resolved)"""
+    try:
+        prods = sb.table("products").select("name,price").execute().data or []
+    except Exception:
+        prods = []
+    pmap = {}
+    for p in prods:
+        nm = (p.get("name") or "").strip().lower()
+        if nm:
+            pmap[nm] = float(p.get("price") or 0)
+    out, all_ok = [], True
+    for it in items:
+        price = pmap.get((it.get("name") or "").strip().lower())
+        if price is None:
+            all_ok = False
+            out.append({**it, "unit_price": None, "amount": None})
+        else:
+            out.append({**it, "unit_price": price, "amount": round(price * it["qty"], 2)})
+    return out, all_ok
+
+def _build_receipt_for_order(sb, order: dict, ov: "ReceiptRequest|None"):
+    """ประกอบ PDF ใบเสร็จจาก order (+ override ถ้ามี) — คืน bytes หรือ None ถ้าไม่มียอด"""
+    order_id = order.get("order_id") or ""
+
+    # ---- รายการสินค้า ----
+    if ov and ov.items:
+        items = [{"name": i.name, "qty": i.qty, "unit_price": i.unit_price,
+                  "amount": (round((i.unit_price or 0) * i.qty, 2) if i.unit_price is not None else None)}
+                 for i in ov.items]
+        all_ok = all(i["unit_price"] is not None for i in items)
+    else:
+        items, all_ok = _receipt_resolve_prices(sb, _receipt_parse_items(order.get("sku")))
+
+    # ---- ยอดเงิน ----
+    total = None
+    if ov and ov.total is not None:
+        total = float(ov.total)
+    else:
+        total = order.get("total")
+        if total is None:
+            try:
+                a = (sb.table("accounting").select("revenue")
+                     .eq("order_id", order_id).limit(1).execute().data)
+                if a and a[0].get("revenue") is not None:
+                    total = float(a[0]["revenue"])
+            except Exception:
+                pass
+    if total is None:
+        return None
+    total = float(total)
+
+    # ---- reconcile ราคา ↔ ยอดจริง ----
+    subtotal = discount = shipping_fee = None
+    show_prices = False
+    if all_ok and items:
+        subtotal = round(sum(i["amount"] for i in items), 2)
+        show_prices = True
+        if abs(subtotal - total) < 0.5:
+            subtotal = total
+        elif subtotal > total:
+            discount = round(subtotal - total, 2)
+        else:
+            shipping_fee = round(total - subtotal, 2)
+
+    # ---- ข้อมูลลูกค้า ----
+    def pick(ov_val, order_val):
+        return (ov_val if (ov_val is not None and str(ov_val) != "") else order_val) or ""
+    cust = {
+        "name":     pick(ov.customer_name if ov else None, order.get("customer")),
+        "address":  pick(ov.address       if ov else None, order.get("full_address")),
+        "province": pick(ov.province      if ov else None, order.get("province")),
+        "zip":      pick(ov.zip           if ov else None, order.get("zip")),
+        "phone":    pick(ov.phone         if ov else None, order.get("phone")),
+    }
+
+    return build_receipt_pdf(
+        shop=SHOP_INFO,
+        receipt_no=f"RE-{order_id}",
+        date_str=(ov.date if (ov and ov.date) else _receipt_fmt_date(order.get("order_date"))),
+        order_id=order_id,
+        channel_label=(ov.channel_label if (ov and ov.channel_label)
+                       else _receipt_channel_label(order.get("channel"))),
+        status_label="ชำระเงินแล้ว",
+        customer=cust, items=items,
+        subtotal=subtotal, discount=discount, shipping_fee=shipping_fee,
+        total=total, show_prices=show_prices,
+    )
+
+def _receipt_response(pdf: bytes, order_id: str) -> Response:
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="receipt-{order_id}.pdf"'})
+
+@app.get("/admin/receipt/{order_id}")
+async def admin_receipt(order_id: str, x_api_key: str = Header(default="")):
+    """ออกใบเสร็จอัตโนมัติจากข้อมูลใน DB (ใช้ได้กับออเดอร์เว็บที่มียอด)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", order_id.strip()).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
+    pdf = _build_receipt_for_order(sb, res.data[0], None)
+    if pdf is None:
+        raise HTTPException(status_code=422,
+            detail="ออเดอร์นี้ไม่มียอดชำระในระบบ (เช่น Shopee) — โปรดระบุยอดผ่านฟอร์มออกใบเสร็จ")
+    return _receipt_response(pdf, order_id.strip())
+
+@app.post("/admin/receipt/{order_id}")
+async def admin_receipt_custom(order_id: str, body: ReceiptRequest, x_api_key: str = Header(default="")):
+    """ออกใบเสร็จโดยระบุยอด/รายการเอง (สำหรับ Shopee หรือแก้ไขก่อนออก)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", order_id.strip()).limit(1).execute()
+    order = res.data[0] if res.data else {"order_id": order_id.strip(), "sku": "", "channel": ""}
+    pdf = _build_receipt_for_order(sb, order, body)
+    if pdf is None:
+        raise HTTPException(status_code=422, detail="กรุณาระบุยอดเงิน (total)")
+    return _receipt_response(pdf, order_id.strip())
+
+@app.get("/my/receipt/{order_id}")
+async def my_receipt(order_id: str, phone: str, x_auth_token: str = Header(default="")):
+    """ลูกค้าโหลดใบเสร็จของออเดอร์ตัวเอง (เฉพาะออเดอร์ที่มียอดในระบบ = เว็บ)"""
+    ph = (phone or "").strip()
+    if not ph:
+        raise HTTPException(status_code=400, detail="ต้องระบุ phone")
+    _check_customer(x_auth_token, phone=ph)
+    sb = get_supabase()
+    res = sb.table("orders").select(_ADMIN_ORDER_FIELDS).eq("order_id", order_id.strip()).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์")
+    order = res.data[0]
+    if (order.get("phone") or "").strip() != ph:
+        raise HTTPException(status_code=403, detail="ออเดอร์นี้ไม่ใช่ของเบอร์นี้")
+    pdf = _build_receipt_for_order(sb, order, None)
+    if pdf is None:
+        raise HTTPException(status_code=422, detail="ออเดอร์นี้ยังไม่มียอดชำระในระบบ")
+    return _receipt_response(pdf, order_id.strip())
 
 _CUSTOMER_PUBLIC_FIELDS = ("id,line_user_id,display_name,picture_url,phone,name,"
                            "address,province,zip,notify_channel")
