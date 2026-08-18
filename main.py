@@ -3601,24 +3601,27 @@ async def verify_otp(body: OTPVerifyBody):
     return {"success": True, "customer": customer, "token": token}
 
 @app.get("/leaderboard")
-async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
+async def get_leaderboard(limit: int = 10, phone: Optional[str] = None, period: str = "month"):
     """
-    จัดอันดับลูกค้าตามยอด point ของเดือนปัจจุบัน (รวม Shopee + เว็บ ตามเบอร์โทรเดียวกัน)
+    จัดอันดับลูกค้าตามยอด point (รวม Shopee + เว็บ ตามเบอร์โทรเดียวกัน)
     Point มาจาก ml รวมที่ดื่ม ไม่ใช่ยอดเงิน — 100ml = 1 point
 
     - limit: จำนวน top ranking ที่จะแสดง (ค่าเริ่มต้น 10)
     - phone: ถ้าระบุ จะคืนอันดับ/point ของเบอร์นี้มาด้วย แม้จะอยู่นอก top N ก็ตาม
+    - period: "month" = เฉพาะเดือนนี้ (default) | "all" = สะสมตลอดกาล
     """
     sb = get_supabase()
 
     today = datetime.utcnow()
     month_start = today.strftime("%Y-%m-01")
+    all_time = (period == "all")
 
-    rows = sb.table("point_ledger") \
+    q = sb.table("point_ledger") \
         .select("phone,customer,points,order_date") \
-        .eq("channel", "web") \
-        .gte("order_date", month_start) \
-        .execute()
+        .eq("channel", "web")
+    if not all_time:
+        q = q.gte("order_date", month_start)
+    rows = q.execute()
 
     data = rows.data or []
 
@@ -3664,10 +3667,19 @@ async def get_leaderboard(limit: int = 10, phone: Optional[str] = None):
         for i, r in enumerate(full_ranked[:limit])
     ]
 
+    # จำนวนสมาชิกทั้งหมด (social proof) — นับจากตาราง customers
+    try:
+        cnt = sb.table("customers").select("id", count="exact").limit(1).execute()
+        member_count = cnt.count or 0
+    except Exception:
+        member_count = len(full_ranked)
+
     response = {
-        "month":   today.strftime("%Y-%m"),
+        "period":  "all" if all_time else "month",
+        "month":   None if all_time else today.strftime("%Y-%m"),
         "results": top_n,
         "total_participants": len(full_ranked),
+        "member_count": member_count,
     }
 
     # ถ้าระบุเบอร์ — หา rank จริงของเบอร์นั้นในทั้งหมด (ไม่จำกัดแค่ top N)
