@@ -344,13 +344,13 @@ def detect_carrier(barcode: str) -> str:
 
 
 def business_carrier(tracking: str, chosen: str = "") -> str:
-    """แปลงเลข tracking → 'ชื่อขนส่งจริง' สำหรับเก็บ/แสดง (Flash Express / KEX Express / POST SABUY / Seller Own Fleet)"""
+    """แปลงเลข tracking → 'ชื่อขนส่งจริง' สำหรับเก็บ/แสดง (Flash Express / KEX Express / Thaipost / Seller Own Fleet)"""
     t = (tracking or "").upper().strip()
     if t.startswith("TH"):    return "Flash Express"   # Shopee-managed THxxxxC
     if t.startswith("SXF"):   return "KEX Express"
-    if t.startswith("JM"):    return "POST SABUY"
+    if t.startswith(("JM", "WB")):  return "Thaipost"  # ไปรษณีย์ไทย (ลงทะเบียน/EMS)
     if t in ("", "-"):        return chosen or "Seller Own Fleet"
-    return chosen or "POST SABUY"
+    return chosen or "Thaipost"
 
 
 async def fetch_etrackings(barcode: str, courier: str) -> dict:
@@ -2255,8 +2255,10 @@ async def import_excel(x_api_key: str = Header(default=""), file: UploadFile = F
         cu = carrier_raw.upper()
         if "FLASH" in cu:
             carrier = "Flash Express"
-        elif "POST" in cu or "SABUY" in cu:
+        elif "SABUY" in cu:
             carrier = "POST SABUY"
+        elif "THAI" in cu or "POST" in cu or "EMS" in cu or "ไปรษณี" in carrier_raw:
+            carrier = "Thaipost"              # Thailand Post / ไปรษณีย์ไทย
         elif "KEX" in cu or "KERRY" in cu:
             carrier = "KEX Express"
         elif "OWN" in cu or "SELLER" in cu:
@@ -3131,7 +3133,7 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
 class AddShippingRequest(BaseModel):
     order_id:      str
     tracking:      str
-    carrier:       str = "POST SABUY"
+    carrier:       str = "Thaipost"
     ship_date:     Optional[str] = None
     weight_g:      Optional[int] = None
     shipping_cost: Optional[float] = None
@@ -3212,7 +3214,7 @@ async def fix_tracking(body: FixTrackingRequest, x_api_key: str = Header(default
     new_trk = body.tracking.strip().upper()
     if not new_trk or new_trk == "-":
         raise HTTPException(status_code=400, detail="ต้องระบุเลขพัสดุใหม่")
-    carrier = business_carrier(new_trk, body.carrier or "POST SABUY")
+    carrier = business_carrier(new_trk, body.carrier or "Thaipost")
 
     o = sb.table("orders").select("customer,phone,ship_date").eq("order_id", body.order_id).execute()
     if not o.data:
