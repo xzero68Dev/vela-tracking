@@ -1781,16 +1781,41 @@ async def upsert_customer_profile(body: CustomerProfileBody, x_auth_token: str =
             continue
         data[k] = v
     if lid:
-        # ลูกค้า LINE — upsert ด้วย line_user_id (conflict key) เหมือนเดิม
         data["line_user_id"] = lid
-        res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
+        # เช็คก่อนว่าเบอร์นี้ถูกใช้โดย "แถวอื่น" อยู่แล้วไหม (เช่น guest ที่เคยสั่งด้วยเบอร์นี้)
+        # กันชน unique constraint customers_phone_unique (เคย 500 ตอน LINE user ตั้งเบอร์ที่เคยสั่งแบบ guest)
+        phone_row = None
+        if ph:
+            _pr = sb.table("customers").select("*").eq("phone", ph).limit(1).execute()
+            phone_row = _pr.data[0] if _pr.data else None
+        if phone_row and (phone_row.get("line_user_id") or "") not in ("", lid):
+            # เบอร์นี้ผูกกับบัญชี LINE อื่นแล้ว — ไม่ยอมให้แย่งเบอร์ (กันสวมรอย)
+            raise HTTPException(status_code=409,
+                detail="เบอร์นี้ถูกผูกกับบัญชี LINE อื่นแล้ว ถ้าเป็นเบอร์ของคุณจริง กรุณาแจ้งร้าน")
+        if phone_row:
+            # เบอร์เป็นของ guest เดิม (line_user_id ว่าง) หรือของ lid นี้เอง → merge เข้าแถวเบอร์
+            # ลบ/เคลียร์แถว LINE ที่เพิ่งสร้างตอน login (ถ้ามี) ก่อน กันชน unique line_user_id
+            _lr = sb.table("customers").select("id").eq("line_user_id", lid).execute().data or []
+            for row in _lr:
+                if row["id"] != phone_row["id"]:
+                    try:
+                        sb.table("customers").delete().eq("id", row["id"]).execute()
+                    except Exception:
+                        sb.table("customers").update({"line_user_id": None}).eq("id", row["id"]).execute()
+            sb.table("customers").update(data).eq("id", phone_row["id"]).execute()
+            _res = sb.table("customers").select("*").eq("id", phone_row["id"]).execute().data
+            cust = _res[0] if _res else None
+        else:
+            # ไม่ชนเบอร์ — upsert ด้วย line_user_id (conflict key) เหมือนเดิม
+            res = sb.table("customers").upsert(data, on_conflict="line_user_id").execute()
+            cust = res.data[0] if res.data else None
     else:
         # ลูกค้า phone-only — update row ที่ตรงเบอร์ (guest auto-capture สร้าง row ไว้แล้ว)
         # ไม่ใช้ upsert เพราะ conflict key ของตารางคือ line_user_id ซึ่งคนกลุ่มนี้เป็น null
         res = sb.table("customers").update(data).eq("phone", ph).execute()
         if not res.data:   # เผื่อไม่มี row เดิม → insert ใหม่
             res = sb.table("customers").insert({**data, "phone": ph}).execute()
-    cust = res.data[0] if res.data else None
+        cust = res.data[0] if res.data else None
     token = _make_customer_token(phone=(cust or {}).get("phone") or ph, line_user_id=lid)
     return {"customer": cust, "token": token}
 
