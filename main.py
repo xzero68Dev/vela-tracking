@@ -1094,10 +1094,11 @@ async def keep_alive():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(run_cron,   "interval", hours=3,    id="tracking_cron")
-    scheduler.add_job(keep_alive, "interval", minutes=10, id="keep_alive")
+    scheduler.add_job(run_cron,              "interval", hours=3,    id="tracking_cron")
+    scheduler.add_job(keep_alive,            "interval", minutes=10, id="keep_alive")
+    scheduler.add_job(recheck_pending_slips, "interval", minutes=2,  id="slip_recheck")
     scheduler.start()
-    print("[scheduler] cron started — ทุก 3 ชั่วโมง, keep-alive ทุก 10 นาที")
+    print("[scheduler] cron started — tracking ทุก 3 ชม., keep-alive ทุก 10 นาที, เช็คสลิปค้างธนาคาร ทุก 2 นาที")
     yield
     scheduler.shutdown()
 
@@ -2809,9 +2810,87 @@ PROMPTPAY_ID    = os.getenv("PROMPTPAY_ID", "")
 # กันยิงซ้ำ /slip-notify (double-submit) — Render รัน WEB_CONCURRENCY=1 ใช้ set ในหน่วยความจำได้
 _slip_inflight: set = set()
 
+# คิวสลิปที่ธนาคารกำลังตรวจ (1010) รอ cron เช็คเบื้องหลัง — {order_id: {"attempts": int, "slip_url": str}}
+# แหล่งความจริงจริงคือ orders.slip_status == "bank_pending" (กัน process restart); dict นี้แค่นับรอบ
+_pending_slips: dict = {}
+SLIP_RECHECK_MAX = 8   # เช็คซ้ำสูงสุด ~16 นาที (ทุก 2 นาที) แล้วยอมแพ้ → ส่งให้ admin ตรวจเอง
+
+
+async def _slipok_verify_once(slip_url: str) -> dict:
+    """เรียก SlipOK ครั้งเดียว (ไม่หน่วง/ไม่วน) — คืน normalized result ใช้ได้ทั้ง endpoint และ cron
+    { ok, amount, ref, code, message, exc, raw }
+    ไม่ส่ง amount ตายตัว → กัน 1013 จากยอดลด 50%/ปัดเศษ; SlipOK ยังเช็คสลิปจริง+เข้าบัญชีร้าน(1014)+ไม่ซ้ำ(1012)"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                SLIPOK_API_URL,
+                headers={"x-authorization": SLIPOK_API_KEY},
+                data={"url": slip_url, "log": "true"},
+            )
+            rdata = r.json()
+    except Exception as e:
+        return {"ok": False, "amount": None, "ref": None, "code": -1, "message": "", "exc": str(e), "raw": None}
+    if rdata.get("success"):
+        d = rdata.get("data", {}) or {}
+        return {"ok": True, "amount": float(d.get("amount") or 0), "ref": d.get("transRef", ""),
+                "code": 0, "message": "", "exc": None, "raw": rdata}
+    return {"ok": False, "amount": None, "ref": None,
+            "code": int(rdata.get("code", 0) or 0), "message": (rdata.get("message") or "").strip(),
+            "exc": None, "raw": rdata}
+
+
+def _slip_underpaid(slip_amount, total) -> bool:
+    """ยอดสลิปน้อยกว่าออเดอร์เกิน ฿2 (เช่นโอน ฿20 ให้ออเดอร์ ฿500) → ไม่ auto-confirm"""
+    return bool(slip_amount and total and slip_amount < total - 2)
+
+
+async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
+                              slip_amount, slip_ref, source="auto"):
+    """ยืนยันชำระเงินจากสลิปที่ผ่าน — อัปเดตสถานะ + ให้แต้ม + แจ้ง admin + แจ้งลูกค้า
+    ใช้ร่วมกันทั้ง endpoint (ตรวจผ่านทันที) และ cron (recheck ผ่านทีหลัง)"""
+    sb.table("orders").update({
+        "status":      "ชำระแล้ว",
+        "paid_at":     datetime.utcnow().isoformat(),
+        "slip_url":    slip_url,
+        "slip_status": "verified",
+    }).eq("order_id", order_id).execute()
+    _pending_slips.pop(order_id, None)
+    try:
+        await _award_points(sb, order_id)
+        await _mark_first_order_used(sb, order_id)
+    except Exception as e:
+        print(f"[SlipOK] post-confirm error: {e}")
+    warn = ""
+    if slip_amount and total and abs(slip_amount - total) > 2:
+        warn = f"\n⚠️ ยอดสลิป ฿{slip_amount:,.0f} ≠ ยอด order ฿{total:,.0f} — โปรดตรวจ"
+    tag = "Auto-confirm" if source == "auto" else "Auto-confirm (เช็คเบื้องหลัง)"
+    await send_line_notify(ADMIN_LINE_USER_ID,
+        f"✅ {tag}! {customer} ({phone})\nOrder: {order_id}\nยอด: ฿{(slip_amount or 0):,.0f}\nRef: {slip_ref}{warn}")
+    await _notify_customer(sb, order_id, phone, customer,
+        f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} เรียบร้อยแล้วค่ะ ✅\n"
+        f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
+        f"ดูสถานะ: velacoldbrew.com/account",
+        f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} แล้วค่ะ กำลังแพ็คและจัดส่ง เดี๋ยวแจ้งเลขพัสดุอีกทีนะคะ ดูสถานะ velacoldbrew.com/account",
+        "payment_confirmed")
+
+
+def _slip_manual_error(result: dict, order_id: str = "") -> str:
+    """แปลง SlipOK error (ที่ไม่ใช่ 1010) เป็นข้อความสำหรับ admin"""
+    code = result["code"]
+    if code == 1014:   return "สลิปนี้ไม่ได้โอนเข้าบัญชีหลักของร้าน"
+    if code == 1012:   return "สลิปซ้ำ (เคยส่งเข้ามาแล้ว) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
+    if result["exc"]:  return f"SlipOK error: {result['exc']}"
+    if result["message"]: return result["message"]
+    if order_id:
+        print(f"[SlipOK] {order_id} raw={str(result.get('raw'))[:400]}")
+    return f"อ่านสลิปอัตโนมัติไม่ได้ (code={code}) — โปรดตรวจเอง"
+
+
 @app.post("/orders/slip-notify")
 async def slip_notify(body: SlipNotifyRequest):
-    """ตรวจสอบสลิปผ่าน SlipOK → auto-confirm ถ้ายอดตรง หรือแจ้ง admin"""
+    """ตรวจสลิปผ่าน SlipOK รอบเดียวแบบเร็ว → ผ่านก็ auto-confirm ทันที
+    ถ้าเจอ 1010 (ธนาคารกำลังตรวจ) → ไม่ให้ลูกค้ารอ: แจ้งลูกค้าทันทีว่ารับสลิปแล้วกำลังตรวจ
+    แล้วเข้าคิวให้ cron เช็คเบื้องหลัง (recheck_pending_slips) พอผ่านค่อย auto-confirm + แจ้งอีกที"""
     sb = get_supabase()
     res = sb.table("orders").select(
         "customer,phone,total,status,first_order_discount,slip_url,slip_status"
@@ -2824,130 +2903,150 @@ async def slip_notify(body: SlipNotifyRequest):
     if order.get("status") in ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
         return {"success": True, "verified": False, "reason": "already_paid"}
 
-    # กันยิงซ้ำ (1): สลิปใบเดิม (URL เดิม) ที่ตรวจไปแล้ว → คืนผลเดิม ไม่เรียก SlipOK ซ้ำ
-    # (ถ้าตรวจสลิปเดิมซ้ำ SlipOK จะขึ้น 1010 "ซ้ำ" ทั้งที่ลูกค้าโอนจริง)
+    # สลิปใบเดิม (URL เดิม) ที่ตรวจไปแล้ว → คืนผลเดิม ไม่เรียก SlipOK ซ้ำ
     if order.get("slip_url") and order.get("slip_url") == body.slip_url and order.get("slip_status"):
-        return {"success": True, "verified": order.get("slip_status") == "verified", "reason": "already_checked"}
+        st = order.get("slip_status")
+        if st == "bank_pending":
+            # กำลังรอ cron เช็คอยู่ — บอกลูกค้าว่ากำลังตรวจ ไม่ต้องส่งซ้ำ
+            _pending_slips.setdefault(body.order_id, {"attempts": 0, "slip_url": body.slip_url})
+            return {"success": True, "verified": False, "pending": True,
+                    "reason": "กำลังตรวจสอบกับธนาคารอยู่ค่ะ ไม่ต้องส่งสลิปซ้ำ เดี๋ยวแจ้งผลให้ทาง LINE/SMS นะคะ"}
+        return {"success": True, "verified": st == "verified", "reason": "already_checked"}
 
-    # กันยิงซ้ำ (2): คำขอซ้อนของ order เดียวกัน (double-submit พร้อมกัน)
+    # กันคำขอซ้อนของ order เดียวกัน (double-submit พร้อมกัน)
     if body.order_id in _slip_inflight:
         return {"success": True, "verified": False, "reason": "processing"}
     _slip_inflight.add(body.order_id)
 
     try:
-        slip_verified = False
-        slip_amount   = None
-        slip_ref      = None
-        slip_error    = None
-        slip_soft     = None   # ปัญหาชั่วคราว (เช่น ธนาคารต้องรอ) — ไม่ตีเป็น rejected ให้ลองใหม่ได้
-
-        if SLIPOK_API_KEY:
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    # ไม่ส่ง amount ตายตัว → กัน 1013 จากยอดลด 50%/ปัดเศษไม่ตรงเป๊ะ
-                    # SlipOK ยังเช็คให้ว่าเป็นสลิปจริง + เข้าบัญชีร้าน (1014) + ไม่ซ้ำ (1012)
-                    # 1010 = ธนาคารกำลังตรวจ (ยังไม่พร้อม) → ลองซ้ำเองอัตโนมัติสูงสุด 3 ครั้ง (หน่วง 8 วิ)
-                    #        ลูกค้าไม่ต้องแนบสลิปใหม่ — ส่วนใหญ่ 1010 เคลียร์ในไม่กี่วินาที
-                    for _attempt in range(3):
-                        r = await client.post(
-                            SLIPOK_API_URL,
-                            headers={"x-authorization": SLIPOK_API_KEY},
-                            data={"url": body.slip_url, "log": "true"},
-                        )
-                        rdata = r.json()
-                        if rdata.get("success"):
-                            slip_amount   = float(rdata.get("data", {}).get("amount") or 0)
-                            slip_ref      = rdata.get("data", {}).get("transRef", "")
-                            slip_verified = True   # สลิปจริง + เข้าบัญชีร้าน + ไม่ซ้ำ → ยืนยันเลย (เตือน admin ถ้ายอดต่าง)
-                            break
-                        err_code = rdata.get("code", 0)
-                        if err_code == 1010 and _attempt < 2:
-                            print(f"[SlipOK] {body.order_id} 1010 (ธนาคารกำลังตรวจ) → ลองใหม่อัตโนมัติ #{_attempt+1} ใน 8 วิ")
-                            await asyncio.sleep(8)
-                            continue
-                        # error อื่น หรือ 1010 หลังลองครบแล้ว → จบการวน
-                        # โค้ด SlipOK จริง: 1012=สลิปซ้ำ, 1013=ยอดไม่ตรง, 1014=บัญชีผู้รับไม่ตรงบัญชีหลักร้าน, 1010=ธนาคารกำลังตรวจ
-                        if err_code == 1014:   slip_error = "สลิปนี้ไม่ได้โอนเข้าบัญชีหลักของร้าน"
-                        elif err_code == 1012: slip_error = "สลิปซ้ำ (เคยส่งเข้ามาแล้ว) — โปรดเช็คยอดเข้าบัญชีก่อนยืนยัน"
-                        elif err_code == 1010:
-                            slip_error = None   # ไม่ตีเป็น rejected
-                            slip_soft  = "ธนาคารนี้ต้องรอตรวจสอบสักครู่ กรุณาลองแนบสลิปใหม่อีกครั้งใน 1-2 นาที"
-                        else:
-                            _msg = (rdata.get("message") or "").strip()
-                            slip_error = _msg or f"อ่านสลิปอัตโนมัติไม่ได้ (code={err_code}) — โปรดตรวจเอง"
-                            if not _msg:   # เคส err=- ที่ไม่มีเหตุผล → log response ดิบไว้ดูว่า SlipOK ตอบอะไรจริง
-                                print(f"[SlipOK] {body.order_id} raw={str(rdata)[:400]}")
-                        break
-                    print(f"[SlipOK] {body.order_id} → {'✓ verified' if slip_verified else '✗ manual'} "
-                          f"slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'} err={slip_error or '-'}")
-            except Exception as e:
-                slip_error = f"SlipOK error: {e}"
-                print(f"[SlipOK] {body.order_id} error: {e}")
-        else:
+        if not SLIPOK_API_KEY:
             print(f"[SlipOK] {body.order_id} skip (ไม่มี SLIPOK_API_KEY) → manual")
-
-        # กันสลิปยอดน้อยกว่าออเดอร์ชัดเจน (เช่นโอน ฿20 ให้ออเดอร์ ฿500) — ไม่ auto-confirm
-        # เช็คเฉพาะตอน SlipOK อ่านยอดได้จริง (slip_amount>0) และน้อยกว่าเกิน ฿2 → ให้ admin ตรวจแทน
-        # (ไม่ได้ส่งยอดไป SlipOK เลยไม่กระทบ 1013 จากยอดลด/ปัดเศษ; ยอดเกินยังผ่านปกติ)
-        if slip_verified and slip_amount and total and slip_amount < total - 2:
-            slip_verified = False
-            slip_error = f"ยอดสลิป ฿{slip_amount:,.0f} น้อยกว่ายอดออเดอร์ ฿{total:,.0f} — โปรดตรวจก่อนยืนยัน"
-            print(f"[SlipOK] {body.order_id} ยอดน้อยกว่าออเดอร์ → ส่งให้ admin ตรวจ")
-
-        if slip_verified:
-            sb.table("orders").update({
-                "status":      "ชำระแล้ว",
-                "paid_at":     datetime.utcnow().isoformat(),
-                "slip_url":    body.slip_url,
-                "slip_status": "verified",
-            }).eq("order_id", body.order_id).execute()
-            # ให้ points + mark first_order_used
-            try:
-                await _award_points(sb, body.order_id)
-                await _mark_first_order_used(sb, body.order_id)
-            except Exception as e:
-                print(f"[SlipOK] post-confirm error: {e}")
-            warn = ""
-            if slip_amount and total and abs(slip_amount - total) > 2:
-                warn = f"\n⚠️ ยอดสลิป ฿{slip_amount:,.0f} ≠ ยอด order ฿{total:,.0f} — โปรดตรวจ"
+            sb.table("orders").update({"slip_url": body.slip_url, "slip_status": "pending"}).eq("order_id", body.order_id).execute()
             await send_line_notify(ADMIN_LINE_USER_ID,
-                f"✅ Auto-confirm! {customer} ({phone})\nOrder: {body.order_id}\nยอด: ฿{slip_amount:,.0f}\nRef: {slip_ref}{warn}")
-            # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
-            await _notify_customer(sb, body.order_id, phone, customer,
-                f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} เรียบร้อยแล้วค่ะ ✅\n"
-                f"กำลังแพ็คของและจัดส่งให้เร็วที่สุด เดี๋ยวมีเลขพัสดุแจ้งอีกทีนะคะ 🐰\n"
-                f"ดูสถานะ: velacoldbrew.com/account",
-                f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{body.order_id} แล้วค่ะ กำลังแพ็คและจัดส่ง เดี๋ยวแจ้งเลขพัสดุอีกทีนะคะ ดูสถานะ velacoldbrew.com/account",
-                "payment_confirmed")
+                f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+                f"\nOrder: {body.order_id}" + (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+                f"\nกรุณายืนยันชำระเงินใน /admin/orders")
+            return {"success": True, "verified": False, "reason": "manual_check"}
+
+        result = await _slipok_verify_once(body.slip_url)
+
+        # ---- ผ่าน → เช็คยอด แล้ว confirm ทันที ----
+        if result["ok"]:
+            slip_amount, slip_ref = result["amount"], result["ref"]
+            if _slip_underpaid(slip_amount, total):
+                sb.table("orders").update({"slip_url": body.slip_url, "slip_status": "pending_review"}).eq("order_id", body.order_id).execute()
+                print(f"[SlipOK] {body.order_id} ยอดน้อยกว่าออเดอร์ → ส่งให้ admin ตรวจ")
+                await send_line_notify(ADMIN_LINE_USER_ID,
+                    f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+                    f"\nOrder: {body.order_id}\n⚠️ ยอดสลิป ฿{(slip_amount or 0):,.0f} น้อยกว่ายอดออเดอร์ ฿{total:,.0f} — โปรดตรวจก่อนยืนยัน\nกรุณายืนยันใน /admin/orders")
+                return {"success": True, "verified": False,
+                        "reason": f"ยอดสลิป ฿{(slip_amount or 0):,.0f} น้อยกว่ายอดออเดอร์ ฿{total:,.0f} — โปรดตรวจก่อนยืนยัน"}
+            print(f"[SlipOK] {body.order_id} → ✓ verified slip=฿{(slip_amount or 0):.0f} order=฿{total:.0f} ref={slip_ref or '-'}")
+            await _finalize_slip_paid(sb, body.order_id, customer, phone, total, body.slip_url, slip_amount, slip_ref, source="auto")
             return {"success": True, "verified": True, "amount": slip_amount, "ref": slip_ref}
-        else:
-            # ISSUE 2 (27/07): ไม่ใช้คำว่า "rejected" อีก — สื่อว่าลูกค้าโกง ทั้งที่ส่วนใหญ่จ่ายจริง
-            # ตรวจไม่ผ่าน/SlipOK ล่ม/quota → "pending_review" (รอ admin ตรวจ) ไม่ใช่ปฏิเสธ
-            sb.table("orders").update({
-                "slip_url":    body.slip_url,
-                "slip_status": "pending_review" if slip_error else "pending",
-            }).eq("order_id", body.order_id).execute()
-            # 1010 (ธนาคารต้องรอ) → บอกลูกค้าให้ลองใหม่ + แจ้ง admin ด้วย (กันออเดอร์หลุดถ้าลูกค้าไม่แนบซ้ำ)
-            if slip_soft and not slip_error:
-                try:
-                    await send_line_notify(ADMIN_LINE_USER_ID,
-                        f"⏳ สลิปรอธนาคารตรวจ (SlipOK 1010) — ลูกค้าจ่ายแล้วแต่ auto-confirm ไม่ได้\n"
-                        f"ชื่อ: {customer}" + (f" ({phone})" if phone else "") +
-                        f"\nOrder: {body.order_id}" + (f"\nยอด order: ฿{total:,.0f}" if total else "") +
-                        f"\nลูกค้าได้รับข้อความให้แนบสลิปใหม่ใน 1-2 นาที — ถ้าไม่แนบซ้ำ โปรดเช็คยอดเข้าบัญชีแล้วยืนยันใน /admin/orders")
-                except Exception as e:
-                    print(f"[SlipOK] 1010 admin-notify error: {e}")
-                return {"success": True, "verified": False, "retry": True, "reason": slip_soft}
-            msg = (f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" +
-                   (f" ({phone})" if phone else "") +
-                   f"\nOrder: {body.order_id}" +
-                   (f"\nยอด order: ฿{total:,.0f}" if total else "") +
-                   (f"\n⚠️ {slip_error}" if slip_error else "") +
-                   f"\nกรุณายืนยันชำระเงินใน /admin/orders")
-            await send_line_notify(ADMIN_LINE_USER_ID, msg)
-            return {"success": True, "verified": False, "reason": slip_error or "manual_check"}
+
+        # ---- 1010 ธนาคารกำลังตรวจ → ไม่ให้ลูกค้ารอ: แจ้งทันที + เข้าคิว cron ----
+        if result["code"] == 1010:
+            sb.table("orders").update({"slip_url": body.slip_url, "slip_status": "bank_pending"}).eq("order_id", body.order_id).execute()
+            _pending_slips[body.order_id] = {"attempts": 0, "slip_url": body.slip_url}
+            print(f"[SlipOK] {body.order_id} 1010 (ธนาคารกำลังตรวจ) → เข้าคิวเช็คเบื้องหลัง + แจ้งลูกค้าแล้ว")
+            await _notify_customer(sb, body.order_id, phone, customer,
+                f"VeLA Cold Brew: รับสลิปออเดอร์ #{body.order_id} แล้วค่ะ 🧾\n"
+                f"ธนาคารกำลังยืนยันรายการโอนอยู่ ระบบจะตรวจให้อัตโนมัติภายในไม่กี่นาที\n"
+                f"ไม่ต้องส่งสลิปซ้ำนะคะ พอเรียบร้อยจะแจ้งผลให้อีกทีค่ะ 🐰\n"
+                f"ดูสถานะ: velacoldbrew.com/account",
+                f"VeLA Cold Brew: รับสลิปออเดอร์ #{body.order_id} แล้วค่ะ ธนาคารกำลังยืนยันรายการโอน ระบบจะตรวจให้อัตโนมัติภายในไม่กี่นาที ไม่ต้องส่งซ้ำ เดี๋ยวแจ้งผลอีกทีค่ะ",
+                "payment_checking")
+            return {"success": True, "verified": False, "pending": True,
+                    "reason": "รับสลิปแล้ว กำลังตรวจสอบกับธนาคาร เดี๋ยวแจ้งผลให้นะคะ"}
+
+        # ---- error แข็ง (1012/1013/1014/อื่นๆ/ล่ม) → manual ----
+        slip_error = _slip_manual_error(result, body.order_id)
+        print(f"[SlipOK] {body.order_id} → ✗ manual err={slip_error}")
+        sb.table("orders").update({"slip_url": body.slip_url, "slip_status": "pending_review"}).eq("order_id", body.order_id).execute()
+        await send_line_notify(ADMIN_LINE_USER_ID,
+            f"💳 ลูกค้าส่งสลิปแล้ว!\nชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+            f"\nOrder: {body.order_id}" + (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+            f"\n⚠️ {slip_error}\nกรุณายืนยันชำระเงินใน /admin/orders")
+        return {"success": True, "verified": False, "reason": slip_error}
     finally:
         _slip_inflight.discard(body.order_id)
+
+
+async def recheck_pending_slips():
+    """[cron ทุก 2 นาที] ยิงเช็คสลิปที่ค้าง bank_pending (ธนาคารกำลังตรวจ) ซ้ำเบื้องหลัง
+    ผ่าน → auto-confirm + แจ้งลูกค้า | ครบ SLIP_RECHECK_MAX รอบยังไม่ผ่าน → ส่งให้ admin ตรวจเอง
+    ลูกค้าไม่ต้องรอหน้าค้าง / ไม่ต้องส่งสลิปซ้ำ"""
+    if not SLIPOK_API_KEY:
+        return
+    sb = get_supabase()
+    try:
+        res = sb.table("orders").select(
+            "order_id,customer,phone,total,status,slip_url"
+        ).eq("slip_status", "bank_pending").execute()
+    except Exception as e:
+        print(f"[SlipOK-recheck] query error: {e}")
+        return
+    rows = res.data or []
+    if not rows:
+        return
+    print(f"[SlipOK-recheck] เช็คสลิปค้างธนาคาร {len(rows)} ใบ")
+    for order in rows:
+        oid      = order["order_id"]
+        # ชำระ/ยกเลิกไปแล้ว (เช่น admin กด confirm เอง) → เอาออกจากคิว
+        if order.get("status") in ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ", "ยกเลิก"):
+            _pending_slips.pop(oid, None)
+            continue
+        slip_url = order.get("slip_url")
+        if not slip_url:
+            _pending_slips.pop(oid, None)
+            continue
+        customer = order.get("customer", "ลูกค้า")
+        phone    = order.get("phone", "")
+        total    = float(order.get("total") or 0)
+        meta = _pending_slips.setdefault(oid, {"attempts": 0, "slip_url": slip_url})
+        meta["attempts"] += 1
+
+        await asyncio.sleep(0.4)   # กันยิง SlipOK รัวเกินตอนมีหลายใบ
+        result = await _slipok_verify_once(slip_url)
+
+        # ผ่านแล้ว
+        if result["ok"]:
+            slip_amount, slip_ref = result["amount"], result["ref"]
+            if _slip_underpaid(slip_amount, total):
+                sb.table("orders").update({"slip_status": "pending_review"}).eq("order_id", oid).execute()
+                _pending_slips.pop(oid, None)
+                await send_line_notify(ADMIN_LINE_USER_ID,
+                    f"💳 สลิปผ่านแล้วแต่ยอดไม่พอ (เช็คเบื้องหลัง)\nชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+                    f"\nOrder: {oid}\n⚠️ ยอดสลิป ฿{(slip_amount or 0):,.0f} < ออเดอร์ ฿{total:,.0f} — โปรดตรวจใน /admin/orders")
+                continue
+            print(f"[SlipOK-recheck] {oid} → ✓ verified (รอบ {meta['attempts']}) slip=฿{(slip_amount or 0):.0f}")
+            await _finalize_slip_paid(sb, oid, customer, phone, total, slip_url, slip_amount, slip_ref, source="recheck")
+            continue
+
+        # ยังรอธนาคาร (1010)
+        if result["code"] == 1010:
+            if meta["attempts"] >= SLIP_RECHECK_MAX:
+                sb.table("orders").update({"slip_status": "pending_review"}).eq("order_id", oid).execute()
+                _pending_slips.pop(oid, None)
+                print(f"[SlipOK-recheck] {oid} → ยอมแพ้หลัง {meta['attempts']} รอบ (ธนาคารยังไม่ยืนยัน) → manual")
+                await send_line_notify(ADMIN_LINE_USER_ID,
+                    f"⏳ สลิปรอธนาคารนานเกิน — ตรวจอัตโนมัติไม่ผ่านหลังลอง {meta['attempts']} รอบ (~{meta['attempts']*2} นาที)\n"
+                    f"ชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+                    f"\nOrder: {oid}" + (f"\nยอด order: ฿{total:,.0f}" if total else "") +
+                    f"\nลูกค้าจ่ายแล้ว โปรดเช็คยอดเข้าบัญชีแล้วยืนยันใน /admin/orders")
+            else:
+                print(f"[SlipOK-recheck] {oid} ยัง 1010 (รอบ {meta['attempts']}/{SLIP_RECHECK_MAX})")
+            continue
+
+        # error แข็ง → หยุด recheck ส่งให้ admin
+        se = _slip_manual_error(result, oid)
+        sb.table("orders").update({"slip_status": "pending_review"}).eq("order_id", oid).execute()
+        _pending_slips.pop(oid, None)
+        print(f"[SlipOK-recheck] {oid} → ✗ manual err={se}")
+        await send_line_notify(ADMIN_LINE_USER_ID,
+            f"💳 สลิปตรวจอัตโนมัติไม่ผ่าน (เช็คเบื้องหลัง)\nชื่อ: {customer}" + (f" ({phone})" if phone else "") +
+            f"\nOrder: {oid}\n⚠️ {se}\nกรุณายืนยันใน /admin/orders")
 
 
 class PaymentSmsRequest(BaseModel):
