@@ -1864,6 +1864,67 @@ async def admin_order_by_tracking(tracking: str, x_api_key: str = Header(default
     return {"order": order}
 
 
+class NewProductRequest(BaseModel):
+    sku: str
+    name: str
+    price: int
+    discount_pct: int = 0
+    flavor: str = ""
+    roast: str = ""
+    process: str = ""
+    description: str = ""
+    image_url: str = ""
+    active: bool = True
+    in_stock: bool = True
+    sort_order: Optional[int] = None
+
+# หมายเหตุ: ต้องประกาศ route "create" (literal) ก่อน route "{product_id}" (int)
+# ไม่งั้น POST /admin/products/create จะไปชน converter int แล้ว 422
+@app.post("/admin/products/create")
+async def create_product(body: NewProductRequest, x_api_key: str = Header(default="")):
+    """Admin — เพิ่มสินค้าใหม่เข้าตาราง products"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    sku  = (body.sku or "").strip()
+    name = (body.name or "").strip()
+    if not sku or not name:
+        raise HTTPException(status_code=400, detail="ต้องมี SKU และชื่อสินค้า")
+    if not body.price or body.price <= 0:
+        raise HTTPException(status_code=400, detail="ราคาต้องมากกว่า 0")
+    # กัน SKU ซ้ำ (SKU ใช้ match ราคา/สต็อก/แต้ม — ห้ามซ้ำ)
+    dup = sb.table("products").select("id").eq("sku", sku).limit(1).execute()
+    if dup.data:
+        raise HTTPException(status_code=409, detail=f"SKU '{sku}' มีอยู่แล้ว ใช้ชื่ออื่น")
+    # sort_order อัตโนมัติ = ตัวท้ายสุด +1 ถ้าไม่ได้ระบุ (สินค้าใหม่ไปต่อท้าย)
+    sort_order = body.sort_order
+    if sort_order is None:
+        try:
+            mx = sb.table("products").select("sort_order").order("sort_order", desc=True).limit(1).execute()
+            sort_order = int((mx.data[0].get("sort_order") or 0)) + 1 if mx.data else 1
+        except Exception:
+            sort_order = 1
+    row = {
+        "sku":          sku,
+        "name":         name,
+        "price":        int(body.price),
+        "discount_pct": max(0, min(99, int(body.discount_pct or 0))),
+        "flavor":       body.flavor or "",
+        "roast":        body.roast or "",
+        "process":      body.process or "",
+        "description":  body.description or "",
+        "image_url":    body.image_url or "",
+        "active":       bool(body.active),
+        "in_stock":     bool(body.in_stock),
+        "sort_order":   sort_order,
+    }
+    try:
+        res = sb.table("products").insert(row).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"เพิ่มสินค้าไม่สำเร็จ: {e}")
+    print(f"[product] เพิ่มสินค้าใหม่ {name} (sku={sku}, ราคา={body.price}, sort={sort_order})")
+    return {"success": True, "product": (res.data or [None])[0]}
+
+
 @app.post("/admin/products/{product_id}")
 async def update_product(product_id: int, body: dict, x_api_key: str = Header(default="")):
     """Admin — อัปเดตราคา/รายละเอียดสินค้า"""
