@@ -1,0 +1,11 @@
+-- เพิ่มคอลัมน์ detail (jsonb) เก็บเนื้อหาหน้าสินค้าแบบละเอียด เพื่อให้เพิ่ม/แก้สินค้าใหม่ได้ครบจากหน้า admin
+-- โครงสร้าง detail:
+-- {
+--   "name": "...", "tagline": "...", "origin": "...",
+--   "highlights": ["..."], "description": "...", "howto": "...",
+--   "specs": [{"label":"ปริมาณ","value":"1,000 มล."}],
+--   "storage": "...", "hashtags": ["..."],
+--   "bg": "#F9D0DC", "accent": "#E05A7A", "dark": false
+-- }
+-- image_url ใช้คอลัมน์เดิมที่มีอยู่แล้ว
+ALTER TABLE products ADD COLUMN IF NOT EXISTS detail jsonb;

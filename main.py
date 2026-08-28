@@ -1877,6 +1877,7 @@ class NewProductRequest(BaseModel):
     active: bool = True
     in_stock: bool = True
     sort_order: Optional[int] = None
+    detail: Optional[dict] = None   # เนื้อหาหน้าสินค้า (origin/tagline/highlights/howto/specs/storage/hashtags/สีธีม)
 
 # หมายเหตุ: ต้องประกาศ route "create" (literal) ก่อน route "{product_id}" (int)
 # ไม่งั้น POST /admin/products/create จะไปชน converter int แล้ว 422
@@ -1917,6 +1918,8 @@ async def create_product(body: NewProductRequest, x_api_key: str = Header(defaul
         "in_stock":     bool(body.in_stock),
         "sort_order":   sort_order,
     }
+    if body.detail is not None:
+        row["detail"] = body.detail   # jsonb — เนื้อหาหน้าสินค้าแบบละเอียด
     try:
         res = sb.table("products").insert(row).execute()
     except Exception as e:
@@ -1930,7 +1933,7 @@ async def update_product(product_id: int, body: dict, x_api_key: str = Header(de
     """Admin — อัปเดตราคา/รายละเอียดสินค้า"""
     check_admin_key(x_api_key)
     sb = get_supabase()
-    allowed = {"name", "description", "flavor", "roast", "process", "price", "discount_pct", "image_url", "active", "in_stock", "sort_order"}
+    allowed = {"name", "description", "flavor", "roast", "process", "price", "discount_pct", "image_url", "active", "in_stock", "sort_order", "detail"}
     update_data = {k: v for k, v in body.items() if k in allowed}
     if not update_data:
         raise HTTPException(status_code=400, detail="no valid fields")
