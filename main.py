@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import uuid
+import hashlib
 import httpx
 import asyncio
 from typing import Optional
@@ -2908,6 +2910,69 @@ def _slip_underpaid(slip_amount, total) -> bool:
     return bool(slip_amount and total and slip_amount < total - 2)
 
 
+# ============================================================
+#  P3: Event layer — เก็บ event กลางใน Supabase (platform-agnostic)
+#  ยิงต่อ Google Ads/Meta ทีหลังผ่าน adapter (dispatcher ยังไม่ผูก — รอ credential)
+# ============================================================
+def _sha256(s: str):
+    s = (s or "").strip().lower()
+    return hashlib.sha256(s.encode("utf-8")).hexdigest() if s else None
+
+
+async def _log_event(sb, event_name, *, event_id=None, order_id=None, value=None,
+                     items=None, phone=None, email=None, source="web",
+                     click_id=None, user_agent=None, ip=None):
+    """บันทึก event ลงตาราง events (dedupe ด้วย event_id) — PII เก็บเป็น sha256 เท่านั้น ห้ามเก็บ plaintext"""
+    try:
+        row = {
+            "event_id":    event_id or str(uuid.uuid4()),
+            "event_name":  event_name,
+            "occurred_at": datetime.utcnow().isoformat(),
+            "currency":    "THB",
+            "source":      source or "web",
+        }
+        if order_id is not None: row["order_id"] = order_id
+        if value    is not None: row["value"]    = float(value)
+        if items    is not None: row["items"]    = items
+        ph = _norm_phone(phone or "")
+        if ph:         row["phone_sha256"] = _sha256(ph)
+        if email:      row["email_sha256"] = _sha256(email)
+        if click_id:   row["click_id"]     = click_id
+        if user_agent: row["user_agent"]   = user_agent[:400]
+        if ip:         row["ip_hash"]       = _sha256(ip)
+        sb.table("events").upsert(row, on_conflict="event_id").execute()
+    except Exception as e:
+        print(f"[events] log error ({event_name}): {e}")
+
+
+class EventIn(BaseModel):
+    event_name: str
+    event_id:   Optional[str]  = None
+    order_id:   Optional[str]  = None
+    value:      Optional[float] = None
+    currency:   Optional[str]  = "THB"
+    items:      Optional[list] = None
+    phone:      Optional[str]  = None
+    email:      Optional[str]  = None
+    click_id:   Optional[str]  = None   # gclid / fbclid
+    source:     Optional[str]  = "web"
+
+
+@app.post("/events")
+async def ingest_event(body: EventIn, user_agent: str = Header(default=""),
+                       x_forwarded_for: str = Header(default="")):
+    """รับ event จาก client: page_view | view_item | add_to_cart | begin_checkout
+    หมายเหตุ: purchase ตัวจริงยิงจาก server ตอนยืนยันสลิปผ่าน (_finalize_slip_paid / confirm-payment)
+    เพื่อไม่ให้ตัวเลข conversion เฟ้อ — client ไม่ต้องยิง purchase"""
+    sb = get_supabase()
+    ip = (x_forwarded_for or "").split(",")[0].strip()
+    await _log_event(sb, body.event_name, event_id=body.event_id, order_id=body.order_id,
+                     value=body.value, items=body.items, phone=body.phone, email=body.email,
+                     source=body.source or "web", click_id=body.click_id,
+                     user_agent=user_agent, ip=ip)
+    return {"success": True}
+
+
 async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
                               slip_amount, slip_ref, source="auto"):
     """ยืนยันชำระเงินจากสลิปที่ผ่าน — อัปเดตสถานะ + ให้แต้ม + แจ้ง admin + แจ้งลูกค้า
@@ -2924,6 +2989,9 @@ async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
         await _mark_first_order_used(sb, order_id)
     except Exception as e:
         print(f"[SlipOK] post-confirm error: {e}")
+    # P3: ยิง purchase event ตอนสลิปผ่านจริงเท่านั้น (dedupe ต่อ order — ยิงกี่ครั้งก็ 1 แถว)
+    await _log_event(sb, "purchase", event_id=f"purchase-{order_id}", order_id=order_id,
+                     value=float(total or slip_amount or 0), phone=phone, source="web")
     warn = ""
     if slip_amount and total and abs(slip_amount - total) > 2:
         warn = f"\n⚠️ ยอดสลิป ฿{slip_amount:,.0f} ≠ ยอด order ฿{total:,.0f} — โปรดตรวจ"
@@ -3666,6 +3734,11 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         f"ดูสถานะ: velacoldbrew.com/account",
         f"VeLA Cold Brew: ยืนยันการชำระเงินออเดอร์ #{order_id} แล้วค่ะ กำลังแพ็คและจัดส่ง เดี๋ยวแจ้งเลขพัสดุอีกทีนะคะ ดูสถานะ velacoldbrew.com/account",
         "payment_confirmed")
+
+    # P3: ยิง purchase event (admin กดยืนยันเอง) — dedupe ต่อ order เดียวกับ path สลิปอัตโนมัติ
+    await _log_event(sb, "purchase", event_id=f"purchase-{order_id}", order_id=order_id,
+                     value=float(order.get("total") or 0), phone=phone or "",
+                     source=(order.get("channel") or "web"))
 
     return {
         "success":  True,
