@@ -3456,6 +3456,140 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
     return {"success": True, "order_id": body.order_id, "tracking": body.tracking.strip().upper()}
 
 
+# ============================================================
+#  Auto-import เลขแทรกจากใบเสร็จ ShipSmile (VeLA_WEB_BILL_*.pdf)
+#  parse ด้วย PyMuPDF (อ่านไทยเป๊ะ) → จับคู่ order ด้วย ชื่อ+ซิป → พร้อมส่ง
+# ============================================================
+_SHIP_TRACK_RE = re.compile(r'^[A-Z]{2,4}\d{8,}[A-Z]{0,2}$')
+
+def _parse_ship_bill(data: bytes) -> list:
+    """อ่านใบเสร็จ ShipSmile → [{tracking, carrier, name, zip, weight_g}] ต่อรายการ"""
+    import pymupdf
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    text = "\n".join(pg.get_text() for pg in doc)
+    lines = [l.strip() for l in text.split("\n")]
+    items, cur = [], None
+    for l in lines:
+        m = re.match(r'^\d+\.\s+.*?(\d{5})\s*$', l)   # "1. ช่องนนทรี 10120"
+        if m:
+            if cur:
+                items.append(cur)
+            cur = {"tracking": "", "carrier": "", "name": "", "zip": m.group(1), "weight_g": None}
+            continue
+        if cur is None:
+            continue
+        if _SHIP_TRACK_RE.match(l):
+            cur["tracking"] = l
+        elif l.startswith("ขนส่ง") and ":" in l:
+            cur["carrier"] = l.split(":", 1)[1].strip()
+        elif l.startswith("ผู้รับ") and ":" in l:
+            cur["name"] = l.split(":", 1)[1].strip()
+        else:
+            mw = re.search(r'([\d,]+)\s*g\.', l)
+            if mw and cur["weight_g"] is None:
+                try: cur["weight_g"] = int(mw.group(1).replace(",", ""))
+                except ValueError: pass
+    if cur:
+        items.append(cur)
+    return [it for it in items if it["tracking"]]
+
+
+def _norm_ship_name(s: str) -> str:
+    s = (s or "")
+    for p in ("คุณ", "khun", "Khun", "คุน", "K."):
+        s = s.replace(p, "")
+    return re.sub(r'\s+', '', s).strip().lower()
+
+
+def _match_ship_order(cand: list, it: dict, used: set):
+    """จับคู่รายการในบิลกับออเดอร์ที่ชำระแล้ว — คืน (order_id|None, confidence, candidates[])"""
+    nb = _norm_ship_name(it.get("name"))
+    z  = str(it.get("zip") or "")
+    avail = [o for o in cand if o["order_id"] not in used]
+    def nm(o): return _norm_ship_name(o.get("customer"))
+    def zp(o): return str(o.get("zip") or "")
+    hit = [o for o in avail if nb and nm(o) == nb and zp(o) == z]
+    if len(hit) == 1: return hit[0]["order_id"], "high", []
+    namec = [o for o in avail if nm(o) and (nb in nm(o) or nm(o) in nb)]
+    nz = [o for o in namec if zp(o) == z]
+    if len(nz) == 1: return nz[0]["order_id"], "high", []
+    if len(namec) == 1: return namec[0]["order_id"], "name", []
+    zipc = [o for o in avail if zp(o) == z]
+    if len(zipc) == 1: return zipc[0]["order_id"], "zip", []
+    pool = {o["order_id"]: o for o in (namec + zipc)}
+    cands = [{"order_id": o["order_id"], "customer": o.get("customer"), "zip": o.get("zip")}
+             for o in list(pool.values())[:8]]
+    return None, "manual", cands
+
+
+async def _apply_shipping(sb, order_id: str, tracking: str, carrier: str = "", ship_date: str = None):
+    """เขียนเลขแทรก+ขนส่ง เข้า shipping + เลื่อนออเดอร์เป็นพร้อมส่ง (ไม่ยุ่งค่าส่ง)"""
+    ship_date = ship_date or datetime.utcnow().strftime("%Y-%m-%d")
+    trk = (tracking or "").strip().upper()
+    car = business_carrier(trk, carrier)
+    sb.table("shipping").upsert({
+        "order_id": order_id, "ship_date": ship_date, "carrier": car, "tracking": trk,
+    }, on_conflict="tracking").execute()
+    self_delivery = (not trk) or trk == "-"
+    sb.table("orders").update({
+        "status":    "จัดส่งแล้ว" if self_delivery else "เตรียมจัดส่ง",
+        "ship_date": ship_date,
+    }).eq("order_id", order_id).execute()
+    if not self_delivery:
+        ex = sb.table("shipments").select("barcode").eq("barcode", trk).execute()
+        if not ex.data:
+            sb.table("shipments").insert({"barcode": trk, "status": "pending"}).execute()
+
+
+@app.post("/admin/parse-shipping-bill")
+async def parse_shipping_bill(file: UploadFile = File(...), x_api_key: str = Header(default="")):
+    """อัปโหลดใบเสร็จ ShipSmile → คืน preview การจับคู่ (ยังไม่ commit)"""
+    check_admin_key(x_api_key)
+    data = await file.read()
+    try:
+        items = _parse_ship_bill(data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"อ่าน PDF ไม่สำเร็จ: {e}")
+    if not items:
+        raise HTTPException(status_code=400, detail="ไม่พบรายการเลขแทรกในไฟล์ (ตรวจว่าเป็นใบเสร็จ ShipSmile)")
+    sb = get_supabase()
+    cand = (sb.table("orders").select("order_id,customer,zip,phone,status")
+            .eq("status", "ชำระแล้ว").limit(1000).execute().data) or []
+    used, out = set(), []
+    for it in items:
+        oid, conf, cands = _match_ship_order(cand, it, used)
+        if oid:
+            used.add(oid)
+        out.append({**it, "order_id": oid, "confidence": conf, "candidates": cands})
+    return {"success": True, "count": len(out), "matched": len(used), "items": out,
+            "orders": [{"order_id": o["order_id"], "customer": o.get("customer"), "zip": o.get("zip")} for o in cand]}
+
+
+class ApplyBillRequest(BaseModel):
+    items: list
+
+@app.post("/admin/apply-shipping-bill")
+async def apply_shipping_bill(body: ApplyBillRequest, x_api_key: str = Header(default="")):
+    """ยืนยัน preview → เขียนเลขแทรกเข้าออเดอร์จริง (พร้อมส่ง)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    applied, errors = [], []
+    for raw in (body.items or []):
+        if not isinstance(raw, dict):
+            continue
+        oid = (raw.get("order_id") or "").strip()
+        trk = (raw.get("tracking") or "").strip()
+        car = (raw.get("carrier") or "").strip()
+        if not oid or not trk:
+            continue
+        try:
+            await _apply_shipping(sb, oid, trk, car)
+            applied.append(oid)
+        except Exception as e:
+            errors.append({"order_id": oid, "error": str(e)})
+    return {"success": True, "applied": applied, "errors": errors}
+
+
 class FixTrackingRequest(BaseModel):
     order_id: str
     tracking: str                       # เลขพัสดุใหม่ (ที่ถูก)
