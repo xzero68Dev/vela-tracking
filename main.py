@@ -1136,6 +1136,37 @@ class BulkRequest(BaseModel):
 
 # ---- Endpoints ----
 
+# ── กัน Supabase Gateway Timeout (HTTP 504) / statement timeout (57014) ──
+# PostgREST คืน 504 เป็นครั้งคราวเวลา pooler/edge ช้า — retry สั้นๆ ก่อนยอมแพ้
+# ถ้ายังไม่ผ่านคืน 503 (Service Unavailable) พร้อมข้อความ ไม่ปล่อยเป็น 500 ดิบ
+_TIMEOUT_HINTS = ("gateway timeout", "timeout", "57014", "canceling statement", "504")
+
+def _is_timeout_err(e: Exception) -> bool:
+    s = str(getattr(e, "message", "") or e).lower()
+    code = str(getattr(e, "code", "") or "")
+    return code == "57014" or any(h in s for h in _TIMEOUT_HINTS)
+
+def db_execute(builder, *, retries: int = 2, delay: float = 0.6, label: str = "query"):
+    """execute() พร้อม retry เฉพาะเคส timeout ของ Supabase
+    - retries=2 → ยิงรวม 3 ครั้ง
+    - ถ้า timeout ทุกครั้ง → HTTPException 503 (ไม่ใช่ 500) ให้ client รู้ว่า 'ลองใหม่ได้'"""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return builder.execute()
+        except Exception as e:
+            last = e
+            if not _is_timeout_err(e):
+                raise
+            print(f"[db_execute] {label} timeout (attempt {attempt+1}/{retries+1}): {e}")
+            if attempt < retries:
+                time.sleep(delay)
+    raise HTTPException(
+        status_code=503,
+        detail="ฐานข้อมูลตอบช้าชั่วคราว (Supabase gateway timeout) กรุณาลองใหม่อีกครั้ง",
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "VeLA Tracking API v2"}
@@ -1150,7 +1181,7 @@ async def get_products(show_all: bool = False):
     q = sb.table("products").select("*")
     if not show_all:
         q = q.eq("active", True)
-    res = q.order("sort_order").execute()
+    res = db_execute(q.order("sort_order"), label="get_products")
     products = []
     for p in (res.data or []):
         price      = int(p.get("price") or 0)
