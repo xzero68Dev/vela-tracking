@@ -2126,6 +2126,28 @@ async def check_now():
     return {"message": "กำลังเช็คสถานะ... ดูผลได้ที่ /shipments"}
 
 
+class CancelShipmentsRequest(BaseModel):
+    barcodes: list[str]
+
+@app.post("/shipments/cancel")
+async def cancel_shipments(body: CancelShipmentsRequest, x_api_key: str = Header(default="")):
+    """เคลียร์เลขพัสดุที่ค้าง (เช่น ลูกค้ายกเลิกออเดอร์ใน Shopee เลขเลยไม่เคยถูกสแกน)
+    → mark 'ยกเลิก' + is_done=true : หลุดจากรายการ 'ยังไม่สำเร็จ' และ cron หยุดตามเช็ค
+    ไม่ลบทิ้ง เก็บประวัติไว้"""
+    check_admin_key(x_api_key)
+    bcs = [str(b).strip() for b in (body.barcodes or []) if b and str(b).strip()]
+    if not bcs:
+        raise HTTPException(status_code=400, detail="ไม่มีเลขพัสดุ")
+    sb = get_supabase()
+    sb.table("shipments").update({
+        "status":          "cancelled",
+        "status_th":       "ยกเลิก",
+        "is_done":         True,
+        "last_checked_at": datetime.utcnow().isoformat(),
+    }).in_("barcode", bcs).execute()
+    return {"cancelled": bcs, "count": len(bcs)}
+
+
 # ---- Import Excel ----
 from fastapi import UploadFile, File
 import io
