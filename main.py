@@ -3581,18 +3581,22 @@ async def _apply_shipping(sb, order_id: str, tracking: str, carrier: str = "", s
     ship_date = ship_date or datetime.utcnow().strftime("%Y-%m-%d")
     trk = (tracking or "").strip().upper()
     car = business_carrier(trk, carrier)
-    sb.table("shipping").upsert({
+    # ครอบ db_execute (retry กัน Supabase Gateway Timeout) — สำคัญที่สุดคือ orders.update
+    # ถ้า update สถานะหลุดเพราะ timeout ออเดอร์จะค้าง 'ชำระแล้ว' ทั้งที่เลขแทรกเข้าแล้ว
+    db_execute(sb.table("shipping").upsert({
         "order_id": order_id, "ship_date": ship_date, "carrier": car, "tracking": trk,
-    }, on_conflict="tracking").execute()
+    }, on_conflict="tracking"), label="apply_shipping.shipping")
     self_delivery = (not trk) or trk == "-"
-    sb.table("orders").update({
+    db_execute(sb.table("orders").update({
         "status":    "จัดส่งแล้ว" if self_delivery else "เตรียมจัดส่ง",
         "ship_date": ship_date,
-    }).eq("order_id", order_id).execute()
+    }).eq("order_id", order_id), label="apply_shipping.orders")
     if not self_delivery:
-        ex = sb.table("shipments").select("barcode").eq("barcode", trk).execute()
+        ex = db_execute(sb.table("shipments").select("barcode").eq("barcode", trk),
+                        label="apply_shipping.shipments_check")
         if not ex.data:
-            sb.table("shipments").insert({"barcode": trk, "status": "pending"}).execute()
+            db_execute(sb.table("shipments").insert({"barcode": trk, "status": "pending"}),
+                       label="apply_shipping.shipments_insert")
 
 
 @app.post("/admin/parse-shipping-bill")
