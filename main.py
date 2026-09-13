@@ -1873,7 +1873,8 @@ async def admin_orders_list(sort: str = "created_at", limit: int = 1000,
     id_list = [i.strip() for i in (ids or "").split(",") if i.strip()]
     if id_list:
         query = query.in_("order_id", id_list)
-    res = query.order(sort_col, desc=True).limit(min(int(limit or 1000), 2000)).execute()
+    res = db_execute(query.order(sort_col, desc=True).limit(min(int(limit or 1000), 2000)),
+                     label="admin_orders_list")
     orders = res.data or []
     _join_tracking(sb, orders)
     return {"orders": orders, "count": len(orders)}
