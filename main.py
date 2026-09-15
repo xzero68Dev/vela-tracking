@@ -3809,6 +3809,48 @@ async def web_accounting(x_api_key: str = Header(default="")):
     return {"rows": rows}
 
 
+class SetShippingCostRequest(BaseModel):
+    order_id: str
+    shipping: float
+
+@app.post("/admin/accounting/set-shipping")
+async def set_accounting_shipping(body: SetShippingCostRequest, x_api_key: str = Header(default="")):
+    """กรอกค่าส่งจริงของออเดอร์เว็บในหน้าบัญชี → อัปเดต accounting.shipping + คำนวณ net_profit ใหม่
+    (ออเดอร์เว็บที่นำเข้าเลขแทรกจากบิลไม่ได้ใส่ค่าส่ง ต้องมากรอกเองที่นี่)"""
+    check_admin_key(x_api_key)
+    oid = (body.order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
+    try:
+        ship = round(float(body.shipping or 0), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="ค่าส่งไม่ถูกต้อง")
+    if ship < 0:
+        raise HTTPException(status_code=400, detail="ค่าส่งต้องไม่ติดลบ")
+    sb = get_supabase()
+    cur = db_execute(sb.table("accounting")
+        .select("revenue,coffee_cost,packaging,other,shopee_fee")
+        .eq("order_id", oid).limit(1), label="set_shipping.read")
+    if not cur.data:
+        raise HTTPException(status_code=404,
+            detail=f"ยังไม่มีบัญชีของ {oid} — กดปุ่ม 'คำนวณต้นทุน/กำไรย้อนหลัง' ก่อน แล้วค่อยกรอกค่าส่ง")
+    a = cur.data[0]
+    def _num(v):
+        try: return float(v or 0)
+        except (TypeError, ValueError): return 0.0
+    net = round(_num(a.get("revenue")) - _num(a.get("coffee_cost")) - _num(a.get("packaging"))
+                - ship - _num(a.get("other")) - _num(a.get("shopee_fee")), 2)
+    db_execute(sb.table("accounting").update({"shipping": ship, "net_profit": net})
+        .eq("order_id", oid), label="set_shipping.update")
+    # อัปเดต shipping_cost ในตาราง shipping ด้วย (เผื่อรายงาน/สรุปรายวันอ้างอิง) — ไม่มีแถวก็ข้าม
+    try:
+        db_execute(sb.table("shipping").update({"shipping_cost": ship}).eq("order_id", oid),
+                   label="set_shipping.shipping_tbl")
+    except Exception as e:
+        print(f"[set-shipping] shipping table update skip: {e}")
+    return {"success": True, "order_id": oid, "shipping": ship, "net_profit": net}
+
+
 @app.post("/admin/confirm-delivered")
 async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str = Header(default="")):
     """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE"""
