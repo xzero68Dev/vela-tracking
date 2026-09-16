@@ -116,6 +116,32 @@ async def send_line_notify(line_user_id: str, message: str, barcode: str = "", s
     return success
 
 
+# ---- เตือนเติมเครดิต SMS เข้า LINE แอดมิน ----
+SMS_CREDIT_LOW_THRESHOLD  = int(os.getenv("SMS_CREDIT_LOW_THRESHOLD", "50"))      # เตือนล่วงหน้าเมื่อเครดิตเหลือ <= ค่านี้
+SMS_CREDIT_ALERT_COOLDOWN = int(os.getenv("SMS_CREDIT_ALERT_COOLDOWN", "21600"))  # กันสแปม: เตือนซ้ำได้ทุก 6 ชม.
+_last_sms_credit_alert = 0.0
+
+async def _alert_admin_low_credit(reason: str):
+    """แจ้งแอดมินทาง LINE ว่าเครดิต SMS ใกล้หมด/หมด — กันสแปมด้วย cooldown"""
+    global _last_sms_credit_alert
+    if not ADMIN_LINE_USER_ID:
+        return
+    now = time.time()
+    if now - _last_sms_credit_alert < SMS_CREDIT_ALERT_COOLDOWN:
+        return   # เพิ่งเตือนไป ยังไม่ถึงเวลาเตือนซ้ำ
+    _last_sms_credit_alert = now
+    try:
+        await send_line_notify(
+            ADMIN_LINE_USER_ID,
+            "⚠️ เครดิต SMS VeLA\n" + reason +
+            "\n\nผลกระทบ: ลูกค้าที่ล็อกอินด้วยเบอร์ (OTP) จะเข้าไม่ได้ และ SMS แจ้งสลิป/เลขพัสดุ/เตือนค้างชำระจะไม่ถูกส่ง (LINE ยังปกติ)\n"
+            "👉 เติมเครดิตที่ Thaibulksms แล้วระบบจะกลับมาเองค่ะ 🐰"
+        )
+        print(f"[SMS] ⚠️ แจ้งแอดมินเรื่องเครดิตแล้ว: {reason}")
+    except Exception as e:
+        print(f"[SMS] แจ้งแอดมินไม่สำเร็จ: {e}")
+
+
 async def send_sms(phone: str, message: str, barcode: str = "", status: str = "", customer: str = "", force: bool = False):
     """ส่ง SMS ผ่าน Thaibulksms พร้อม log (force=True ข้าม dedup ให้ส่งซ้ำได้)"""
     if not SMS_API_KEY or not SMS_API_SECRET:
@@ -159,8 +185,19 @@ async def send_sms(phone: str, message: str, barcode: str = "", status: str = ""
             if success:
                 credit_left = data.get("remaining_credit", "?")
                 print(f"[SMS] ✓ ส่งไปที่ ...{phone[-4:]} สำเร็จ (เครดิตคงเหลือ: {credit_left})")
+                # เตือนล่วงหน้าเมื่อเครดิตใกล้หมด (ก่อนถึง 0 จะได้เติมทัน)
+                try:
+                    cl = float(str(credit_left).replace(",", ""))
+                    if cl <= SMS_CREDIT_LOW_THRESHOLD:
+                        await _alert_admin_low_credit(f"เครดิตเหลือ {cl:.0f} เครดิต (ต่ำกว่าเกณฑ์เตือน {SMS_CREDIT_LOW_THRESHOLD})")
+                except (TypeError, ValueError):
+                    pass
             else:
                 print(f"[SMS] ✗ ส่งไม่สำเร็จ: {data}")
+                # เครดิตหมด (code 116 ERROR_INSUFFICIENT_CREDIT) → เตือนแอดมินทันที
+                err = data.get("error") or {}
+                if err.get("code") == 116 or "INSUFFICIENT" in str(err.get("name", "")).upper():
+                    await _alert_admin_low_credit("เครดิตหมดแล้ว — ส่ง SMS ไม่ได้")
     except Exception as e:
         print(f"[SMS] ERROR: {e}")
 
