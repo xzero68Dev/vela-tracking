@@ -1481,6 +1481,54 @@ async def my_orders(phone: str, limit: int = 20, x_auth_token: str = Header(defa
     _join_tracking(sb, orders)
     return {"orders": orders, "count": len(orders)}
 
+
+@app.delete("/my/order/{order_id}")
+async def delete_my_order(order_id: str, phone: str = "", x_auth_token: str = Header(default="")):
+    """ลูกค้าลบออเดอร์ 'ค้างชำระ' ของตัวเองได้ (เช่น สั่งซ้ำตอนระบบมีปัญหา)
+    - ลบได้เฉพาะสถานะ 'รอชำระเงิน' เท่านั้น — ออเดอร์ที่ยืนยัน/ชำระแล้วลบไม่ได้
+    - ต้องเป็นเจ้าของ (เบอร์ตรงกับออเดอร์ + customer token)
+    - ถ้าออเดอร์ใช้สิทธิ์ลูกค้าใหม่ 50% → คืนสิทธิ์ให้กลับมาใช้ได้"""
+    oid = (order_id or "").strip()
+    ph  = _norm_phone(phone or "")
+    if not oid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
+    _check_customer(x_auth_token, phone=ph if ph else None)
+    sb = get_supabase()
+    res = db_execute(sb.table("orders")
+        .select("order_id,phone,account_phone,status,first_order_discount")
+        .eq("order_id", oid).limit(1), label="del_my_order.read")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์นี้")
+    order = res.data[0]
+    # เช็คเจ้าของ: เบอร์ผู้เรียกต้องตรงกับเบอร์ในออเดอร์ (ผู้รับ หรือ เบอร์บัญชีที่สั่ง)
+    owner_phones = {_norm_phone(order.get("phone") or ""), _norm_phone(order.get("account_phone") or "")}
+    owner_phones.discard("")
+    if ph and owner_phones and ph not in owner_phones:
+        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์ลบออเดอร์นี้")
+    # ลบได้เฉพาะค้างชำระ — ยืนยัน/ชำระแล้วห้ามลบ
+    status = (order.get("status") or "").strip()
+    if status != "รอชำระเงิน":
+        raise HTTPException(status_code=400,
+            detail="ออเดอร์นี้ยืนยัน/ชำระแล้ว ลบไม่ได้ หากต้องการยกเลิกกรุณาติดต่อร้าน")
+    # ลบลูกก่อนพ่อ (กัน FK) — ค้างชำระปกติไม่มีอยู่แล้ว แต่ใส่ให้ครบ
+    for tbl in ("accounting", "shipping"):
+        try:
+            db_execute(sb.table(tbl).delete().eq("order_id", oid), label=f"del_my_order.{tbl}")
+        except Exception as e:
+            print(f"[del-my-order] ลบ {tbl} error: {e}")
+    db_execute(sb.table("orders").delete().eq("order_id", oid), label="del_my_order.orders")
+    # คืนสิทธิ์ลูกค้าใหม่ 50% ถ้าออเดอร์นี้ใช้สิทธิ์ (กลับมาสั่งใหม่ยังได้ส่วนลด)
+    if order.get("first_order_discount"):
+        rp = (order.get("account_phone") or order.get("phone") or "").strip()
+        if rp:
+            try:
+                db_execute(sb.table("customers").update({"first_order_used": False}).eq("phone", rp),
+                           label="del_my_order.first_order")
+            except Exception as e:
+                print(f"[del-my-order] คืนสิทธิ์ error: {e}")
+    print(f"[del-my-order] ลูกค้าลบออเดอร์ค้างชำระ {oid} (เบอร์ ...{ph[-4:] if ph else '?'})")
+    return {"success": True, "deleted": oid}
+
 # field ที่ปลอดภัยจะโชว์ผ่านลิงก์ order-complete (เปิดด้วย order_id อย่างเดียว ไม่มี auth)
 # → ตัด PII ออก (ชื่อ/เบอร์/ที่อยู่/สลิป) กัน IDOR: ใครเดา/ได้ลิงก์ไปก็เห็นแค่รายการ+ยอด+สถานะ
 _PUBLIC_ORDER_FIELDS = ("order_id,order_date,ship_date,sku,qty,total,status,"
