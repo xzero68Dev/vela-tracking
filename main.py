@@ -1136,6 +1136,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(run_cron,              "interval", hours=3,    id="tracking_cron")
     scheduler.add_job(keep_alive,            "interval", minutes=10, id="keep_alive")
     scheduler.add_job(recheck_pending_slips, "interval", minutes=2,  id="slip_recheck")
+    scheduler.add_job(referral_confirm_cron, "interval", hours=24,   id="referral_confirm")
     scheduler.start()
     print("[scheduler] cron started — tracking ทุก 3 ชม., keep-alive ทุก 10 นาที, เช็คสลิปค้างธนาคาร ทุก 2 นาที")
     yield
@@ -1529,7 +1530,386 @@ async def delete_my_order(order_id: str, phone: str = "", x_auth_token: str = He
     print(f"[del-my-order] ลูกค้าลบออเดอร์ค้างชำระ {oid} (เบอร์ ...{ph[-4:] if ph else '?'})")
     return {"success": True, "deleted": oid}
 
-# field ที่ปลอดภัยจะโชว์ผ่านลิงก์ order-complete (เปิดด้วย order_id อย่างเดียว ไม่มี auth)
+
+# ============================================================
+#  Referral / Affiliate (ชั้นเดียว) — เว็บเท่านั้น
+#  หลักการ: ทุก hook ครอบ try/except ที่ caller — ระบบขาย/จ่ายเงินต้องไม่พังเพราะ referral
+# ============================================================
+REFERRAL_PCT           = float(os.getenv("REFERRAL_PCT", "0.10"))          # 10% ของยอดจ่ายจริง
+REFERRAL_BONUS_FIRST5  = float(os.getenv("REFERRAL_BONUS_FIRST5", "30"))   # โบนัส 5 คนแรก /คน
+REFERRAL_BONUS_COUNT   = int(os.getenv("REFERRAL_BONUS_COUNT", "5"))
+REFERRAL_MIN_PAYOUT    = float(os.getenv("REFERRAL_MIN_PAYOUT", "300"))
+REFERRAL_CONFIRM_DAYS  = int(os.getenv("REFERRAL_CONFIRM_DAYS", "7"))
+REFERRAL_BINDING_DAYS  = int(os.getenv("REFERRAL_BINDING_DAYS", "365"))     # 12 เดือน
+_PAID_STATUSES = ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ")
+
+def _norm_ref_code(code) -> str:
+    """โค้ด referral: a-z0-9 ตัวเล็ก ยาว 6 — คืน '' ถ้าไม่ถูกรูปแบบ"""
+    c = re.sub(r"[^a-z0-9]", "", str(code or "").strip().lower())
+    return c[:6] if len(c) >= 4 else ""
+
+def _phone9(p: str) -> str:
+    """9 หลักท้าย ใช้เทียบว่าเป็นเบอร์เดียวกัน (กันผู้ซื้อ=ผู้แนะนำ)"""
+    d = re.sub(r"\D", "", p or "")
+    return d[-9:] if len(d) >= 9 else d
+
+def _gen_ref_code(sb) -> str:
+    """สุ่มโค้ด 6 ตัว unique (a-z0-9) — เลี่ยงตัวสับสน 0/o/1/l"""
+    import random
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    for _ in range(20):
+        code = "".join(random.choice(alphabet) for _ in range(6))
+        try:
+            ex = sb.table("customers").select("phone").eq("ref_code", code).limit(1).execute()
+            if not ex.data:
+                return code
+        except Exception:
+            return code
+    return code
+
+def _referrer_by_code(sb, code: str):
+    """หา referrer (ที่เปิดใช้งาน) จาก ref_code — คืน dict หรือ None"""
+    rc = _norm_ref_code(code)
+    if not rc:
+        return None
+    try:
+        r = sb.table("customers").select("phone,is_referrer,ref_code").eq("ref_code", rc).limit(1).execute()
+        if r.data and r.data[0].get("is_referrer"):
+            return r.data[0]
+    except Exception as e:
+        print(f"[referral] lookup code error: {e}")
+    return None
+
+async def _apply_referral_on_paid(sb, order_id: str):
+    """[hook] ออเดอร์กลายเป็น 'ชำระแล้ว' → ผูกลูกค้า↔ผู้แนะนำ (ออเดอร์แรก) + บันทึกคอม 10%
+    idempotent: earnings unique (order_id,kind) กันซ้ำ; binding unique customer_phone
+    ปลอดภัย: error ใดๆ ไม่กระทบ flow จ่ายเงิน (caller ครอบ try/except อีกชั้น)"""
+    res = db_execute(sb.table("orders")
+        .select("order_id,phone,account_phone,ref_code,total,status,channel,created_at")
+        .eq("order_id", order_id).limit(1), label="referral.read_order")
+    if not res.data:
+        return
+    o = res.data[0]
+    if (o.get("channel") or "web") != "web":
+        return
+    if (o.get("status") or "") not in _PAID_STATUSES:
+        return
+    cust_phone = _norm_phone(o.get("account_phone") or o.get("phone") or "")
+    if not cust_phone:
+        return
+    now = datetime.utcnow()
+
+    # หา binding เดิม (ลูกค้าคนนี้เคยผูกผู้แนะนำไว้แล้วภายใน 12 เดือน)
+    b = db_execute(sb.table("referral_bindings")
+        .select("referrer_phone,expires_at").eq("customer_phone", cust_phone).limit(1),
+        label="referral.read_binding")
+    binding = b.data[0] if b.data else None
+    is_new_binding = False
+
+    if not binding:
+        # ยังไม่ผูก → ต้องมี ref_code บนออเดอร์นี้ถึงจะผูกได้
+        ref = _referrer_by_code(sb, o.get("ref_code"))
+        if not ref:
+            return
+        referrer_phone = _norm_phone(ref.get("phone") or "")
+        if not referrer_phone:
+            return
+        # กันผู้ซื้อ = ผู้แนะนำ
+        if _phone9(referrer_phone) == _phone9(cust_phone):
+            print(f"[referral] {order_id} ข้าม — ผู้ซื้อ=ผู้แนะนำ")
+            return
+        # กันลูกค้าเก่า: ถ้าเคยมีออเดอร์เว็บ paid มาก่อนหน้านี้ (คนละ order) = ไม่นับเป็นลูกค้าแนะนำ
+        prev = db_execute(sb.table("orders")
+            .select("order_id").eq("phone", cust_phone).eq("channel", "web")
+            .in_("status", list(_PAID_STATUSES)).neq("order_id", order_id).limit(1),
+            label="referral.prev_paid")
+        if prev.data:
+            print(f"[referral] {order_id} ข้าม — ลูกค้าเก่า (เคยซื้อเว็บก่อนคลิกลิงก์)")
+            return
+        expires = now + timedelta(days=REFERRAL_BINDING_DAYS)
+        try:
+            db_execute(sb.table("referral_bindings").insert({
+                "referrer_phone": referrer_phone,
+                "customer_phone": cust_phone,
+                "bound_at":       now.isoformat(),
+                "expires_at":     expires.isoformat(),
+            }), label="referral.bind")
+            is_new_binding = True
+            print(f"[referral] ผูกลูกค้าใหม่ ...{cust_phone[-4:]} → ผู้แนะนำ ...{referrer_phone[-4:]}")
+        except Exception as e:
+            # อาจชนกัน (race) — อ่านใหม่
+            print(f"[referral] bind race/err: {e}")
+            b2 = db_execute(sb.table("referral_bindings").select("referrer_phone,expires_at")
+                .eq("customer_phone", cust_phone).limit(1), label="referral.rebind")
+            binding = b2.data[0] if b2.data else None
+            referrer_phone = _norm_phone((binding or {}).get("referrer_phone") or referrer_phone)
+    else:
+        referrer_phone = _norm_phone(binding.get("referrer_phone") or "")
+        # หมดอายุผูกแล้ว → ไม่นับคอม
+        try:
+            exp = datetime.fromisoformat(str(binding.get("expires_at")).replace("Z", "+00:00")).replace(tzinfo=None)
+            if now > exp:
+                print(f"[referral] {order_id} ข้าม — binding หมดอายุ")
+                return
+        except Exception:
+            pass
+
+    if not referrer_phone or _phone9(referrer_phone) == _phone9(cust_phone):
+        return
+
+    base = round(float(o.get("total") or 0), 2)
+    if base <= 0:
+        return
+    commission = round(base * REFERRAL_PCT, 2)
+
+    # คอม 10% (dedupe ด้วย unique order_id+kind)
+    try:
+        db_execute(sb.table("referral_earnings").insert({
+            "referrer_phone": referrer_phone, "customer_phone": cust_phone,
+            "order_id": order_id, "base_amount": base, "commission": commission,
+            "kind": "commission", "status": "pending",
+        }), label="referral.earn")
+        print(f"[referral] คอม ฿{commission:.2f} (order {order_id}) → ...{referrer_phone[-4:]}")
+    except Exception as e:
+        print(f"[referral] earn dup/err {order_id}: {e}")
+
+    # โบนัส 5 คนแรก — เฉพาะตอนผูกลูกค้าใหม่ และผู้แนะนำยังมี binding ≤ 5 คน
+    if is_new_binding and REFERRAL_BONUS_FIRST5 > 0:
+        try:
+            cnt = db_execute(sb.table("referral_bindings").select("id", count="exact")
+                .eq("referrer_phone", referrer_phone), label="referral.bind_count")
+            total_bound = cnt.count if getattr(cnt, "count", None) is not None else len(cnt.data or [])
+            if total_bound <= REFERRAL_BONUS_COUNT:
+                db_execute(sb.table("referral_earnings").insert({
+                    "referrer_phone": referrer_phone, "customer_phone": cust_phone,
+                    "order_id": order_id, "base_amount": 0, "commission": REFERRAL_BONUS_FIRST5,
+                    "kind": "bonus_first5", "status": "pending",
+                }), label="referral.bonus")
+                print(f"[referral] โบนัสคนที่ {total_bound} +฿{REFERRAL_BONUS_FIRST5:.0f} → ...{referrer_phone[-4:]}")
+        except Exception as e:
+            print(f"[referral] bonus err: {e}")
+
+async def _reverse_referral(sb, order_id: str):
+    """[hook] ออเดอร์ยกเลิก/คืนเงิน → ล้างคอมของออเดอร์นั้น
+    - แถวที่ยังไม่จ่าย (pending/confirmed) → set 'reversed' (ไม่ถูกจ่าย)
+    - แถวที่จ่ายไปแล้ว (paid) → insert reversal ติดลบ (หักคืนงวดถัดไป)"""
+    try:
+        rows = db_execute(sb.table("referral_earnings")
+            .select("id,referrer_phone,customer_phone,commission,kind,status")
+            .eq("order_id", order_id), label="referral.rev_read").data or []
+    except Exception as e:
+        print(f"[referral] reverse read err {order_id}: {e}")
+        return
+    for r in rows:
+        if r.get("kind") == "reversal":
+            continue
+        st = r.get("status")
+        try:
+            if st in ("pending", "confirmed"):
+                db_execute(sb.table("referral_earnings").update({"status": "reversed"})
+                    .eq("id", r["id"]), label="referral.rev_void")
+            elif st == "paid":
+                db_execute(sb.table("referral_earnings").insert({
+                    "referrer_phone": r["referrer_phone"], "customer_phone": r["customer_phone"],
+                    "order_id": f"{order_id}:rev:{r['kind']}", "base_amount": 0,
+                    "commission": -abs(float(r.get("commission") or 0)),
+                    "kind": "reversal", "status": "confirmed",
+                }), label="referral.rev_neg")
+        except Exception as e:
+            print(f"[referral] reverse err {order_id}: {e}")
+    print(f"[referral] reverse ออเดอร์ {order_id} เรียบร้อย")
+
+async def referral_confirm_cron():
+    """[cron รายวัน] คอม pending ที่ผ่าน 7 วันไม่มียกเลิก → confirmed"""
+    try:
+        sb = get_supabase()
+        cutoff = (datetime.utcnow() - timedelta(days=REFERRAL_CONFIRM_DAYS)).isoformat()
+        res = sb.table("referral_earnings").update({"status": "confirmed"}) \
+            .eq("status", "pending").in_("kind", ["commission", "bonus_first5"]) \
+            .lte("created_at", cutoff).execute()
+        n = len(res.data or [])
+        if n:
+            print(f"[referral-cron] ยืนยันคอม {n} รายการ (ผ่าน {REFERRAL_CONFIRM_DAYS} วัน)")
+    except Exception as e:
+        print(f"[referral-cron] error: {e}")
+
+
+# ---- Referral endpoints (ลูกค้า) ----
+class ReferralRegisterRequest(BaseModel):
+    phone:        Optional[str] = None
+    line_user_id: Optional[str] = None
+    promptpay:    Optional[str] = None
+
+@app.post("/referral/register")
+async def referral_register(body: ReferralRegisterRequest, x_auth_token: str = Header(default="")):
+    """สมัครเป็นผู้แนะนำ — ออก ref_code ให้ทันที (ไม่มีรออนุมัติ)"""
+    ph = _norm_phone(body.phone or "")
+    _check_customer(x_auth_token, phone=ph if ph else None, line_user_id=body.line_user_id)
+    if not ph and not body.line_user_id:
+        raise HTTPException(status_code=400, detail="ต้องเข้าสู่ระบบก่อน")
+    sb = get_supabase()
+    # หา record ลูกค้า (จากเบอร์ หรือ line_user_id)
+    cust = None
+    if ph:
+        r = db_execute(sb.table("customers").select("phone,ref_code,is_referrer,promptpay").eq("phone", ph).limit(1), label="ref.reg_read")
+        cust = r.data[0] if r.data else None
+    if not cust and body.line_user_id:
+        r = db_execute(sb.table("customers").select("phone,ref_code,is_referrer,promptpay").eq("line_user_id", body.line_user_id).limit(1), label="ref.reg_read2")
+        cust = r.data[0] if r.data else None
+        if cust:
+            ph = _norm_phone(cust.get("phone") or ph)
+    if not ph:
+        raise HTTPException(status_code=400, detail="ไม่พบเบอร์โทรในบัญชี กรุณาผูกเบอร์ก่อน")
+    code = _norm_ref_code((cust or {}).get("ref_code")) or _gen_ref_code(sb)
+    payload = {"phone": ph, "is_referrer": True, "ref_code": code}
+    pp = _norm_phone(body.promptpay or "")
+    if pp:
+        payload["promptpay"] = pp
+    db_execute(sb.table("customers").upsert(payload, on_conflict="phone"), label="ref.reg_write")
+    return {"success": True, "ref_code": code,
+            "link": f"https://velacoldbrew.com/?ref={code}"}
+
+@app.post("/referral/track")
+async def referral_track(code: str = ""):
+    """นับคลิกลิงก์ (เรียกจากหน้า landing เมื่อมี ?ref=) — ไม่ต้อง auth, กันพังเงียบ"""
+    rc = _norm_ref_code(code)
+    if not rc:
+        return {"ok": False}
+    try:
+        sb = get_supabase()
+        cur = sb.table("customers").select("phone,ref_clicks").eq("ref_code", rc).limit(1).execute()
+        if cur.data:
+            clicks = int(cur.data[0].get("ref_clicks") or 0) + 1
+            sb.table("customers").update({"ref_clicks": clicks}).eq("ref_code", rc).execute()
+    except Exception as e:
+        print(f"[referral] track err: {e}")
+    return {"ok": True}
+
+@app.get("/referral/me")
+async def referral_me(phone: str, x_auth_token: str = Header(default="")):
+    """ข้อมูล dashboard ผู้แนะนำ — ไม่โชว์ PII ลูกค้า (PDPA)"""
+    ph = _norm_phone(phone or "")
+    _check_customer(x_auth_token, phone=ph if ph else None)
+    if not ph:
+        raise HTTPException(status_code=400, detail="ต้องระบุ phone")
+    sb = get_supabase()
+    r = db_execute(sb.table("customers").select("ref_code,is_referrer,promptpay,ref_clicks").eq("phone", ph).limit(1), label="ref.me_cust")
+    cust = r.data[0] if r.data else None
+    if not cust or not cust.get("is_referrer"):
+        return {"is_referrer": False}
+    now = datetime.utcnow()
+    binds = db_execute(sb.table("referral_bindings").select("customer_phone,expires_at").eq("referrer_phone", ph), label="ref.me_binds").data or []
+    active = 0
+    for b in binds:
+        try:
+            if datetime.fromisoformat(str(b.get("expires_at")).replace("Z", "+00:00")).replace(tzinfo=None) > now:
+                active += 1
+        except Exception:
+            active += 1
+    earns = db_execute(sb.table("referral_earnings")
+        .select("commission,kind,status,created_at,base_amount,customer_phone")
+        .eq("referrer_phone", ph).order("created_at", desc=True).limit(100), label="ref.me_earn").data or []
+    month_key = now.strftime("%Y-%m")
+    sum_pending_confirmed = 0.0   # คอมเดือนนี้ (pending+confirmed)
+    sum_unpaid = 0.0             # รอจ่ายทั้งหมด (confirmed ยังไม่ paid)
+    sum_paid = 0.0
+    # map เบอร์ลูกค้า → หมายเลขนิรนาม (PDPA)
+    cust_ids = {}
+    def _cid(cp):
+        if cp not in cust_ids:
+            cust_ids[cp] = len(cust_ids) + 1
+        return cust_ids[cp]
+    recent = []
+    for e in earns:
+        c = float(e.get("commission") or 0)
+        st = e.get("status")
+        if st == "paid":
+            sum_paid += c
+        if st in ("pending", "confirmed"):
+            if str(e.get("created_at") or "")[:7] == month_key:
+                sum_pending_confirmed += c
+        if st == "confirmed":
+            sum_unpaid += c
+        recent.append({
+            "date":   str(e.get("created_at") or "")[:10],
+            "base":   float(e.get("base_amount") or 0),
+            "commission": c,
+            "kind":   e.get("kind"),
+            "status": st,
+            "customer": f"ลูกค้า #{_cid(e.get('customer_phone'))}",
+        })
+    return {
+        "is_referrer": True,
+        "ref_code": cust.get("ref_code"),
+        "link": f"https://velacoldbrew.com/?ref={cust.get('ref_code')}",
+        "promptpay": cust.get("promptpay") or "",
+        "clicks": int(cust.get("ref_clicks") or 0),
+        "active_customers": active,
+        "month_commission": round(sum_pending_confirmed, 2),
+        "unpaid_total": round(sum_unpaid, 2),
+        "paid_total": round(sum_paid, 2),
+        "min_payout": REFERRAL_MIN_PAYOUT,
+        "recent": recent[:30],
+    }
+
+
+# ---- Referral endpoints (admin) ----
+@app.get("/admin/referral/payouts")
+async def admin_referral_payouts(x_api_key: str = Header(default="")):
+    """สรุปยอดรอจ่าย (confirmed) ต่อผู้แนะนำ — สำหรับโอนสิ้นเดือน"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    earns = db_execute(sb.table("referral_earnings")
+        .select("referrer_phone,commission,status").eq("status", "confirmed"), label="ref.payout_earn").data or []
+    agg = {}
+    for e in earns:
+        p = e.get("referrer_phone")
+        agg.setdefault(p, {"referrer_phone": p, "total": 0.0, "count": 0})
+        agg[p]["total"] += float(e.get("commission") or 0)
+        agg[p]["count"] += 1
+    # เติม promptpay/ชื่อ
+    phones = list(agg.keys())
+    if phones:
+        cs = db_execute(sb.table("customers").select("phone,promptpay,display_name,name,ref_code").in_("phone", phones), label="ref.payout_cust").data or []
+        cmap = {c["phone"]: c for c in cs}
+        for p, row in agg.items():
+            c = cmap.get(p, {})
+            row["promptpay"] = c.get("promptpay") or ""
+            row["name"] = c.get("display_name") or c.get("name") or ""
+            row["ref_code"] = c.get("ref_code") or ""
+            row["total"] = round(row["total"], 2)
+            row["payable"] = row["total"] >= REFERRAL_MIN_PAYOUT
+    rows = sorted(agg.values(), key=lambda x: -x["total"])
+    return {"rows": rows, "min_payout": REFERRAL_MIN_PAYOUT,
+            "grand_total": round(sum(r["total"] for r in rows), 2)}
+
+class ReferralMarkPaidRequest(BaseModel):
+    referrer_phone: str
+
+@app.post("/admin/referral/mark-paid")
+async def admin_referral_mark_paid(body: ReferralMarkPaidRequest, x_api_key: str = Header(default="")):
+    """โอนแล้ว → mark คอม confirmed ทั้งหมดของผู้แนะนำคนนี้เป็น paid"""
+    check_admin_key(x_api_key)
+    p = _norm_phone(body.referrer_phone or "")
+    if not p:
+        raise HTTPException(status_code=400, detail="ต้องระบุ referrer_phone")
+    sb = get_supabase()
+    res = db_execute(sb.table("referral_earnings")
+        .update({"status": "paid", "paid_at": datetime.utcnow().isoformat()})
+        .eq("referrer_phone", p).eq("status", "confirmed"), label="ref.mark_paid")
+    return {"success": True, "marked": len(res.data or [])}
+
+@app.post("/admin/referral/reverse")
+async def admin_referral_reverse(order_id: str, x_api_key: str = Header(default="")):
+    """[admin] ยกเลิก/คืนเงินออเดอร์ → ล้างคอมของออเดอร์นั้น (เรียกเองตอน refund)"""
+    check_admin_key(x_api_key)
+    oid = (order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
+    await _reverse_referral(get_supabase(), oid)
+    return {"success": True, "order_id": oid}
+
+
 # → ตัด PII ออก (ชื่อ/เบอร์/ที่อยู่/สลิป) กัน IDOR: ใครเดา/ได้ลิงก์ไปก็เห็นแค่รายการ+ยอด+สถานะ
 _PUBLIC_ORDER_FIELDS = ("order_id,order_date,ship_date,sku,qty,total,status,"
                         "channel,slip_status,paid_at,created_at")
@@ -2666,6 +3046,7 @@ class CreateOrderRequest(BaseModel):
     utm_term:             Optional[str] = None
     referrer:             Optional[str] = None
     landing_page:         Optional[str] = None
+    ref_code:             Optional[str] = None  # โค้ดผู้แนะนำ (referral) — จับจาก ?ref= เก็บใน localStorage
 
 def sku_code_to_ml(sku_code: str) -> int:
     """แปลง SKU code (เช่น ORIGINAL-200, KYOHO, ORIGINAL) เป็น ml — ใช้กับ order จากเว็บเท่านั้น"""
@@ -2912,6 +3293,11 @@ async def create_order(body: CreateOrderRequest):
         if v:
             order_row[k] = v
 
+    # referral — เก็บโค้ดผู้แนะนำถ้ามี (additive; ไม่กระทบราคา/flow การขาย)
+    _rc = _norm_ref_code(body.ref_code)
+    if _rc:
+        order_row["ref_code"] = _rc
+
     sb.table("orders").insert(order_row).execute()
 
     # เก็บลูกค้าลงตาราง customers อัตโนมัติ — เฉพาะเบอร์ที่ยังไม่มี (ไม่ทับข้อมูลเดิมของคน login)
@@ -3128,6 +3514,11 @@ async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
         await _mark_first_order_used(sb, order_id)
     except Exception as e:
         print(f"[SlipOK] post-confirm error: {e}")
+    # referral — บันทึกคอม (ครอบ try/except: ห้ามกระทบ flow จ่ายเงิน)
+    try:
+        await _apply_referral_on_paid(sb, order_id)
+    except Exception as e:
+        print(f"[referral] apply error (slip {order_id}): {e}")
     # P3: ยิง purchase event ตอนสลิปผ่านจริงเท่านั้น (dedupe ต่อ order — ยิงกี่ครั้งก็ 1 แถว)
     await _log_event(sb, "purchase", event_id=f"purchase-{order_id}", order_id=order_id,
                      value=float(total or slip_amount or 0), phone=phone, source="web")
@@ -4045,6 +4436,12 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         await _mark_first_order_used(sb, order_id)
     except Exception as e:
         print(f"[first_order] mark error: {e}")
+
+    # referral — บันทึกคอม (ครอบ try/except: ห้ามกระทบ flow ยืนยันจ่ายเงิน)
+    try:
+        await _apply_referral_on_paid(sb, order_id)
+    except Exception as e:
+        print(f"[referral] apply error (confirm {order_id}): {e}")
 
     # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
     await _notify_customer(sb, order_id, phone or "", order.get("customer") or "",
