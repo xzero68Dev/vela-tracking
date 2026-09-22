@@ -1541,6 +1541,8 @@ REFERRAL_BONUS_COUNT   = int(os.getenv("REFERRAL_BONUS_COUNT", "5"))
 REFERRAL_MIN_PAYOUT    = float(os.getenv("REFERRAL_MIN_PAYOUT", "300"))
 REFERRAL_CONFIRM_DAYS  = int(os.getenv("REFERRAL_CONFIRM_DAYS", "7"))
 REFERRAL_BINDING_DAYS  = int(os.getenv("REFERRAL_BINDING_DAYS", "365"))     # 12 เดือน
+# invite-only phase: ปิดสมัครทั่วไป — แอดมินเพิ่มผู้แนะนำเองก่อน (เปิดเป็น "1" ทีหลังเมื่อระบบนิ่ง)
+REFERRAL_PUBLIC_SIGNUP = os.getenv("REFERRAL_PUBLIC_SIGNUP", "0").strip().lower() in ("1", "true", "yes", "on")
 _PAID_STATUSES = ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ")
 
 def _norm_ref_code(code) -> str:
@@ -1742,7 +1744,10 @@ class ReferralRegisterRequest(BaseModel):
 
 @app.post("/referral/register")
 async def referral_register(body: ReferralRegisterRequest, x_auth_token: str = Header(default="")):
-    """สมัครเป็นผู้แนะนำ — ออก ref_code ให้ทันที (ไม่มีรออนุมัติ)"""
+    """สมัครเป็นผู้แนะนำเอง — เปิดเฉพาะเฟสสาธารณะ (REFERRAL_PUBLIC_SIGNUP=1)
+    เฟส invite-only ตอนนี้: ปิดไว้ ให้แอดมินเพิ่มผ่าน /admin/referral/add-referrer"""
+    if not REFERRAL_PUBLIC_SIGNUP:
+        raise HTTPException(status_code=403, detail="ยังไม่เปิดสมัครทั่วไป — โปรแกรมแนะนำเพื่อนเปิดเฉพาะผู้ได้รับเชิญ")
     ph = _norm_phone(body.phone or "")
     _check_customer(x_auth_token, phone=ph if ph else None, line_user_id=body.line_user_id)
     if not ph and not body.line_user_id:
@@ -1854,6 +1859,35 @@ async def referral_me(phone: str, x_auth_token: str = Header(default="")):
 
 
 # ---- Referral endpoints (admin) ----
+class AddReferrerRequest(BaseModel):
+    phone:     str
+    promptpay: Optional[str] = None
+
+@app.post("/admin/referral/add-referrer")
+async def admin_add_referrer(body: AddReferrerRequest, x_api_key: str = Header(default="")):
+    """[admin] ตั้งลูกค้าที่สมัครเว็บปกติแล้ว ให้เป็นผู้แนะนำ — ออก ref_code ให้
+    (เฟส invite-only: แอดมินเพิ่มเองเฉพาะคนที่เราไปชวน)"""
+    check_admin_key(x_api_key)
+    ph = _norm_phone(body.phone or "")
+    if not ph:
+        raise HTTPException(status_code=400, detail="ต้องระบุเบอร์โทร")
+    sb = get_supabase()
+    r = db_execute(sb.table("customers").select("phone,ref_code,is_referrer,name,display_name")
+        .eq("phone", ph).limit(1), label="ref.add_read")
+    cust = r.data[0] if r.data else None
+    if not cust:
+        raise HTTPException(status_code=404, detail=f"ยังไม่มีลูกค้าเบอร์ {ph} ในระบบ — ให้เค้าสมัคร/สั่งซื้อผ่านเว็บก่อน")
+    code = _norm_ref_code(cust.get("ref_code")) or _gen_ref_code(sb)
+    payload = {"phone": ph, "is_referrer": True, "ref_code": code}
+    pp = _norm_phone(body.promptpay or "")
+    if pp:
+        payload["promptpay"] = pp
+    db_execute(sb.table("customers").upsert(payload, on_conflict="phone"), label="ref.add_write")
+    print(f"[referral] admin ตั้งผู้แนะนำ ...{ph[-4:]} code={code}")
+    return {"success": True, "phone": ph, "ref_code": code,
+            "link": f"https://velacoldbrew.com/?ref={code}",
+            "name": cust.get("display_name") or cust.get("name") or ""}
+
 @app.get("/admin/referral/payouts")
 async def admin_referral_payouts(x_api_key: str = Header(default="")):
     """สรุปยอดรอจ่าย (confirmed) ต่อผู้แนะนำ — สำหรับโอนสิ้นเดือน"""
@@ -2446,7 +2480,7 @@ async def list_customers(q: str = "", limit: int = 200, x_api_key: str = Header(
     """รายชื่อลูกค้า + ค้นหา (เบอร์/ชื่อ) สำหรับหน้าจัดการลูกค้า"""
     check_admin_key(x_api_key)
     sb = get_supabase()
-    sel = "id,phone,name,display_name,line_user_id,notify_channel,vip_discount_pct,first_order_used,created_at"
+    sel = "id,phone,name,display_name,line_user_id,notify_channel,vip_discount_pct,first_order_used,is_referrer,ref_code,created_at"
     query = sb.table("customers").select(sel)
     q = (q or "").strip()
     if q:
