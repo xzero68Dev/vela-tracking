@@ -1741,13 +1741,18 @@ class ReferralRegisterRequest(BaseModel):
     phone:        Optional[str] = None
     line_user_id: Optional[str] = None
     promptpay:    Optional[str] = None
+    invite_code:  Optional[str] = None
+
+def _norm_invite(code) -> str:
+    """โค้ดเชิญ: a-z0-9 ตัวเล็ก ยาว 4-16"""
+    c = re.sub(r"[^a-z0-9]", "", str(code or "").strip().lower())
+    return c[:16] if 4 <= len(c) <= 16 else (c if len(c) >= 4 else "")
 
 @app.post("/referral/register")
 async def referral_register(body: ReferralRegisterRequest, x_auth_token: str = Header(default="")):
-    """สมัครเป็นผู้แนะนำเอง — เปิดเฉพาะเฟสสาธารณะ (REFERRAL_PUBLIC_SIGNUP=1)
-    เฟส invite-only ตอนนี้: ปิดไว้ ให้แอดมินเพิ่มผ่าน /admin/referral/add-referrer"""
-    if not REFERRAL_PUBLIC_SIGNUP:
-        raise HTTPException(status_code=403, detail="ยังไม่เปิดสมัครทั่วไป — โปรแกรมแนะนำเพื่อนเปิดเฉพาะผู้ได้รับเชิญ")
+    """สมัครเป็นผู้แนะนำ — เปิดได้ 2 ทาง:
+    - เฟสสาธารณะ (REFERRAL_PUBLIC_SIGNUP=1) → สมัครได้เลย
+    - เฟส invite-only (default) → ต้องมีรหัสเชิญที่ยังไม่ถูกใช้ (โค้ดใช้ครั้งเดียว/คน)"""
     ph = _norm_phone(body.phone or "")
     _check_customer(x_auth_token, phone=ph if ph else None, line_user_id=body.line_user_id)
     if not ph and not body.line_user_id:
@@ -1765,14 +1770,85 @@ async def referral_register(body: ReferralRegisterRequest, x_auth_token: str = H
             ph = _norm_phone(cust.get("phone") or ph)
     if not ph:
         raise HTTPException(status_code=400, detail="ไม่พบเบอร์โทรในบัญชี กรุณาผูกเบอร์ก่อน")
+
+    already = bool(cust and cust.get("is_referrer"))
+    invite = None
+    inv_code = ""
+    # ถ้ายังไม่เปิดสาธารณะ และยังไม่เคยเป็นผู้แนะนำ → ต้องมีรหัสเชิญที่ยังไม่ถูกใช้
+    if not REFERRAL_PUBLIC_SIGNUP and not already:
+        inv_code = _norm_invite(body.invite_code)
+        if not inv_code:
+            raise HTTPException(status_code=403, detail="ต้องมีรหัสเชิญ — โปรแกรมนี้เปิดเฉพาะผู้ได้รับคำเชิญ")
+        r = db_execute(sb.table("referral_invites").select("code,used_by").eq("code", inv_code).limit(1), label="ref.inv_read")
+        invite = r.data[0] if r.data else None
+        if not invite:
+            raise HTTPException(status_code=400, detail="รหัสเชิญไม่ถูกต้อง")
+        ub = _norm_phone(invite.get("used_by") or "")
+        if ub and _phone9(ub) != _phone9(ph):
+            raise HTTPException(status_code=400, detail="รหัสเชิญนี้ถูกใช้ไปแล้ว")
+
     code = _norm_ref_code((cust or {}).get("ref_code")) or _gen_ref_code(sb)
     payload = {"phone": ph, "is_referrer": True, "ref_code": code}
     pp = _norm_phone(body.promptpay or "")
     if pp:
         payload["promptpay"] = pp
     db_execute(sb.table("customers").upsert(payload, on_conflict="phone"), label="ref.reg_write")
+    # มาร์คโค้ดเชิญว่าถูกใช้แล้ว (ครั้งเดียว)
+    if invite is not None and not invite.get("used_by"):
+        try:
+            db_execute(sb.table("referral_invites").update({"used_by": ph, "used_at": datetime.utcnow().isoformat()})
+                       .eq("code", inv_code), label="ref.inv_use")
+        except Exception as e:
+            print(f"[referral] mark invite error: {e}")
     return {"success": True, "ref_code": code,
             "link": f"https://velacoldbrew.com/?ref={code}"}
+
+@app.get("/referral/invite/check")
+async def referral_invite_check(code: str = ""):
+    """เช็ครหัสเชิญว่าใช้ได้มั้ย (หน้า /referral เรียกก่อนโชว์ปุ่มสมัคร) — ไม่ต้อง auth"""
+    if REFERRAL_PUBLIC_SIGNUP:
+        return {"valid": True, "public": True}
+    c = _norm_invite(code)
+    if not c:
+        return {"valid": False, "reason": "empty"}
+    try:
+        sb = get_supabase()
+        r = sb.table("referral_invites").select("code,used_by").eq("code", c).limit(1).execute()
+        inv = r.data[0] if r.data else None
+        if not inv:
+            return {"valid": False, "reason": "not_found"}
+        if inv.get("used_by"):
+            return {"valid": False, "reason": "used"}
+        return {"valid": True}
+    except Exception as e:
+        print(f"[referral] invite check error: {e}")
+        return {"valid": False, "reason": "error"}
+
+class WaitlistRequest(BaseModel):
+    name:         Optional[str] = None
+    contact:      Optional[str] = None
+    line_user_id: Optional[str] = None
+    note:         Optional[str] = None
+
+@app.post("/referral/waitlist")
+async def referral_waitlist(body: WaitlistRequest):
+    """เก็บคนสนใจร่วมโปรแกรม (waitlist) — ไม่ต้อง auth, กันพังเงียบ"""
+    name = (body.name or "").strip()[:120]
+    contact = (body.contact or "").strip()[:120]
+    if not name and not contact:
+        raise HTTPException(status_code=400, detail="กรุณากรอกชื่อหรือช่องทางติดต่อ")
+    try:
+        sb = get_supabase()
+        sb.table("referral_waitlist").insert({
+            "name": name, "contact": contact,
+            "line_user_id": (body.line_user_id or "").strip() or None,
+            "note": (body.note or "").strip()[:300] or None,
+        }).execute()
+    except Exception as e:
+        print(f"[referral] waitlist error: {e}")
+        raise HTTPException(status_code=500, detail="บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง")
+    return {"success": True}
+
 
 @app.post("/referral/track")
 async def referral_track(code: str = ""):
@@ -1859,6 +1935,29 @@ async def referral_me(phone: str, x_auth_token: str = Header(default="")):
 
 
 # ---- Referral endpoints (admin) ----
+class CreateInviteRequest(BaseModel):
+    note:  Optional[str] = None
+    count: int = 1
+
+@app.post("/admin/referral/create-invite")
+async def admin_create_invite(body: CreateInviteRequest, x_api_key: str = Header(default="")):
+    """[admin] สร้างโค้ดเชิญ (a-z0-9 6 ตัว) — ส่งลิงก์ velacoldbrew.com/referral?invite=CODE ให้นักรีวิว
+    (จะสร้างจาก SQL เองก็ได้ — endpoint นี้แค่ช่วยให้สะดวก)"""
+    check_admin_key(x_api_key)
+    n = max(1, min(int(body.count or 1), 50))
+    note = (body.note or "").strip()[:200] or None
+    sb = get_supabase()
+    codes = []
+    for _ in range(n):
+        code = _gen_ref_code(sb)   # ใช้ generator เดียวกับ ref_code (unique)
+        try:
+            sb.table("referral_invites").insert({"code": code, "note": note}).execute()
+            codes.append(code)
+        except Exception as e:
+            print(f"[referral] create invite err: {e}")
+    return {"success": True, "codes": codes,
+            "links": [f"https://velacoldbrew.com/referral?invite={c}" for c in codes]}
+
 class AddReferrerRequest(BaseModel):
     phone:     str
     promptpay: Optional[str] = None
