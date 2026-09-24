@@ -16,3 +16,10 @@ CREATE TABLE IF NOT EXISTS receipts (
 
 -- ออเดอร์หนึ่งมีใบเสร็จ (ลิงก์) เดียว — upsert by order_id ในโค้ดอาศัย unique นี้
 CREATE UNIQUE INDEX IF NOT EXISTS receipts_order_id_key ON receipts (order_id);
+
+-- ===== ความปลอดภัย: เปิด RLS แต่ "ไม่ใส่ policy ให้ anon" =====
+-- data มี PII ลูกค้า (ชื่อ/ที่อยู่/เบอร์) — anon key โผล่ในหน้าเว็บ ถ้าไม่เปิด RLS
+-- ใครก็ยิง REST ด้วย anon key แล้วดึงใบเสร็จทั้งหมดได้
+-- เปิด RLS + ไม่มี policy → anon/public โดนปฏิเสธทั้งหมด
+-- backend ใช้ service key (บายพาส RLS) จึงยังอ่าน/เขียนได้ปกติ → ทุก endpoint ทำงานเหมือนเดิม
+ALTER TABLE receipts ENABLE ROW LEVEL SECURITY;
