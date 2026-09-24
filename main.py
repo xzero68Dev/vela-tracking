@@ -2127,7 +2127,7 @@ async def my_order(order_id: str):
 SHOP_INFO = {
     "name":    "VeLA Cold Brew",
     "address": "143/32 หมู่บ้านสามกองปาร์ค หมู่5 ถ.ประชาสามัคคี ต.รัษฎา อ.เมืองภูเก็ต 83000",
-    "phone":   "0906980460",
+    "phone":   "0624535388",
 }
 
 class ReceiptItemIn(BaseModel):
