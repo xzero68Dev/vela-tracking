@@ -60,12 +60,17 @@ LINE_TEMPLATES = {
 ADMIN_LINE_USER_ID = os.getenv("ADMIN_LINE_USER_ID", "U28d1b5573f79da2f3ff3f52ccc1fcf1c")
 ALERT_STATUSES = {"returned", "problem"}
 
-async def send_line_notify(line_user_id: str, message: str, barcode: str = "", status: str = "", customer: str = "", phone: str = ""):
-    """ส่งข้อความผ่าน LINE OA — retry ถ้าเจอ error ชั่วคราว (5xx/timeout) สูงสุด 3 ครั้ง"""
+async def send_line_notify(line_user_id: str, message: str, barcode: str = "", status: str = "", customer: str = "", phone: str = "", image_url: str = ""):
+    """ส่งข้อความผ่าน LINE OA — retry ถ้าเจอ error ชั่วคราว (5xx/timeout) สูงสุด 3 ครั้ง
+    image_url: ถ้ามี https ส่งรูป (image message) ต่อท้ายข้อความด้วย (เช่น รูปหลักฐานส่งของ)"""
     token = os.getenv("LINE_CHANNEL_TOKEN", "")
     if not token:
         print("[LINE] ยังไม่ได้ตั้ง LINE_CHANNEL_TOKEN")
         return False
+
+    messages = [{"type": "text", "text": message}]
+    if image_url and str(image_url).startswith("https://"):
+        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
 
     MAX_ATTEMPTS = 3
     success = False
@@ -76,7 +81,7 @@ async def send_line_notify(line_user_id: str, message: str, barcode: str = "", s
                 resp = await client.post(
                     "https://api.line.me/v2/bot/message/push",
                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    json={"to": line_user_id, "messages": [{"type": "text", "text": message}]}
+                    json={"to": line_user_id, "messages": messages}
                 )
             if resp.status_code == 200:
                 success = True
@@ -1137,6 +1142,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(keep_alive,            "interval", minutes=10, id="keep_alive")
     scheduler.add_job(recheck_pending_slips, "interval", minutes=2,  id="slip_recheck")
     scheduler.add_job(referral_confirm_cron, "interval", hours=24,   id="referral_confirm")
+    scheduler.add_job(cleanup_old_slips,     "interval", hours=24,   id="slip_cleanup")
     scheduler.start()
     print("[scheduler] cron started — tracking ทุก 3 ชม., keep-alive ทุก 10 นาที, เช็คสลิปค้างธนาคาร ทุก 2 นาที")
     yield
@@ -1450,21 +1456,28 @@ _MY_ORDER_FIELDS = ("order_id,order_date,ship_date,customer,phone,sku,qty,total,
                     "province,zip,full_address,note,channel,slip_url,slip_status,paid_at,created_at")
 
 def _join_tracking(sb, orders):
-    """เติมเลขพัสดุ/ขนส่งจากตาราง shipping ให้ลิสต์ออเดอร์ (in-place)"""
+    """เติมเลขพัสดุ/ขนส่งจากตาราง shipping ให้ลิสต์ออเดอร์ (in-place)
+    รองรับ 1 ออเดอร์มีหลายแทรก: tracking/carrier = เลขแรก (backward compat) + trackings[] = ทุกเลข"""
     oids = [o["order_id"] for o in orders if o.get("order_id")]
-    tmap = {}
+    tmap = {}   # order_id → [{tracking, carrier}, ...]
     if oids:
         try:
-            sh = sb.table("shipping").select("order_id,tracking,carrier").in_("order_id", oids).execute()
+            sh = sb.table("shipping").select("order_id,tracking,carrier,ship_date").in_("order_id", oids).execute()
             for row in (sh.data or []):
-                if row.get("order_id") and row["order_id"] not in tmap:
-                    tmap[row["order_id"]] = {"tracking": row.get("tracking"), "carrier": row.get("carrier")}
+                oid = row.get("order_id")
+                trk = (row.get("tracking") or "").strip()
+                if not oid or not trk:
+                    continue
+                lst = tmap.setdefault(oid, [])
+                if not any(x["tracking"] == trk for x in lst):   # กันซ้ำ
+                    lst.append({"tracking": trk, "carrier": row.get("carrier"), "ship_date": row.get("ship_date")})
         except Exception as e:
             print(f"[orders] shipping join error: {e}")
     for o in orders:
-        t = tmap.get(o.get("order_id")) or {}
-        o["tracking"] = t.get("tracking")
-        o["carrier"]  = t.get("carrier")
+        lst = tmap.get(o.get("order_id")) or []
+        o["trackings"] = lst
+        o["tracking"]  = lst[0]["tracking"] if lst else None   # เลขแรก (โค้ดเดิมที่ใช้ o.tracking ยังทำงาน)
+        o["carrier"]   = lst[0]["carrier"]  if lst else None
     return orders
 
 @app.get("/my/orders")
@@ -1734,6 +1747,54 @@ async def referral_confirm_cron():
             print(f"[referral-cron] ยืนยันคอม {n} รายการ (ผ่าน {REFERRAL_CONFIRM_DAYS} วัน)")
     except Exception as e:
         print(f"[referral-cron] error: {e}")
+
+
+# ล้างรูปสลิปเก่าใน Supabase Storage — กัน storage เต็ม (Storage ไม่ลบอัตโนมัติ)
+SLIP_RETENTION_DAYS = int(os.getenv("SLIP_RETENTION_DAYS", "90"))
+SLIP_CLEANUP_ENABLED = os.getenv("SLIP_CLEANUP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+
+def _slip_object_path(url: str) -> str:
+    """ดึง path ของไฟล์ใน bucket 'slips' จาก public URL → เอาไปลบใน storage"""
+    m = re.search(r"/(?:public/)?slips/(.+)$", str(url or ""))
+    return m.group(1).split("?")[0] if m else ""
+
+async def cleanup_old_slips():
+    """[cron รายวัน] ลบไฟล์รูปสลิปใน Storage ของออเดอร์ที่จัดส่งสำเร็จแล้ว + เก่ากว่า N วัน
+    เก็บแถวออเดอร์ไว้ ลบแค่ไฟล์รูป + เคลียร์ slip_url (กันลบซ้ำ) — payment proof เก็บได้ N วัน"""
+    if not SLIP_CLEANUP_ENABLED:
+        return
+    try:
+        sb = get_supabase()
+        cutoff = (datetime.utcnow() - timedelta(days=SLIP_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        # เฉพาะออเดอร์ที่จบแล้ว (จัดส่งสำเร็จ) และเก่ากว่า cutoff — ยังมี slip_url อยู่
+        rows = sb.table("orders").select("order_id,slip_url,order_date,paid_at") \
+            .eq("status", "จัดส่งสำเร็จ").not_.is_("slip_url", "null") \
+            .lte("order_date", cutoff).limit(500).execute().data or []
+        paths, oids = [], []
+        for r in rows:
+            p = _slip_object_path(r.get("slip_url"))
+            if p:
+                paths.append(p); oids.append(r["order_id"])
+        if not paths:
+            return
+        # ลบไฟล์ใน storage (ครั้งละไม่เกิน 100 กันช้า)
+        removed = 0
+        for i in range(0, len(paths), 100):
+            batch = paths[i:i+100]
+            try:
+                sb.storage.from_("slips").remove(batch)
+                removed += len(batch)
+            except Exception as e:
+                print(f"[slip-cleanup] remove batch error: {e}")
+        # เคลียร์ slip_url ของออเดอร์ที่ลบรูปแล้ว (กันวนลบซ้ำ)
+        for i in range(0, len(oids), 50):
+            try:
+                sb.table("orders").update({"slip_url": None}).in_("order_id", oids[i:i+50]).execute()
+            except Exception as e:
+                print(f"[slip-cleanup] clear url error: {e}")
+        print(f"[slip-cleanup] ลบรูปสลิปเก่า {removed} ไฟล์ (จัดส่งสำเร็จ + เก่ากว่า {SLIP_RETENTION_DAYS} วัน)")
+    except Exception as e:
+        print(f"[slip-cleanup] error: {e}")
 
 
 # ---- Referral endpoints (ลูกค้า) ----
@@ -4461,8 +4522,9 @@ async def set_accounting_shipping(body: SetShippingCostRequest, x_api_key: str =
 
 
 @app.post("/admin/confirm-delivered")
-async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str = Header(default="")):
-    """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE"""
+async def confirm_delivered(order_id: str, notify: bool = True, photo_url: str = "", x_api_key: str = Header(default="")):
+    """ยืนยันส่งถึงแล้ว (กรณีส่งเอง) — อัปเดตสถานะและแจ้งลูกค้าผ่าน SMS/LINE
+    photo_url: รูปหลักฐานส่งของ (https) → LINE ส่งรูป / SMS แนบลิงก์"""
     check_admin_key(x_api_key)
     sb = get_supabase()
 
@@ -4471,7 +4533,15 @@ async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str =
         raise HTTPException(status_code=404, detail=f"ไม่พบ order_id: {order_id}")
     order = res.data[0]
 
-    sb.table("orders").update({"status": "จัดส่งสำเร็จ"}).eq("order_id", order_id).execute()
+    photo = (photo_url or "").strip()
+    upd = {"status": "จัดส่งสำเร็จ"}
+    if photo.startswith("https://"):
+        upd["delivery_photo"] = photo   # ต้องรัน migration เพิ่มคอลัมน์ก่อน (2026-09-24_delivery_photo.sql)
+    try:
+        sb.table("orders").update(upd).eq("order_id", order_id).execute()
+    except Exception:
+        # เผื่อยังไม่ได้ ALTER คอลัมน์ delivery_photo → อัปเดตแค่สถานะ ไม่ให้พัง
+        sb.table("orders").update({"status": "จัดส่งสำเร็จ"}).eq("order_id", order_id).execute()
 
     phone    = order.get("phone", "")
     customer = order.get("customer", "")
@@ -4508,10 +4578,13 @@ async def confirm_delivered(order_id: str, notify: bool = True, x_api_key: str =
         if notify_ch == "off":
             print(f"[confirm-delivered] ข้าม {customer} → ปิดแจ้งเตือน")
         elif notify_ch == "line" and line_uid:
-            # ส่ง barcode/status/customer/phone ไปด้วย เพื่อให้ send_line_notify เขียน log ลง sms_logs (เหมือนฝั่ง SMS)
-            await send_line_notify(line_uid, msg, barcode=tracking, status="delivered", customer=customer, phone=phone)
+            # LINE ส่งรูปหลักฐานส่งของได้เลย (image message)
+            await send_line_notify(line_uid, msg, barcode=tracking, status="delivered", customer=customer, phone=phone,
+                                   image_url=photo if photo.startswith("https://") else "")
         else:
-            await send_sms(phone, msg, barcode=tracking, status="delivered", customer=customer)
+            # SMS แนบรูปไม่ได้ → ใส่ลิงก์รูปต่อท้าย
+            sms_msg = msg + (f"\nรูปการจัดส่ง: {photo}" if photo.startswith("https://") else "")
+            await send_sms(phone, sms_msg, barcode=tracking, status="delivered", customer=customer)
 
     return {"success": True, "order_id": order_id, "notified": bool(phone and notify)}
 
