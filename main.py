@@ -4652,10 +4652,10 @@ async def backfill_web_accounting(x_api_key: str = Header(default="")):
         if s.get("order_id"):
             ship_map[s["order_id"]] = s.get("shipping_cost")
     # ออเดอร์เว็บ (WEB*)
-    orders = sb.table("orders").select("order_id,order_date,customer,sku,total").like("order_id", "WEB%").execute()
+    orders = sb.table("orders").select("order_id,order_date,customer,sku,total").or_("order_id.like.WEB*,order_id.like.LINE*").execute()
     # accounting เดิม (ดู revenue + coffee_cost)
     acc_map = {}
-    for a in (sb.table("accounting").select("order_id,revenue,coffee_cost").like("order_id", "WEB%").execute().data or []):
+    for a in (sb.table("accounting").select("order_id,revenue,coffee_cost").or_("order_id.like.WEB*,order_id.like.LINE*").execute().data or []):
         acc_map[a["order_id"]] = a
     rows = []
     for o in (orders.data or []):
@@ -4696,9 +4696,9 @@ async def web_accounting(x_api_key: str = Header(default="")):
     sb = get_supabase()
     acc = sb.table("accounting") \
         .select("order_id,order_date,customer,revenue,shopee_fee,shipping,coffee_cost,packaging,other,net_profit") \
-        .like("order_id", "WEB%").order("order_date", desc=True).limit(3000).execute()
+        .or_("order_id.like.WEB*,order_id.like.LINE*").order("order_date", desc=True).limit(3000).execute()
     st = {}
-    for o in (sb.table("orders").select("order_id,status").like("order_id", "WEB%").limit(3000).execute().data or []):
+    for o in (sb.table("orders").select("order_id,status").or_("order_id.like.WEB*,order_id.like.LINE*").limit(3000).execute().data or []):
         st[o["order_id"]] = o.get("status")
     rows = acc.data or []
     for r in rows:
