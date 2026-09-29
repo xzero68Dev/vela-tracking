@@ -2660,6 +2660,92 @@ async def admin_restore_order(order_id: str, x_api_key: str = Header(default="")
     return {"success": True, "order_id": oid, "restored": True}
 
 
+class AdminCreateOrderRequest(BaseModel):
+    customer:      str
+    phone:         str = ""
+    full_address:  str = ""
+    province:      str = ""
+    zip:           str = ""
+    note:          str = ""
+    sku:           str = ""            # รายการสินค้าแบบข้อความ เช่น "Original x2, Dark x1"
+    qty:           int = 0             # จำนวนรวม
+    total:         float = 0           # ยอดที่ลูกค้าจ่ายจริง
+    status:        str = "ชำระแล้ว"    # ดีฟอลต์จ่ายแล้ว (ลูกค้าโอนมาทางไลน์)
+    tracking:      str = ""            # เลขแทรก (ถ้ามี — ใส่พร้อมกันได้)
+    carrier:       str = ""
+    shipping_cost: Optional[float] = None
+    ship_date:     Optional[str] = None
+
+@app.post("/admin/create-order")
+async def admin_create_order(body: AdminCreateOrderRequest, x_api_key: str = Header(default="")):
+    """สร้างออเดอร์เองในแอดมิน (เคสลูกค้าสั่งตรงทางไลน์) — order_id ขึ้นต้น 'LINE', channel=web
+    ใส่เลขแทรกในครั้งเดียวได้ (จะเลื่อนสถานะเป็นเตรียมจัดส่ง/จัดส่งแล้วให้เอง)"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    cust = (body.customer or "").strip()
+    if not cust:
+        raise HTTPException(status_code=400, detail="ต้องระบุชื่อลูกค้า")
+    ph = _norm_phone(body.phone or "")
+    if ph and ph.isdigit() and len(ph) < 10:
+        ph = ph.zfill(10)
+    # gen order_id ขึ้นต้น LINE + วันที่ + สุ่ม — กันชนด้วยการเช็คซ้ำ
+    import secrets
+    oid = ""
+    for _ in range(6):
+        cand = "LINE" + datetime.utcnow().strftime("%y%m%d") + secrets.token_hex(3).upper()
+        if not (sb.table("orders").select("order_id").eq("order_id", cand).limit(1).execute().data):
+            oid = cand
+            break
+    if not oid:
+        raise HTTPException(status_code=500, detail="สร้างเลขออเดอร์ไม่สำเร็จ ลองใหม่อีกครั้ง")
+
+    status = (body.status or "ชำระแล้ว").strip()
+    now = datetime.utcnow()
+    order_row = {
+        "order_id":     oid,
+        "order_date":   now.strftime("%Y-%m-%d"),
+        "created_at":   now.isoformat(),
+        "customer":     cust,
+        "phone":        ph,
+        "full_address": body.full_address or "",
+        "province":     body.province or "",
+        "zip":          body.zip or "",
+        "note":         body.note or "",
+        "sku":          body.sku or "",
+        "qty":          int(body.qty or 0),
+        "channel":      "web",
+        "status":       status,
+        "total":        float(body.total or 0),
+        "first_order_discount": False,
+    }
+    if status in ("ชำระแล้ว", "เตรียมจัดส่ง", "จัดส่งแล้ว", "จัดส่งสำเร็จ"):
+        order_row["paid_at"] = now.isoformat()
+    db_execute(sb.table("orders").insert(order_row), label="admin_create_order.insert")
+
+    # เก็บลูกค้าเข้า customers ถ้ายังไม่มี (ไม่ทับข้อมูลเดิม)
+    try:
+        if ph:
+            if not (sb.table("customers").select("phone").eq("phone", ph).limit(1).execute().data):
+                sb.table("customers").insert({"phone": ph, "name": cust}).execute()
+    except Exception as e:
+        print(f"[admin-create-order] save customer error: {e}")
+
+    # ใส่เลขแทรกถ้ามี — reuse _apply_shipping (อัปสถานะ + shipments ให้เอง)
+    trk = (body.tracking or "").strip()
+    if trk:
+        try:
+            await _apply_shipping(sb, oid, trk, body.carrier or "", body.ship_date)
+            if body.shipping_cost is not None:
+                sb.table("shipping").update({"shipping_cost": float(body.shipping_cost)}) \
+                    .eq("order_id", oid).execute()
+        except Exception as e:
+            print(f"[admin-create-order] apply_shipping error: {e}")
+
+    print(f"[admin-create-order] สร้างออเดอร์เอง {oid} ({cust} ...{ph[-4:] if ph else '?'}) ยอด {order_row['total']}"
+          + (f" + แทรก {trk.upper()}" if trk else ""))
+    return {"success": True, "order_id": oid, "status": status, "tracking": trk.upper() if trk else ""}
+
+
 class NewProductRequest(BaseModel):
     sku: str
     name: str
