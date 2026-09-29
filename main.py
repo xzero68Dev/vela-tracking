@@ -709,6 +709,26 @@ async def _send_unpaid_reminder(sb, order: dict, stage: int, expire_hours: int):
     await _notify_customer(sb, oid, phone, customer, line_msg, sms_msg, f"payment_reminder_{stage}")
 
 
+def _archive_orders(sb, order_ids, reason: str) -> int:
+    """เก็บออเดอร์ลงตาราง deleted_orders (ทั้งแถวเป็น jsonb) ก่อนลบจริง — กู้คืนได้ภายหลัง
+    คืนจำนวนที่ archive สำเร็จ · ถ้าเก็บไม่ได้จะ raise ให้ caller ตัดสินใจ (ห้ามลบถ้าเก็บไม่ได้)"""
+    ids = [i for i in (order_ids or []) if i]
+    if not ids:
+        return 0
+    full = (sb.table("orders").select("*").in_("order_id", ids).execute().data) or []
+    if not full:
+        return 0
+    rows = [{
+        "order_id": o.get("order_id"),
+        "phone":    o.get("phone") or o.get("account_phone"),
+        "customer": o.get("customer"),
+        "reason":   reason,
+        "data":     o,
+    } for o in full]
+    sb.table("deleted_orders").insert(rows).execute()
+    return len(rows)
+
+
 async def run_cron():
     """เช็คเฉพาะพัสดุที่ is_done = false ทุก 3 ชั่วโมง เฉพาะช่วง 10:00-18:00"""
 
@@ -774,6 +794,14 @@ async def run_cron():
                     print(f"[cron] reminder error {r['order_id']}: {e}")
 
         if expired_ids:
+            # archive ก่อนลบ — ถ้าเก็บไม่ได้ ข้ามการลบรอบนี้ (order จะ expire ใหม่รอบหน้าแล้วลองอีก) กันข้อมูลหาย
+            try:
+                n_arch = _archive_orders(sb, expired_ids, reason="expired_unpaid")
+                print(f"[cron] archive ออเดอร์หมดเวลา {n_arch} รายการ ก่อนลบ")
+            except Exception as e:
+                print(f"[cron] archive ก่อนลบ error — ข้ามการลบรอบนี้: {e}")
+                expired_ids = []
+        if expired_ids:
             # ลบลูก (accounting) ก่อนพ่อ (orders) — ไม่งั้น FK accounting_order_id_fkey บล็อก
             try:
                 sb.table("accounting").delete().in_("order_id", expired_ids).execute()
@@ -784,7 +812,7 @@ async def run_cron():
             except Exception as e:
                 print(f"[cron] ลบ shipping ค้างชำระ error: {e}")
             sb.table("orders").delete().in_("order_id", expired_ids).execute()
-            print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids}")
+            print(f"[cron] ลบ order ค้างชำระหมดเวลา {len(expired_ids)} รายการ: {expired_ids} (เก็บไว้ที่ deleted_orders กู้คืนได้)")
             # คืนสิทธิ์ลูกค้าใหม่ 50% ให้เบอร์ที่ออเดอร์ถูกลบ — กลับมาสั่งใหม่ยังได้ส่วนลดเหมือนเดิม
             # (ปลอดภัย: _is_first_order_eligible ยังเช็ค 'ไม่เคยมีออเดอร์เว็บ' อีกชั้น กันคนเคยจ่ายจริง)
             for ph in expired_phones:
@@ -1524,6 +1552,11 @@ async def delete_my_order(order_id: str, phone: str = "", x_auth_token: str = He
     if status != "รอชำระเงิน":
         raise HTTPException(status_code=400,
             detail="ออเดอร์นี้ยืนยัน/ชำระแล้ว ลบไม่ได้ หากต้องการยกเลิกกรุณาติดต่อร้าน")
+    # archive ก่อนลบ (best-effort) — เผื่อลูกค้าโอนทีหลัง จะได้กู้คืนได้ ไม่ต้องขุด log
+    try:
+        _archive_orders(sb, [oid], reason="customer_deleted")
+    except Exception as e:
+        print(f"[del-my-order] archive error (ยังลบต่อ): {e}")
     # ลบลูกก่อนพ่อ (กัน FK) — ค้างชำระปกติไม่มีอยู่แล้ว แต่ใส่ให้ครบ
     for tbl in ("accounting", "shipping"):
         try:
@@ -1795,6 +1828,19 @@ async def cleanup_old_slips():
         print(f"[slip-cleanup] ลบรูปสลิปเก่า {removed} ไฟล์ (จัดส่งสำเร็จ + เก่ากว่า {SLIP_RETENTION_DAYS} วัน)")
     except Exception as e:
         print(f"[slip-cleanup] error: {e}")
+    # ล้างคลัง deleted_orders เก่ากว่า N วัน (เก็บ payment proof ไว้พอสมควรแล้วค่อยทิ้ง)
+    try:
+        sb = get_supabase()
+        keep_days = int(os.getenv("DELETED_ORDER_RETENTION_DAYS", "90"))
+        cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
+        old = sb.table("deleted_orders").select("id").lt("deleted_at", cutoff).limit(1000).execute().data or []
+        if old:
+            ids = [r["id"] for r in old]
+            for i in range(0, len(ids), 100):
+                sb.table("deleted_orders").delete().in_("id", ids[i:i+100]).execute()
+            print(f"[deleted-orders-purge] ลบคลังออเดอร์เก่า {len(ids)} รายการ (เก่ากว่า {keep_days} วัน)")
+    except Exception as e:
+        print(f"[deleted-orders-purge] error: {e}")
 
 
 # ---- Referral endpoints (ลูกค้า) ----
@@ -2555,6 +2601,63 @@ async def admin_order_by_tracking(tracking: str, x_api_key: str = Header(default
     if order:
         order["tracking"] = tk
     return {"order": order}
+
+
+@app.get("/admin/deleted-orders")
+async def admin_deleted_orders(q: str = "", phone: str = "", limit: int = 100,
+                               x_api_key: str = Header(default="")):
+    """ค้นออเดอร์ที่ถูกลบ (หมดเวลา/ลูกค้าลบเอง) — เคส 'โอนแล้วไม่ได้ของ' หาได้จากที่นี่
+    - phone=... ค้นตรงเบอร์ | q=... ค้นแบบ ilike จาก order_id/ชื่อ/เบอร์"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    query = sb.table("deleted_orders").select("id,order_id,phone,customer,reason,deleted_at,data")
+    ph = _norm_phone(phone or "")
+    if ph:
+        query = query.eq("phone", ph)
+    qq = (q or "").strip()
+    if qq:
+        query = query.or_(f"order_id.ilike.%{qq}%,customer.ilike.%{qq}%,phone.ilike.%{qq}%")
+    res = db_execute(query.order("deleted_at", desc=True).limit(min(int(limit or 100), 500)),
+                     label="admin_deleted_orders")
+    out = []
+    for r in (res.data or []):
+        d = r.get("data") or {}
+        out.append({
+            "id": r.get("id"), "order_id": r.get("order_id"), "phone": r.get("phone"),
+            "customer": r.get("customer"), "reason": r.get("reason"), "deleted_at": r.get("deleted_at"),
+            "total": d.get("total"), "sku": d.get("sku"), "qty": d.get("qty"),
+            "order_date": d.get("order_date"), "note": d.get("note"), "channel": d.get("channel"),
+            "full_address": d.get("full_address"), "province": d.get("province"), "zip": d.get("zip"),
+        })
+    return {"deleted_orders": out, "count": len(out)}
+
+
+@app.post("/admin/restore-order")
+async def admin_restore_order(order_id: str, x_api_key: str = Header(default="")):
+    """กู้ออเดอร์จากคลัง deleted_orders กลับเข้าตาราง orders (สถานะ 'รอชำระเงิน')
+    รีเซ็ต created_at เป็นตอนนี้ กัน cron ลบซ้ำทันที · แอดมินค่อยกดยืนยันชำระ + ส่งของ"""
+    check_admin_key(x_api_key)
+    oid = (order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="ต้องระบุ order_id")
+    sb = get_supabase()
+    ex = sb.table("orders").select("order_id").eq("order_id", oid).limit(1).execute()
+    if ex.data:
+        raise HTTPException(status_code=400, detail="ออเดอร์นี้มีอยู่ในระบบแล้ว ไม่ต้องกู้")
+    arc = sb.table("deleted_orders").select("*").eq("order_id", oid) \
+        .order("deleted_at", desc=True).limit(1).execute()
+    if not arc.data:
+        raise HTTPException(status_code=404, detail="ไม่พบออเดอร์นี้ในคลัง deleted_orders")
+    row = arc.data[0]
+    data = dict(row.get("data") or {})
+    data.pop("id", None)                                  # กัน PK ภายในชน (ถ้ามี)
+    data["status"] = "รอชำระเงิน"
+    data["created_at"] = datetime.utcnow().isoformat()    # รีเซ็ตนาฬิกา กัน cron ลบซ้ำ
+    data["reminder_stage"] = 0
+    sb.table("orders").insert(data).execute()
+    sb.table("deleted_orders").delete().eq("id", row.get("id")).execute()
+    print(f"[admin] กู้คืนออเดอร์ {oid} จาก deleted_orders")
+    return {"success": True, "order_id": oid, "restored": True}
 
 
 class NewProductRequest(BaseModel):
