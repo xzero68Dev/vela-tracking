@@ -2668,6 +2668,7 @@ class AdminCreateOrderRequest(BaseModel):
     zip:           str = ""
     note:          str = ""
     sku:           str = ""            # รายการสินค้าแบบข้อความ เช่น "Original x2, Dark x1"
+    items:         list = []           # [{sku, qty}] สำหรับคำนวณต้นทุน/บัญชีให้แม่น
     qty:           int = 0             # จำนวนรวม
     total:         float = 0           # ยอดที่ลูกค้าจ่ายจริง
     status:        str = "ชำระแล้ว"    # ดีฟอลต์จ่ายแล้ว (ลูกค้าโอนมาทางไลน์)
@@ -2740,6 +2741,43 @@ async def admin_create_order(body: AdminCreateOrderRequest, x_api_key: str = Hea
                     .eq("order_id", oid).execute()
         except Exception as e:
             print(f"[admin-create-order] apply_shipping error: {e}")
+
+    # บันทึกบัญชี — รายรับ + ต้นทุนกาแฟ/แพ็กเกจ (ตามสูตรร้าน) + ค่าส่ง + กำไรสุทธิ
+    try:
+        items = body.items or []
+        if items:
+            coffee = 0.0; q1 = 0; q2 = 0
+            for it in items:
+                isku = str((it or {}).get("sku", "")).upper().strip()
+                iq   = int((it or {}).get("qty", 1) or 1)
+                coffee += _coffee_cost_per_unit(isku) * iq
+                if isku.endswith("-200") or isku in ("KYOHO", "GESHA"):
+                    q2 += iq
+                else:
+                    q1 += iq
+            pack_1l  = 0.0 if q1 == 0 else (11.70 if q1 == 1 else q1 * 4.5 + q1 * 3.9 + 2)
+            pack_200 = 0.0 if q2 == 0 else (6.15 if q2 == 1 else q2 * 2 + 3.9 + 2)
+            coffee_cost, packaging = round(coffee, 2), round(pack_1l + pack_200, 2)
+        else:
+            coffee_cost, packaging = _costs_from_sku_string(body.sku or "")
+        revenue = float(body.total or 0)
+        ship    = float(body.shipping_cost or 0)
+        sb.table("accounting").upsert({
+            "order_id":   oid,
+            "order_date": order_row["order_date"],
+            "customer":   cust,
+            "revenue":    revenue,
+            "shopee_net": revenue,   # ขายเอง/ไลน์ ไม่มี fee → net = revenue
+            "shopee_fee": 0,
+            "shipping":   ship,
+            "coffee_cost": coffee_cost,
+            "packaging":  packaging,
+            "other":      0,
+            "net_profit": round(revenue - coffee_cost - packaging - ship, 2),
+            "note":       "สั่งเอง/ไลน์",
+        }, on_conflict="order_id").execute()
+    except Exception as e:
+        print(f"[admin-create-order] accounting error: {e}")
 
     print(f"[admin-create-order] สร้างออเดอร์เอง {oid} ({cust} ...{ph[-4:] if ph else '?'}) ยอด {order_row['total']}"
           + (f" + แทรก {trk.upper()}" if trk else ""))
