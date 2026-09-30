@@ -2784,6 +2784,71 @@ async def admin_create_order(body: AdminCreateOrderRequest, x_api_key: str = Hea
     return {"success": True, "order_id": oid, "status": status, "tracking": trk.upper() if trk else ""}
 
 
+class NotifyCustomerRequest(BaseModel):
+    order_id: str = ""
+    phone:    str = ""
+    message:  str
+    channel:  str = "auto"   # auto (LINE ก่อน fallback SMS) | line | sms
+
+@app.post("/admin/notify-customer")
+async def admin_notify_customer(body: NotifyCustomerRequest, x_api_key: str = Header(default="")):
+    """ส่งข้อความ custom หาลูกค้า (เช่น แจ้งชะลอส่ง/น้ำท่วม) — LINE ฟรี / SMS เสียเครดิต"""
+    check_admin_key(x_api_key)
+    sb = get_supabase()
+    msg = (body.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="ต้องมีข้อความ")
+    oid   = (body.order_id or "").strip()
+    phone = _norm_phone(body.phone or "")
+    customer = ""
+    order = None
+    if oid:
+        r = sb.table("orders").select("order_id,phone,customer,line_user_id,account_phone") \
+            .eq("order_id", oid).limit(1).execute()
+        if r.data:
+            order = r.data[0]
+            phone = _norm_phone(order.get("phone") or order.get("account_phone") or phone)
+            customer = order.get("customer") or ""
+    # หา line_user_id: จากออเดอร์ก่อน แล้ว fallback ลุคอัพจากเบอร์
+    line_uid = (order or {}).get("line_user_id") or ""
+    if not line_uid and phone:
+        look = sb.table("customers").select("line_user_id").eq("phone", phone).limit(1).execute()
+        if look.data:
+            line_uid = look.data[0].get("line_user_id") or ""
+    tag = "admin_" + uuid.uuid4().hex[:10]
+
+    async def _try_line():
+        if not line_uid:
+            return False
+        return await send_line_notify(line_uid, msg, barcode=oid or tag, status=tag, customer=customer, phone=phone)
+
+    async def _try_sms():
+        ph = (phone or "").strip()
+        if not ph or ph == "-" or len(ph) < 9:
+            return False
+        return await send_sms(ph, msg, barcode=oid or tag, status=tag, customer=customer, force=True)
+
+    want = (body.channel or "auto").lower()
+    sent = ""
+    if want == "line":
+        if not line_uid:
+            raise HTTPException(status_code=400, detail="ลูกค้าไม่ได้ผูก LINE — เลือกส่ง SMS แทน")
+        sent = "line" if await _try_line() else ""
+    elif want == "sms":
+        if not phone:
+            raise HTTPException(status_code=400, detail="ออเดอร์นี้ไม่มีเบอร์ — ส่ง SMS ไม่ได้")
+        sent = "sms" if await _try_sms() else ""
+    else:  # auto — LINE ก่อน (ฟรี) แล้ว fallback SMS
+        if await _try_line():
+            sent = "line"
+        elif await _try_sms():
+            sent = "sms"
+    if not sent:
+        raise HTTPException(status_code=400, detail="ส่งไม่สำเร็จ — ลูกค้าไม่มี LINE/เบอร์ที่ใช้ได้")
+    print(f"[admin-notify] ส่งข้อความหา {customer or phone or '?'} via {sent}")
+    return {"success": True, "sent_via": sent}
+
+
 class NewProductRequest(BaseModel):
     sku: str
     name: str
