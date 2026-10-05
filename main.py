@@ -4477,22 +4477,42 @@ async def add_shipping(body: AddShippingRequest, x_api_key: str = Header(default
 #  parse ด้วย PyMuPDF (อ่านไทยเป๊ะ) → จับคู่ order ด้วย ชื่อ+ซิป → พร้อมส่ง
 # ============================================================
 _SHIP_TRACK_RE = re.compile(r'^[A-Z]{2,4}\d{8,}[A-Z]{0,2}$')
+# component ค่าส่งในบิล ShipSmile (แต่ละตัว label อยู่คนละบรรทัดกับตัวเลข)
+_SHIP_COST_LABELS = ("ค่าขนส่ง", "ค่าน้ำมันส่วนเพิ่ม", "ค่าพื้นที่พิเศษ")
+_SHIP_AMT_RE = re.compile(r'฿\s*([\d,]+(?:\.\d+)?)')
 
 def _parse_ship_bill(data: bytes) -> list:
-    """อ่านใบเสร็จ ShipSmile → [{tracking, carrier, name, zip, weight_g}] ต่อรายการ"""
+    """อ่านใบเสร็จ ShipSmile → [{tracking, carrier, name, zip, weight_g, cost}] ต่อรายการ
+    cost = ค่าขนส่ง + ค่าน้ำมันส่วนเพิ่ม (+ ค่าพื้นที่พิเศษ ถ้ามี) ของกล่องนั้น
+    หมายเหตุรูปแบบบิล: label เช่น '- ค่าขนส่ง' อยู่บรรทัดบน แล้วตัวเลข '฿32.00' อยู่บรรทัดถัดไป
+    ยอดรวมท้ายบิล (ยอดเงินสุทธิ/ยอดรวม) ไม่มี label ค่าส่งนำหน้า → ไม่ถูกนับเข้า cost"""
     import pymupdf
     doc = pymupdf.open(stream=data, filetype="pdf")
     text = "\n".join(pg.get_text() for pg in doc)
     lines = [l.strip() for l in text.split("\n")]
-    items, cur = [], None
+    items, cur, want_cost = [], None, False
     for l in lines:
         m = re.match(r'^\d+\.\s+.*?(\d{5})\s*$', l)   # "1. ช่องนนทรี 10120"
         if m:
             if cur:
                 items.append(cur)
-            cur = {"tracking": "", "carrier": "", "name": "", "zip": m.group(1), "weight_g": None}
+            cur = {"tracking": "", "carrier": "", "name": "", "zip": m.group(1),
+                   "weight_g": None, "cost": 0.0}
+            want_cost = False
             continue
         if cur is None:
+            continue
+        # บรรทัดก่อนหน้าเป็น label ค่าส่ง → บรรทัดนี้คือตัวเลข '฿XX.XX' ให้บวกเข้า cost
+        if want_cost:
+            ma = _SHIP_AMT_RE.search(l)
+            if ma:
+                try: cur["cost"] += float(ma.group(1).replace(",", ""))
+                except ValueError: pass
+            want_cost = False
+            continue
+        lbl = l.lstrip("- ").strip()
+        if lbl in _SHIP_COST_LABELS:
+            want_cost = True
             continue
         if _SHIP_TRACK_RE.match(l):
             cur["tracking"] = l
@@ -4507,6 +4527,9 @@ def _parse_ship_bill(data: bytes) -> list:
                 except ValueError: pass
     if cur:
         items.append(cur)
+    # ปัดทศนิยม cost ให้เรียบร้อย
+    for it in items:
+        it["cost"] = round(it.get("cost") or 0.0, 2)
     return [it for it in items if it["tracking"]]
 
 
@@ -4538,16 +4561,28 @@ def _match_ship_order(cand: list, it: dict, used: set):
     return None, "manual", cands
 
 
-async def _apply_shipping(sb, order_id: str, tracking: str, carrier: str = "", ship_date: str = None):
-    """เขียนเลขแทรก+ขนส่ง เข้า shipping + เลื่อนออเดอร์เป็นพร้อมส่ง (ไม่ยุ่งค่าส่ง)"""
+async def _apply_shipping(sb, order_id: str, tracking: str, carrier: str = "", ship_date: str = None,
+                          shipping_cost=None):
+    """เขียนเลขแทรก+ขนส่ง เข้า shipping + เลื่อนออเดอร์เป็นพร้อมส่ง
+    ถ้าส่ง shipping_cost (>0) มาด้วย → บันทึกค่าส่งจริงลง shipping + อัปเดตกำไรสุทธิในบัญชี"""
     ship_date = ship_date or datetime.utcnow().strftime("%Y-%m-%d")
     trk = (tracking or "").strip().upper()
     car = business_carrier(trk, carrier)
+    # แปลง shipping_cost → float ที่ใช้ได้จริง (รับเฉพาะค่า > 0 กันเขียนทับด้วย 0 ตอน parse พลาด)
+    cost = None
+    if shipping_cost not in (None, ""):
+        try:
+            cost = float(shipping_cost)
+            if cost <= 0: cost = None
+        except (TypeError, ValueError):
+            cost = None
     # ครอบ db_execute (retry กัน Supabase Gateway Timeout) — สำคัญที่สุดคือ orders.update
     # ถ้า update สถานะหลุดเพราะ timeout ออเดอร์จะค้าง 'ชำระแล้ว' ทั้งที่เลขแทรกเข้าแล้ว
-    db_execute(sb.table("shipping").upsert({
-        "order_id": order_id, "ship_date": ship_date, "carrier": car, "tracking": trk,
-    }, on_conflict="tracking"), label="apply_shipping.shipping")
+    ship_row = {"order_id": order_id, "ship_date": ship_date, "carrier": car, "tracking": trk}
+    if cost is not None:
+        ship_row["shipping_cost"] = cost
+    db_execute(sb.table("shipping").upsert(ship_row, on_conflict="tracking"),
+               label="apply_shipping.shipping")
     self_delivery = (not trk) or trk == "-"
     db_execute(sb.table("orders").update({
         "status":    "จัดส่งแล้ว" if self_delivery else "เตรียมจัดส่ง",
@@ -4559,6 +4594,19 @@ async def _apply_shipping(sb, order_id: str, tracking: str, carrier: str = "", s
         if not ex.data:
             db_execute(sb.table("shipments").insert({"barcode": trk, "status": "pending"}),
                        label="apply_shipping.shipments_insert")
+    # อัปเดตค่าส่งจริง + กำไรสุทธิ ในบัญชี (เฉพาะออเดอร์ที่มีแถวบัญชีอยู่แล้ว)
+    if cost is not None:
+        try:
+            acc = sb.table("accounting").select("revenue,coffee_cost,packaging,other") \
+                .eq("order_id", order_id).execute()
+            if acc.data:
+                a = acc.data[0]
+                net = round(float(a.get("revenue") or 0) - float(a.get("coffee_cost") or 0)
+                            - float(a.get("packaging") or 0) - cost - float(a.get("other") or 0), 2)
+                sb.table("accounting").update({"shipping": cost, "net_profit": net}) \
+                    .eq("order_id", order_id).execute()
+        except Exception as e:
+            print(f"[apply_shipping] accounting update error ({order_id}): {e}")
 
 
 @app.post("/admin/parse-shipping-bill")
@@ -4600,10 +4648,13 @@ async def apply_shipping_bill(body: ApplyBillRequest, x_api_key: str = Header(de
         oid = (raw.get("order_id") or "").strip()
         trk = (raw.get("tracking") or "").strip()
         car = (raw.get("carrier") or "").strip()
+        cost = raw.get("cost")
+        if cost in (None, ""):
+            cost = raw.get("shipping_cost")
         if not oid or not trk:
             continue
         try:
-            await _apply_shipping(sb, oid, trk, car)
+            await _apply_shipping(sb, oid, trk, car, shipping_cost=cost)
             applied.append(oid)
         except Exception as e:
             errors.append({"order_id": oid, "error": str(e)})
