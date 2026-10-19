@@ -1023,128 +1023,135 @@ async def run_cron():
 
     # process ทุก results รวมกัน (Thailand Post + eTrackings)
     for result in all_results:
-        barcode    = result["barcode"]
-        status     = result["status"]
-        is_done    = status in DONE_STATUSES
-        latest     = result.get("latest_event") or {}
-        old_status = old_status_map.get(barcode, "pending")
+        try:
+            barcode    = result["barcode"]
+            status     = result["status"]
+            is_done    = status in DONE_STATUSES
+            latest     = result.get("latest_event") or {}
+            old_status = old_status_map.get(barcode, "pending")
 
-        # ถ้า API ส่ง events ว่างมา (Thailand Post มีปัญหา) → ข้ามไปไม่ทับสถานะเดิม
-        if not result.get("events") and status == "pending":
-            print(f"[cron] {barcode} → ข้าม (API ไม่มีข้อมูล)")
+            # ถ้า API ส่ง events ว่างมา (Thailand Post มีปัญหา) → ข้ามไปไม่ทับสถานะเดิม
+            if not result.get("events") and status == "pending":
+                print(f"[cron] {barcode} → ข้าม (API ไม่มีข้อมูล)")
+                continue
+
+            db_execute(sb.table("shipments").update({
+                "status":          status,
+                "status_th":       result["status_th"],
+                "latest_location": latest.get("location"),
+                "latest_datetime": latest.get("datetime"),
+                "is_done":         is_done,
+                "last_checked_at": datetime.utcnow().isoformat(),
+            }).eq("barcode", barcode), label="cron.shipments_update")
+            print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
+
+            # เชื่อมสถานะกลับไปที่ orders — พัสดุถึง/ตีกลับแล้ว → อัปเดต order ให้ตรงกัน (link statuses)
+            if is_done:
+                try:
+                    sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                    if sr.data:
+                        order_new_status = "ตีกลับ" if status == "returned" else "จัดส่งสำเร็จ"
+                        sb.table("orders").update({"status": order_new_status}).eq("order_id", sr.data[0]["order_id"]).execute()
+                        print(f"[cron] link → order {sr.data[0]['order_id']} = {order_new_status}")
+                except Exception as e:
+                    print(f"[cron] link order status error: {e}")
+            # พัสดุเริ่มเคลื่อนไหว (ขนส่ง scan รับพัสดุจริง) → ออเดอร์ที่ยัง "เตรียมจัดส่ง" เลื่อนเป็น "จัดส่งแล้ว"
+            elif status in ("accepted", "in_transit", "out_for_delivery"):
+                try:
+                    sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                    if sr.data:
+                        oid = sr.data[0]["order_id"]
+                        cur = sb.table("orders").select("status").eq("order_id", oid).execute()
+                        if cur.data and cur.data[0].get("status") == "เตรียมจัดส่ง":
+                            sb.table("orders").update({"status": "จัดส่งแล้ว"}).eq("order_id", oid).execute()
+                            print(f"[cron] link → order {oid} = จัดส่งแล้ว (พัสดุเคลื่อนไหว)")
+                except Exception as e:
+                    print(f"[cron] link ship→order status error: {e}")
+
+            # แจ้ง admin ทันทีถ้าพัสดุมีปัญหา (เสียหาย/ตีกลับ/นำจ่ายไม่สำเร็จ) — ยิงเสมอ ไม่ผูกกับ template ลูกค้า
+            # (เดิมบล็อกนี้ซ้อนอยู่ใต้ has_notify ซึ่ง problem/returned = None เลยไม่เคยแจ้งจริง)
+            if status != old_status and status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
+                try:
+                    _sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
+                    _oid = _sr.data[0]["order_id"] if _sr.data else ""
+                    _cname, _cphone = "", ""
+                    if _oid:
+                        _or = sb.table("orders").select("customer,phone").eq("order_id", _oid).execute()
+                        if _or.data:
+                            _cname  = _or.data[0].get("customer") or ""
+                            _cphone = _or.data[0].get("phone") or ""
+                    await send_line_notify(ADMIN_LINE_USER_ID,
+                        "⚠️ พัสดุมีปัญหา — โปรดแจ้งลูกค้า\n"
+                        f"ลูกค้า: {_cname}" + (f" ({_cphone})" if _cphone else "") +
+                        (f"\nOrder: {_oid}" if _oid else "") +
+                        f"\nเลขพัสดุ: {barcode}\n"
+                        f"สถานะ: {result.get('status_th') or status}\n"
+                        f"ติดตาม: velacoldbrew.com/track/{barcode}")
+                    print(f"[ADMIN] แจ้ง admin (ปัญหา) → {barcode} {status}")
+                except Exception as e:
+                    print(f"[ADMIN] alert error {barcode}: {e}")
+
+            # แจ้งเตือนถ้าสถานะเปลี่ยน
+            # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
+            sms_status = status
+            if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
+                sms_status = "accepted"
+            # เลือก template ตาม channel
+            line_msg = LINE_TEMPLATES.get(sms_status)
+            sms_msg  = SMS_TEMPLATES.get(sms_status)
+            has_notify = (line_msg or sms_msg)
+            if status != old_status and has_notify:
+                msg = line_msg or sms_msg
+                ship_row = db_execute(sb.table("shipping").select("order_id").eq("tracking", barcode),
+                                      label="cron.notify_ship")
+                if ship_row.data:
+                    order_id  = ship_row.data[0]["order_id"]
+                    order_row = db_execute(sb.table("orders").select("phone,customer").eq("order_id", order_id),
+                                           label="cron.notify_order")
+                    if order_row.data:
+                        phone    = order_row.data[0].get("phone", "")
+                        customer = order_row.data[0].get("customer", "")
+                        if phone:
+                            # เช็ค notify_channel จาก customers table
+                            notify       = "sms"
+                            line_uid     = ""
+                            try:
+                                cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
+                                if cust.data:
+                                    line_uid = cust.data[0].get("line_user_id") or ""
+                                    # ลูกค้าที่ผูก LINE ไว้ → รับแจ้งเตือนทาง LINE เสมอ (เว้นตั้งค่าปิดชัดเจน)
+                                    notify   = _resolve_notify_channel(cust.data[0].get("notify_channel"), line_uid)
+                            except:
+                                pass
+
+                            final_msg = msg.replace("{barcode}", barcode)
+
+                            if notify == "off":
+                                print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
+                            elif notify == "line" and line_uid:
+                                # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
+                                if line_msg:
+                                    final_line_msg = line_msg.replace("{barcode}", barcode)
+                                    await send_line_notify(line_uid, final_line_msg, barcode=barcode, status=sms_status, customer=customer, phone=phone)
+                                    print(f"[LINE] แจ้ง {customer} → {status}")
+                                else:
+                                    print(f"[LINE] ข้าม {customer} → ไม่มี LINE template สำหรับ {sms_status}")
+                            else:
+                                # SMS ใช้ SMS_TEMPLATES (เฉพาะ delivered)
+                                if sms_msg:
+                                    final_sms_msg = sms_msg.replace("{barcode}", barcode)
+                                    await send_sms(phone, final_sms_msg, barcode=barcode, status=sms_status, customer=customer)
+                                    print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
+                                else:
+                                    print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
+
+            if thaipost_barcodes and i + batch_size < len(thaipost_barcodes):
+                await asyncio.sleep(1)
+
+        except Exception as _pe:
+            # พัสดุรายนี้สะดุด (เช่น Supabase หลุดหลัง retry) → ข้าม ไม่ให้ cron ล้มทั้งรอบ
+            print(f"[cron] ข้ามพัสดุ {result.get('barcode','?')}: {_pe}")
             continue
-
-        sb.table("shipments").update({
-            "status":          status,
-            "status_th":       result["status_th"],
-            "latest_location": latest.get("location"),
-            "latest_datetime": latest.get("datetime"),
-            "is_done":         is_done,
-            "last_checked_at": datetime.utcnow().isoformat(),
-        }).eq("barcode", barcode).execute()
-        print(f"[cron] {barcode} → {status} {'✓ done' if is_done else ''}")
-
-        # เชื่อมสถานะกลับไปที่ orders — พัสดุถึง/ตีกลับแล้ว → อัปเดต order ให้ตรงกัน (link statuses)
-        if is_done:
-            try:
-                sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
-                if sr.data:
-                    order_new_status = "ตีกลับ" if status == "returned" else "จัดส่งสำเร็จ"
-                    sb.table("orders").update({"status": order_new_status}).eq("order_id", sr.data[0]["order_id"]).execute()
-                    print(f"[cron] link → order {sr.data[0]['order_id']} = {order_new_status}")
-            except Exception as e:
-                print(f"[cron] link order status error: {e}")
-        # พัสดุเริ่มเคลื่อนไหว (ขนส่ง scan รับพัสดุจริง) → ออเดอร์ที่ยัง "เตรียมจัดส่ง" เลื่อนเป็น "จัดส่งแล้ว"
-        elif status in ("accepted", "in_transit", "out_for_delivery"):
-            try:
-                sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
-                if sr.data:
-                    oid = sr.data[0]["order_id"]
-                    cur = sb.table("orders").select("status").eq("order_id", oid).execute()
-                    if cur.data and cur.data[0].get("status") == "เตรียมจัดส่ง":
-                        sb.table("orders").update({"status": "จัดส่งแล้ว"}).eq("order_id", oid).execute()
-                        print(f"[cron] link → order {oid} = จัดส่งแล้ว (พัสดุเคลื่อนไหว)")
-            except Exception as e:
-                print(f"[cron] link ship→order status error: {e}")
-
-        # แจ้ง admin ทันทีถ้าพัสดุมีปัญหา (เสียหาย/ตีกลับ/นำจ่ายไม่สำเร็จ) — ยิงเสมอ ไม่ผูกกับ template ลูกค้า
-        # (เดิมบล็อกนี้ซ้อนอยู่ใต้ has_notify ซึ่ง problem/returned = None เลยไม่เคยแจ้งจริง)
-        if status != old_status and status in ALERT_STATUSES and ADMIN_LINE_USER_ID:
-            try:
-                _sr = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
-                _oid = _sr.data[0]["order_id"] if _sr.data else ""
-                _cname, _cphone = "", ""
-                if _oid:
-                    _or = sb.table("orders").select("customer,phone").eq("order_id", _oid).execute()
-                    if _or.data:
-                        _cname  = _or.data[0].get("customer") or ""
-                        _cphone = _or.data[0].get("phone") or ""
-                await send_line_notify(ADMIN_LINE_USER_ID,
-                    "⚠️ พัสดุมีปัญหา — โปรดแจ้งลูกค้า\n"
-                    f"ลูกค้า: {_cname}" + (f" ({_cphone})" if _cphone else "") +
-                    (f"\nOrder: {_oid}" if _oid else "") +
-                    f"\nเลขพัสดุ: {barcode}\n"
-                    f"สถานะ: {result.get('status_th') or status}\n"
-                    f"ติดตาม: velacoldbrew.com/track/{barcode}")
-                print(f"[ADMIN] แจ้ง admin (ปัญหา) → {barcode} {status}")
-            except Exception as e:
-                print(f"[ADMIN] alert error {barcode}: {e}")
-
-        # แจ้งเตือนถ้าสถานะเปลี่ยน
-        # ถ้า old_status เป็น pending และ status ใหม่เป็น in_transit หรือสูงกว่า → ส่ง SMS accepted แทน
-        sms_status = status
-        if old_status in ("pending",) and status in ("in_transit", "out_for_delivery") and not SMS_TEMPLATES.get(status):
-            sms_status = "accepted"
-        # เลือก template ตาม channel
-        line_msg = LINE_TEMPLATES.get(sms_status)
-        sms_msg  = SMS_TEMPLATES.get(sms_status)
-        has_notify = (line_msg or sms_msg)
-        if status != old_status and has_notify:
-            msg = line_msg or sms_msg
-            ship_row = sb.table("shipping").select("order_id").eq("tracking", barcode).execute()
-            if ship_row.data:
-                order_id  = ship_row.data[0]["order_id"]
-                order_row = sb.table("orders").select("phone,customer").eq("order_id", order_id).execute()
-                if order_row.data:
-                    phone    = order_row.data[0].get("phone", "")
-                    customer = order_row.data[0].get("customer", "")
-                    if phone:
-                        # เช็ค notify_channel จาก customers table
-                        notify       = "sms"
-                        line_uid     = ""
-                        try:
-                            cust = sb.table("customers").select("notify_channel,line_user_id").eq("phone", phone).execute()
-                            if cust.data:
-                                line_uid = cust.data[0].get("line_user_id") or ""
-                                # ลูกค้าที่ผูก LINE ไว้ → รับแจ้งเตือนทาง LINE เสมอ (เว้นตั้งค่าปิดชัดเจน)
-                                notify   = _resolve_notify_channel(cust.data[0].get("notify_channel"), line_uid)
-                        except:
-                            pass
-
-                        final_msg = msg.replace("{barcode}", barcode)
-
-                        if notify == "off":
-                            print(f"[notify] ข้าม {customer} → ปิดแจ้งเตือน")
-                        elif notify == "line" and line_uid:
-                            # LINE ใช้ LINE_TEMPLATES (มีทั้ง accepted และ delivered)
-                            if line_msg:
-                                final_line_msg = line_msg.replace("{barcode}", barcode)
-                                await send_line_notify(line_uid, final_line_msg, barcode=barcode, status=sms_status, customer=customer, phone=phone)
-                                print(f"[LINE] แจ้ง {customer} → {status}")
-                            else:
-                                print(f"[LINE] ข้าม {customer} → ไม่มี LINE template สำหรับ {sms_status}")
-                        else:
-                            # SMS ใช้ SMS_TEMPLATES (เฉพาะ delivered)
-                            if sms_msg:
-                                final_sms_msg = sms_msg.replace("{barcode}", barcode)
-                                await send_sms(phone, final_sms_msg, barcode=barcode, status=sms_status, customer=customer)
-                                print(f"[SMS] แจ้ง {customer} ({phone[-4:].zfill(4)}) → {status}")
-                            else:
-                                print(f"[SMS] ข้าม {customer} → ไม่มี SMS template สำหรับ {sms_status}")
-
-        if thaipost_barcodes and i + batch_size < len(thaipost_barcodes):
-            await asyncio.sleep(1)
-
     print("[cron] เสร็จแล้ว")
 
 
@@ -1211,7 +1218,10 @@ class BulkRequest(BaseModel):
 # ── กัน Supabase Gateway Timeout (HTTP 504) / statement timeout (57014) ──
 # PostgREST คืน 504 เป็นครั้งคราวเวลา pooler/edge ช้า — retry สั้นๆ ก่อนยอมแพ้
 # ถ้ายังไม่ผ่านคืน 503 (Service Unavailable) พร้อมข้อความ ไม่ปล่อยเป็น 500 ดิบ
-_TIMEOUT_HINTS = ("gateway timeout", "timeout", "57014", "canceling statement", "504")
+_TIMEOUT_HINTS = ("gateway timeout", "timeout", "57014", "canceling statement", "504",
+                  # การเชื่อมต่อ Supabase หลุดกลางคัน (HTTP/2) — transient ลองใหม่ได้ (query ทั้งหมด idempotent)
+                  "connectionterminated", "remoteprotocolerror", "server disconnected",
+                  "connection reset", "connection aborted", "peer closed", "connecterror")
 
 def _is_timeout_err(e: Exception) -> bool:
     s = str(getattr(e, "message", "") or e).lower()
@@ -3074,8 +3084,13 @@ async def list_shipments(is_done: Optional[bool] = None):
 @app.post("/shipments/check-now")
 async def check_now():
     """trigger cron ทันที ไม่ต้องรอ 3 ชั่วโมง"""
-    await run_cron()
-    return {"message": "กำลังเช็คสถานะ... ดูผลได้ที่ /shipments"}
+    try:
+        await run_cron()
+    except Exception as e:
+        # ไม่โยน 500 ให้แอดมิน — cron เช็คพัสดุรายตัวมี guard อยู่แล้ว เคสนี้คือสะดุดก่อนเข้าลูป
+        print(f"[check-now] run_cron error: {e}")
+        return {"message": "เช็คสถานะไม่สำเร็จชั่วคราว (ระบบสะดุด) กรุณาลองใหม่อีกครั้ง", "ok": False}
+    return {"message": "กำลังเช็คสถานะ... ดูผลได้ที่ /shipments", "ok": True}
 
 
 class CancelShipmentsRequest(BaseModel):
