@@ -4029,21 +4029,33 @@ def _oai_norm_phone(p: str) -> str:
 
 _oai_bg_tasks: set = set()
 
-async def _fire_oai_conversion(order_id: str):
+def _oai_paid_ms(paid_at) -> int:
+    """แปลง paid_at (ISO) → epoch ms สำหรับ timestamp_ms (fallback = เวลาปัจจุบัน)"""
+    try:
+        s = str(paid_at or "").strip().replace("Z", "+00:00")
+        if s:
+            return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        pass
+    return int(time.time() * 1000)
+
+async def _fire_oai_conversion(order_id: str, force: bool = False) -> dict:
     """ยิง order_created ไป OpenAI Ads Conversions API — idempotent (เช็ค/เซ็ต oai_sent_at)
-    ปลอดภัย: error ใดๆ ไม่กระทบ flow จ่ายเงิน (รันเป็น background task)"""
+    force=True → ยิงซ้ำแม้ oai_sent_at มีแล้ว (ใช้ re-fire ย้อนหลัง)
+    ปลอดภัย: error ใดๆ ไม่กระทบ flow จ่ายเงิน · คืน dict ผลลัพธ์ให้ endpoint re-fire ใช้"""
     if not (OAI_ADS_PIXEL_ID and OAI_ADS_API_KEY):
-        return
+        print("[oai] ข้าม — ยังไม่ได้ตั้ง env OAI_ADS_PIXEL_ID/OAI_ADS_API_KEY บน Render")
+        return {"ok": False, "reason": "env_not_set"}
     try:
         sb = get_supabase()
         res = sb.table("orders").select(
-            "order_id,phone,account_phone,zip,total,sku,oppref,obref,oai_sent_at"
+            "order_id,phone,account_phone,zip,total,sku,oppref,obref,oai_sent_at,paid_at"
         ).eq("order_id", order_id).limit(1).execute()
         if not res.data:
-            return
+            return {"ok": False, "reason": "order_not_found"}
         o = res.data[0]
-        if o.get("oai_sent_at"):
-            return   # ยิงไปแล้ว — กันซ้ำ
+        if o.get("oai_sent_at") and not force:
+            return {"ok": True, "reason": "already_sent", "oai_sent_at": o.get("oai_sent_at")}
         # user matching (hash เฉพาะเบอร์/อีเมล · obref/zip/country ไม่ hash · list ≤ 3 ค่า)
         user = {"countries": ["TH"]}
         if o.get("obref"):
@@ -4075,7 +4087,7 @@ async def _fire_oai_conversion(order_id: str):
         event = {
             "id":            f"order_{order_id}",
             "type":          "order_created",
-            "timestamp_ms":  int(time.time() * 1000),
+            "timestamp_ms":  _oai_paid_ms(o.get("paid_at")),   # เวลาที่จ่ายจริง (ต้องไม่เกิน 7 วัน)
             "source_url":    "https://velacoldbrew.com/",
             "action_source": "web",
             "user":          user,
@@ -4094,11 +4106,17 @@ async def _fire_oai_conversion(order_id: str):
             sb.table("orders").update({"oai_sent_at": datetime.utcnow().isoformat()}) \
                 .eq("order_id", order_id).execute()
             print(f"[oai] order_created sent {order_id} (HTTP {r.status_code})")
+            return {"ok": True, "reason": "sent", "http": r.status_code}
         else:
-            # ไม่ log payload (มีข้อมูลลูกค้า) — log แค่ order id + status ให้ retry รอบหน้าได้
-            print(f"[oai] send failed {order_id} HTTP {r.status_code}")
+            # log response ของ OpenAI (ไม่ใช่ payload ลูกค้า) ช่วย debug 4xx — เบอร์/อีเมล hash แล้วไม่หลุด
+            body = ""
+            try: body = r.text[:300]
+            except Exception: pass
+            print(f"[oai] send failed {order_id} HTTP {r.status_code} · {body}")
+            return {"ok": False, "reason": "http_error", "http": r.status_code, "body": body}
     except Exception as e:
-        print(f"[oai] error {order_id}: {type(e).__name__}")
+        print(f"[oai] error {order_id}: {type(e).__name__}: {e}")
+        return {"ok": False, "reason": "exception", "error": f"{type(e).__name__}: {e}"}
 
 def _fire_oai_bg(order_id: str):
     """ยิง conversion แบบ background — ไม่ block response การจ่ายเงิน"""
@@ -4108,6 +4126,16 @@ def _fire_oai_bg(order_id: str):
         t.add_done_callback(_oai_bg_tasks.discard)
     except RuntimeError:
         pass   # ไม่มี event loop (ไม่ควรเกิดใน handler async)
+
+
+@app.post("/admin/oai-refire")
+async def admin_oai_refire(order_id: str, force: bool = True, x_api_key: str = Header(default="")):
+    """ยิง ChatGPT Ads order_created ย้อนหลังสำหรับออเดอร์ที่ระบุ (เช่น ออเดอร์ที่ยิงไม่ทันตอน env ยังไม่ตั้ง)
+    - force ดีฟอลต์ True → ยิงซ้ำแม้ oai_sent_at มีค่าแล้ว (ใช้ event_id order_<id> เดิม → Ads dedup ให้)
+    - คืน HTTP status/เหตุผลจาก OpenAI ให้เห็นว่าสำเร็จหรือพลาดตรงไหน"""
+    check_admin_key(x_api_key)
+    result = await _fire_oai_conversion((order_id or "").strip(), force=force)
+    return {"order_id": order_id, **result}
 
 
 async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
