@@ -3548,6 +3548,8 @@ class CreateOrderRequest(BaseModel):
     referrer:             Optional[str] = None
     landing_page:         Optional[str] = None
     ref_code:             Optional[str] = None  # โค้ดผู้แนะนำ (referral) — จับจาก ?ref= เก็บใน localStorage
+    oppref:               Optional[str] = None  # ChatGPT Ads click id (cookie __oppref) — ใช้ยิง Conversions API
+    obref:                Optional[str] = None  # ChatGPT Ads click id ระยะยาว (cookie __obref)
 
 def sku_code_to_ml(sku_code: str) -> int:
     """แปลง SKU code (เช่น ORIGINAL-200, KYOHO, ORIGINAL) เป็น ml — ใช้กับ order จากเว็บเท่านั้น"""
@@ -3799,6 +3801,12 @@ async def create_order(body: CreateOrderRequest):
     if _rc:
         order_row["ref_code"] = _rc
 
+    # ChatGPT Ads click id — เก็บไว้ยิง Conversions API ตอนชำระเงิน (additive; ต้องรัน migration 2026-11-20_oai_ads.sql)
+    if body.oppref:
+        order_row["oppref"] = body.oppref[:256]
+    if body.obref:
+        order_row["obref"] = body.obref[:256]
+
     sb.table("orders").insert(order_row).execute()
 
     # เก็บลูกค้าลงตาราง customers อัตโนมัติ — เฉพาะเบอร์ที่ยังไม่มี (ไม่ทับข้อมูลเดิมของคน login)
@@ -3999,6 +4007,109 @@ async def ingest_event(body: EventIn, user_agent: str = Header(default=""),
     return {"success": True}
 
 
+# ============================================================
+#  ChatGPT Ads (OpenAI Ads) — Conversions API (server-side order_created)
+#  ยิงตอนออเดอร์ "ชำระแล้ว" เท่านั้น · dedup ต่อ order ด้วย oai_sent_at · ไม่ log payload
+# ============================================================
+OAI_ADS_PIXEL_ID = os.getenv("OAI_ADS_PIXEL_ID", "").strip()
+OAI_ADS_API_KEY  = os.getenv("OAI_ADS_API_KEY", "").strip()
+OAI_EVENTS_URL   = "https://bzr.openai.com/v1/events"
+
+def _oai_h(v: str) -> str:
+    """sha256 hex (lowercase) — ใช้ hash เบอร์/อีเมล"""
+    return hashlib.sha256((v or "").encode("utf-8")).hexdigest()
+
+def _oai_norm_phone(p: str) -> str:
+    """normalize เบอร์ไทย → '66xxxxxxxxx' (เอาเฉพาะเลข, ตัด 0 นำหน้า, เติม 66) ก่อน hash"""
+    d = re.sub(r"\D", "", p or "")
+    if d.startswith("66"):
+        d = d[2:]
+    d = d.lstrip("0")
+    return "66" + d
+
+_oai_bg_tasks: set = set()
+
+async def _fire_oai_conversion(order_id: str):
+    """ยิง order_created ไป OpenAI Ads Conversions API — idempotent (เช็ค/เซ็ต oai_sent_at)
+    ปลอดภัย: error ใดๆ ไม่กระทบ flow จ่ายเงิน (รันเป็น background task)"""
+    if not (OAI_ADS_PIXEL_ID and OAI_ADS_API_KEY):
+        return
+    try:
+        sb = get_supabase()
+        res = sb.table("orders").select(
+            "order_id,phone,account_phone,zip,total,sku,oppref,obref,oai_sent_at"
+        ).eq("order_id", order_id).limit(1).execute()
+        if not res.data:
+            return
+        o = res.data[0]
+        if o.get("oai_sent_at"):
+            return   # ยิงไปแล้ว — กันซ้ำ
+        # user matching (hash เฉพาะเบอร์/อีเมล · obref/zip/country ไม่ hash · list ≤ 3 ค่า)
+        user = {"countries": ["TH"]}
+        if o.get("obref"):
+            user["obref"] = str(o["obref"])
+        phone = (o.get("account_phone") or o.get("phone") or "").strip()
+        if phone:
+            user["phone_numbers_sha256"] = [_oai_h(_oai_norm_phone(phone))]
+        if o.get("zip"):
+            user["postal_codes"] = [str(o["zip"])]
+        # contents จาก sku string ("ชื่อ x2, ...")
+        contents = []
+        try:
+            for it in _receipt_parse_items(o.get("sku") or ""):
+                contents.append({
+                    "id":           it.get("name") or "item",
+                    "name":         it.get("name") or "",
+                    "content_type": "product",
+                    "quantity":     int(it.get("qty") or 1),
+                })
+        except Exception:
+            pass
+        data = {
+            "type":     "contents",
+            "amount":   int(round(float(o.get("total") or 0) * 100)),   # สตางค์ (฿230 = 23000)
+            "currency": "THB",
+        }
+        if contents:
+            data["contents"] = contents
+        event = {
+            "id":            f"order_{order_id}",
+            "type":          "order_created",
+            "timestamp_ms":  int(time.time() * 1000),
+            "source_url":    "https://velacoldbrew.com/",
+            "action_source": "web",
+            "user":          user,
+            "data":          data,
+        }
+        if o.get("oppref"):
+            event["oppref"] = str(o["oppref"])
+        payload = {"integration_source": "vela_web", "events": [event]}
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{OAI_EVENTS_URL}?pid={OAI_ADS_PIXEL_ID}",
+                headers={"Authorization": f"Bearer {OAI_ADS_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=payload)
+        if 200 <= r.status_code < 300:
+            sb.table("orders").update({"oai_sent_at": datetime.utcnow().isoformat()}) \
+                .eq("order_id", order_id).execute()
+            print(f"[oai] order_created sent {order_id} (HTTP {r.status_code})")
+        else:
+            # ไม่ log payload (มีข้อมูลลูกค้า) — log แค่ order id + status ให้ retry รอบหน้าได้
+            print(f"[oai] send failed {order_id} HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[oai] error {order_id}: {type(e).__name__}")
+
+def _fire_oai_bg(order_id: str):
+    """ยิง conversion แบบ background — ไม่ block response การจ่ายเงิน"""
+    try:
+        t = asyncio.create_task(_fire_oai_conversion(order_id))
+        _oai_bg_tasks.add(t)
+        t.add_done_callback(_oai_bg_tasks.discard)
+    except RuntimeError:
+        pass   # ไม่มี event loop (ไม่ควรเกิดใน handler async)
+
+
 async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
                               slip_amount, slip_ref, source="auto"):
     """ยืนยันชำระเงินจากสลิปที่ผ่าน — อัปเดตสถานะ + ให้แต้ม + แจ้ง admin + แจ้งลูกค้า
@@ -4020,6 +4131,8 @@ async def _finalize_slip_paid(sb, order_id, customer, phone, total, slip_url,
         await _apply_referral_on_paid(sb, order_id)
     except Exception as e:
         print(f"[referral] apply error (slip {order_id}): {e}")
+    # ChatGPT Ads — ยิง order_created (background, ไม่ block; idempotent ด้วย oai_sent_at)
+    _fire_oai_bg(order_id)
     # P3: ยิง purchase event ตอนสลิปผ่านจริงเท่านั้น (dedupe ต่อ order — ยิงกี่ครั้งก็ 1 แถว)
     await _log_event(sb, "purchase", event_id=f"purchase-{order_id}", order_id=order_id,
                      value=float(total or slip_amount or 0), phone=phone, source="web")
@@ -5006,6 +5119,9 @@ async def confirm_payment(order_id: str, x_api_key: str = Header(default="")):
         await _apply_referral_on_paid(sb, order_id)
     except Exception as e:
         print(f"[referral] apply error (confirm {order_id}): {e}")
+
+    # ChatGPT Ads — ยิง order_created (background, ไม่ block; idempotent ด้วย oai_sent_at)
+    _fire_oai_bg(order_id)
 
     # แจ้งลูกค้าทาง LINE ว่ายืนยันการชำระเงินแล้ว
     await _notify_customer(sb, order_id, phone or "", order.get("customer") or "",
