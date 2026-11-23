@@ -3809,6 +3809,16 @@ async def create_order(body: CreateOrderRequest):
 
     sb.table("orders").insert(order_row).execute()
 
+    # เก็บ SKU code ของแต่ละรายการ (เช่น "HONEY x1, ORIGINAL x2") — ใช้ให้ content id ฝั่ง server
+    # ตรงกับ Pixel เป๊ะ · best-effort: ถ้ายังไม่ได้รัน migration เพิ่มคอลัมน์ item_skus จะข้ามไป
+    # ไม่กระทบการสร้างออเดอร์ (insert หลักด้านบนสำเร็จไปแล้ว)
+    try:
+        item_skus_str = ", ".join(f"{(i.sku or '').upper()} x{i.qty}" for i in body.items)
+        if item_skus_str:
+            sb.table("orders").update({"item_skus": item_skus_str}).eq("order_id", body.order_id).execute()
+    except Exception as e:
+        print(f"[orders/create] item_skus store skipped (ต้องรัน migration?): {e}")
+
     # เก็บลูกค้าลงตาราง customers อัตโนมัติ — เฉพาะเบอร์ที่ยังไม่มี (ไม่ทับข้อมูลเดิมของคน login)
     try:
         cust_phone = (body.phone or "").replace("-", "").replace(" ", "").strip()
@@ -4054,6 +4064,13 @@ async def _fire_oai_conversion(order_id: str, force: bool = False) -> dict:
         if not res.data:
             return {"ok": False, "reason": "order_not_found"}
         o = res.data[0]
+        # item_skus (SKU code ต่อรายการ) — select แยก best-effort กันพังถ้ายังไม่ได้รัน migration
+        try:
+            _is = sb.table("orders").select("item_skus").eq("order_id", order_id).limit(1).execute()
+            if _is.data:
+                o["item_skus"] = _is.data[0].get("item_skus")
+        except Exception:
+            o["item_skus"] = None
         if o.get("oai_sent_at") and not force:
             return {"ok": True, "reason": "already_sent", "oai_sent_at": o.get("oai_sent_at")}
         # user matching (hash เฉพาะเบอร์/อีเมล · obref/zip/country ไม่ hash · list ≤ 3 ค่า)
@@ -4065,16 +4082,41 @@ async def _fire_oai_conversion(order_id: str, force: bool = False) -> dict:
             user["phone_numbers_sha256"] = [_oai_h(_oai_norm_phone(phone))]
         if o.get("zip"):
             user["postal_codes"] = [str(o["zip"])]
-        # contents จาก sku string ("ชื่อ x2, ...")
+        # contents — ใช้ "SKU code" เป็น content id ให้ตรงกับ Pixel ฝั่งเว็บ (เช่น HONEY, ORIGINAL)
+        # 1) ถ้ามี item_skus (เก็บตอนสร้างออเดอร์) → token ก่อน " xN" คือ SKU code อยู่แล้ว ใช้เลย
+        # 2) ไม่งั้น (ออเดอร์เก่า/ยังไม่ migration) → map ชื่อสินค้า → SKU code จากตาราง products
         contents = []
         try:
-            for it in _receipt_parse_items(o.get("sku") or ""):
-                contents.append({
-                    "id":           it.get("name") or "item",
-                    "name":         it.get("name") or "",
-                    "content_type": "product",
-                    "quantity":     int(it.get("qty") or 1),
-                })
+            raw_skus = (o.get("item_skus") or "").strip()
+            if raw_skus:
+                for it in _receipt_parse_items(raw_skus):
+                    code = (it.get("name") or "").upper()
+                    if code:
+                        contents.append({
+                            "id":           code,
+                            "name":         code,
+                            "content_type": "product",
+                            "quantity":     int(it.get("qty") or 1),
+                        })
+            else:
+                name2sku = {}
+                try:
+                    _p = sb.table("products").select("sku,name").execute()
+                    for p in (_p.data or []):
+                        nm = (p.get("name") or "").strip().lower()
+                        if nm:
+                            name2sku[nm] = (p.get("sku") or "").upper()
+                except Exception:
+                    pass
+                for it in _receipt_parse_items(o.get("sku") or ""):
+                    nm   = (it.get("name") or "").strip()
+                    code = name2sku.get(nm.lower()) or nm or "item"
+                    contents.append({
+                        "id":           code,
+                        "name":         nm or code,
+                        "content_type": "product",
+                        "quantity":     int(it.get("qty") or 1),
+                    })
         except Exception:
             pass
         data = {
